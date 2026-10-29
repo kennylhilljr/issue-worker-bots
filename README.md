@@ -15,7 +15,7 @@ Design stage. [`DESIGN.md`](DESIGN.md) describes the whole pipeline: which issue
 | --- | --- |
 | 1. Worker Apps registered (`claude-dev-gh`, `codex-dev-gh`) | Done. Installed on all of Kenny's repositories with contents, issues and pull requests read and write. |
 | 2. Intake watcher | Live: launchd runs it every 5 minutes. Trusts Kenny and `openclaw-ops-assist[bot]`; the 6 issues open at install were skipped. |
-| 3. Analysis step | Not started |
+| 3. Analysis step | Built; dry-run on a real issue with Opus. The running job does intake only until switched to `tick`. |
 | 4. Clarity gate, approval, orchestrator runs, draft PRs | Not started |
 | 5. Review hand-off and repair round | Not started |
 | 6. More repositories and model tuning | Not started |
@@ -43,6 +43,26 @@ Run it every 5 minutes with launchd. To skip the issues already open, run `./iwb
 ```
 
 Log: `~/Library/Logs/issue-intake.log`. State: `~/.config/issue-worker-bots/state.json`. Remove the job with `./install-intake.sh --uninstall`. Tests: `python3 -m unittest discover -s tests`.
+
+## Analysis (step 3)
+
+`iwb analyze` takes one picked-up issue per pass, clones its repository read-only with the worker bot's token, and runs the worker's strongest model on it: `opus` at high effort for Claude, `gpt-6-astra` at high effort for Codex (override in `config.json` under `analysis_models`). Only the issue and comments from Kenny, trusted openers and the worker bots go into the prompt; other people's comments are left out.
+
+The model answers with exactly one of:
+
+| Answer | Posted as | Label |
+| --- | --- | --- |
+| No code change needed | The reason | `bot:no-code` |
+| Questions | Up to 5 questions | `bot:needs-info` |
+| A plan | A unit table plus the full plan in orchestrator format, saved to `~/.config/issue-worker-bots/plans/` | `bot:planned` |
+
+A reply from Kenny after questions or a no-code answer runs the analysis again. Plans are checked before posting: 1 to 8 units, unique ids, every work-unit field present, files and acceptance commands on every unit, dependencies that exist. Two unusable answers mark the issue `bot:blocked`; removing that label tries again. A model failure such as a usage limit retries after an hour.
+
+```bash
+./iwb analyze --dry-run
+```
+
+`./iwb tick` runs intake, then one analysis; that is what `install-intake.sh` schedules.
 
 ## Layout
 

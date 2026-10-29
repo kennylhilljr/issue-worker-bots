@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install (or remove, with --uninstall) a launchd agent that runs `iwb intake` every 5 minutes.
+# Install (or remove, with --uninstall) a launchd agent that runs `iwb tick` (intake, then analysis) every 5 minutes.
 # launchd starts jobs with a bare PATH, so this records where python3, gh and openssl live right now.
 set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -16,7 +16,7 @@ if [ "${1:-}" = "--uninstall" ]; then
 fi
 
 path_dirs=""
-for tool in python3 gh openssl git; do
+for tool in python3 gh openssl git claude codex; do
   if p="$(command -v "$tool")"; then
     d="$(dirname "$p")"
     case ":$path_dirs:" in *":$d:"*) ;; *) path_dirs="${path_dirs:+$path_dirs:}$d" ;; esac
@@ -35,7 +35,7 @@ cat > "$plist" <<PLIST
 <dict>
   <key>Label</key><string>$label</string>
   <key>ProgramArguments</key>
-  <array><string>$python</string><string>$repo/iwb</string><string>intake</string></array>
+  <array><string>$python</string><string>$repo/iwb</string><string>tick</string></array>
   <key>WorkingDirectory</key><string>$repo</string>
   <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><true/>
