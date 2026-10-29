@@ -1,6 +1,6 @@
 # Issue worker bots: design
 
-Status: draft for Kenny's review. Nothing here is built yet.
+Status: build steps 1 to 3 are live. Step 4a (gates and plan approval) is on main behind `approval_live`. Step 4b (coding and draft PRs) is built and tested with fakes, behind `coding_live`, with `kennylhilljr/ecc-customization` as the pilot; it has not run live. Kenny's answers to the open questions are under "Decisions (2026-10-29)".
 
 ## Goal
 
@@ -28,12 +28,12 @@ Two new GitHub Apps, separate from the review bots:
 
 | | Claude worker | Codex worker |
 | --- | --- | --- |
-| App name (proposed) | `claude-dev-gh` | `codex-dev-gh` |
+| App name | `claude-dev-gh` | `codex-dev-gh` |
 | Does | Analyzes issues, writes code, opens PRs | Same |
 | Reviewed by | `codex-pr-gh` | `claude-pr-gh` |
 | Permissions | Contents, pull requests and issues: read and write | Same |
 
-Keeping workers and reviewers apart means a pull request's author and its reviewer are visibly different accounts, and each App holds only what it needs. Once the workers exist, the review bots can go back to contents read-only, since agents would push through the worker bots.
+Keeping workers and reviewers apart means a pull request's author and its reviewer are visibly different accounts. The review bots keep contents write: agents working by hand still commit and push through `prbot git claude|codex`, and the `cross-review` skill depends on that.
 
 Registration, tokens, Keychain storage and the bot commit identity all come from `prbot`. It needs one change: bot names are fixed to `claude` and `codex` today, and it would need to accept `claude-dev` and `codex-dev` as well.
 
@@ -125,11 +125,22 @@ Why this is safe without a person in the loop:
 
 ### 5. Coding
 
-The worker starts an orchestrator run with the plan. The orchestrator routes each unit to the model for its tier, runs it in a worktree, runs the acceptance commands, and escalates one tier on a real failure. Commits use the worker bot's identity through `prbot git`, on a branch named `bot/<issue-number>-<slug>`.
+Coding (`iwb code`, step 4b) picks up a plan that step 4a approved, as long as the plan file is still the one that was approved. It runs only in repositories listed in `coding_repos` in `config.json`; the pilot is `kennylhilljr/ecc-customization`. Elsewhere an approved plan waits, with a one-line note on the issue. The scheduled job runs it only when `"coding_live": true` is set, separately from step 4a's `approval_live`.
+
+The worker labels the issue `bot:in-progress` and starts an orchestrator run with the approved plan:
+
+- **Where.** A fresh clone of the target repository that `iwb` owns, under `~/.local/state/issue-worker-bots/repos/`, never one of Kenny's checkouts. The branch `bot/<issue-number>-<slug>` is created at the default branch's tip and is the run's target branch. The orchestrator's state and worktrees live under the same directory, so these runs never contend with Kenny's own orchestrator runs.
+- **Approval record.** The approval is recorded the way the orchestrator expects, with the approving review bot as operator: `ecc review-plan --json --approve --operator <review bot> --session iwb.<owner>.<repo>.<n> -- create-run --run-id <id> --plan <file> <config flags>`, then `ecc create-run ... --yes --review-id <id>`. The record is bound to the hash of that exact command plan, expires after an hour and is used once. `drive` is gated the same way and gets its own record right before it runs.
+- **Merge approval.** If the repository has no `.orchestration/team.json`, `iwb` writes one with `"merge_approval": "agents"` into its clone, kept out of git. Without it the orchestrator would wait for a person to approve each merge into the `bot/` branch; the plan approver already stands in for that, and Kenny still merges the PR.
+- **Runners.** The run gets an orchestrator config with the runner certifications and model catalog (`ecc_config` in `config.json` overrides them). Without certifications no runner can be assigned, so `iwb` checks for them before labeling anything.
+- **Run.** The orchestrator routes each unit to the model for its tier, runs it in a worktree, runs the acceptance commands, escalates one tier on a real failure, and fast-forwards the `bot/` branch as units pass. The bots never call `ecc merge`, and nothing in the orchestrator pushes.
+- **Check and commit.** `iwb` compares the result with the default branch. Any changed file outside the plan's scope or on a protected path blocks the issue, and nothing is pushed. Otherwise the result becomes one commit authored and committed by the worker bot (`prbot git <worker> -- commit-tree`), pushed with `prbot git` to the `bot/` branch only. A push to any other branch is refused in code.
+
+A run that stops (`drive` exits non-zero: budget, no progress, needs an owner) blocks the issue with the orchestrator's reason. A pass that dies mid-run leaves `bot:in-progress` behind, and the next pass blocks the issue as interrupted rather than starting again.
 
 ### 6. Pull request and review
 
-When all units pass, the worker pushes and opens a draft PR with `Closes #<n>`, the label `agent:claude` or `agent:codex`, and the plan summary. It marks the PR ready, and the `pr-review-bots` watcher sends it to the other agent for review within 5 minutes.
+When the commit is pushed, the worker opens a draft PR with `Closes #<n>`, the label `agent:claude` or `agent:codex`, and the plan's units. It marks the PR ready, labels the issue `bot:pr-open`, and the `pr-review-bots` watcher sends the PR to the other agent for review within 5 minutes.
 
 If the review raises P1 or P2 findings, the worker runs one repair round. Each finding becomes a unit with the finding as its instructions and the failing case as its acceptance check, which is exactly the clear kind of work a cheap model can do. After that round, or if findings remain, the PR waits for Kenny.
 
@@ -137,7 +148,7 @@ Merging stays with Kenny.
 
 ## Coming back to an issue
 
-The bots look at every open issue they picked up on each 5-minute pass (seconds, once webhooks from the OpenClaw bridge's Phase B exist). These are the things that bring a bot back:
+The bots look at every open issue they picked up on each 5-minute pass; there are no webhooks for now. A review bot's verdict on a plan also goes into the next analysis, so a revise verdict reaches the planner. Once coding has started (`bot:in-progress` or `bot:pr-open`), comments on the issue no longer start a new analysis: feedback belongs on the PR from then on. These are the things that bring a bot back:
 
 | Trigger | How it's detected | What the bot does |
 | --- | --- | --- |
@@ -181,7 +192,8 @@ Two cautions:
 
 | Limit | Default | On reaching it |
 | --- | --- | --- |
-| Issues in progress at once | 2 | New issues wait in `bot:queued` |
+| Issues being coded at once | 2 | Approved plans wait |
+| Coding runs per pass | 1 | The next approved plan waits for the next pass |
 | Analysis attempts per issue | 2 | Questions posted on the issue |
 | Cost or time per issue | Orchestrator unit budgets | Run stops, PR or issue labeled `bot:blocked` with the reason |
 | Repair rounds after review | 1 | PR waits for Kenny |
@@ -194,7 +206,7 @@ Two cautions:
 ## Safety
 
 - Only issues opened or labeled by Kenny are worked on.
-- Analysis runs read-only. Coding runs only inside orchestrator worktrees, never on `main` or a checkout Kenny uses.
+- Analysis runs read-only. Coding runs only in repositories listed in `coding_repos`, inside orchestrator worktrees of `iwb`'s own clone, never on `main` or a checkout Kenny uses. Before anything is pushed, the run's actual changes are checked against the plan's scope and the protected paths.
 - Workers never merge, never push to the default branch, and never change repository settings, secrets or workflows. Changes to `.github/workflows`, secrets, credentials and deploy configuration are refused by the policy gate; no agent can approve them.
 - Tokens come from `prbot`: one hour, one repository, never printed or saved.
 - The guard hook and the `cross-review` skill already stop agents from posting or pushing as Kenny.
@@ -275,16 +287,28 @@ A new repository, `issue-worker-bots`, holds the intake watcher, the analysis pr
 1. Generalize `prbot` bot names; register `claude-dev-gh` and `codex-dev-gh`.
 2. Intake watcher with the opener and label rules, posting only the "picked up" comment. Run it for a few days.
 3. Analysis step that posts questions or a plan, with no coding yet. Check plan quality on real issues.
-4. Clarity, policy and red-check gates, agentic clarification and plan approval, then orchestrator runs and draft PRs on one low-risk repository.
+4. Clarity, policy and red-check gates, agentic clarification and plan approval, then orchestrator runs and draft PRs on one low-risk repository. Gates and approval are step 4a, on main behind `approval_live`; coding and PRs are step 4b, behind `coding_live`, piloted on `kennylhilljr/ecc-customization`. Agentic clarification is not built yet.
 5. Review hand-off and the repair round.
 6. Turn on more repositories, then measure escalation rates and adjust the model table.
 
-## Open questions for Kenny
+## Decisions (2026-10-29)
 
-1. App names: `claude-dev-gh` and `codex-dev-gh`, or something else?
-2. Trigger: issues opened by you and the `bot:work` label, or the label only?
-3. Which paths count as deploy or release configuration in each repository, for the policy gate?
-4. All 21 repositories, or start with a list?
-5. Once the workers push, should the review bots go back to contents read-only?
-6. For webhooks, if ever: reuse `openclaw-ops-assist`, or a new `openclaw-gh-events` App?
-7. Is one `github` pseudo-run in OpenClaw the right grouping, or one per repository?
+Kenny's answers to the open questions:
+
+1. App names stay `claude-dev-gh` and `codex-dev-gh`.
+2. The trigger stays as built: issues opened by Kenny or a trusted opener, or `bot:work` added by Kenny.
+3. Policy gate: the always-blocked paths are `.github/workflows/**`, `**/.env*`, `**/*.pem`, `**/*.key` and `**/secrets/**`. Each repository can add its own in `~/.config/issue-worker-bots/config.json` under `"policy": {"owner/repo": [globs]}`. The seed list for `kennylhilljr/ecc-customization` is `bootstrap.sh`, `stack.conf` and `machine/**`.
+4. Coding runs only in repositories listed in `"coding_repos"` in `config.json`; the pilot is `["kennylhilljr/ecc-customization"]`. Elsewhere a plan waits with a note.
+5. The review bots keep contents write. Agents commit and push through `prbot git claude|codex`, and the `cross-review` skill depends on it.
+6. No webhooks for now.
+7. One `github` OpenClaw run stays.
+
+Step 4a's approval policy as built on main (docs-only and tiny mechanical plans approved by rule, a cheap model for normal code, the strongest model for tier 2 or high risk) was kept as it is.
+
+Choices made while building step 4b, where the design left room:
+
+- `coding_repos` defaults to empty and `coding_live` to false, so nothing is coded until Kenny sets both.
+- The post-run check reads decision 3's form: `policy` for a repository as a list of globs, falling back to the seed list. Step 4a's plan gate reads `policy` for a repository as `{"deny_paths": [...], "allow_paths": [...]}` regexes, so the two forms still need to be brought together; until then the post-run check uses the seed list when it finds the dict form.
+- The orchestrator runs with its own state directory and worktree root under `~/.local/state/issue-worker-bots/`, so the bots never contend with Kenny's own runs, and the run's events stay out of OpenClaw's run list (decision 7).
+- The PR gets one commit by the worker bot holding the run's whole result, rather than the orchestrator's per-unit commits, so GitHub shows the worker bot as the author and the cross-review routes by it.
+- A coding run can take hours, and launchd does not start a new pass while one is running, so intake and analysis wait during a run. Running coding as a separate job is the fix if that delay matters.

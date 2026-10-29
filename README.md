@@ -15,14 +15,14 @@ Everything runs locally through one command, `iwb`, on a launchd timer. It signs
 
 ## Project status
 
-Intake and analysis are live on all of `kennylhilljr`'s repositories. Coding is designed but not built, so an issue stops at a posted plan for now.
+Intake and analysis are live on all of `kennylhilljr`'s repositories. Plan approval (step 4a) and coding (step 4b) are built but switched off until `approval_live` and `coding_live` are set, so an issue stops at a posted plan for now.
 
 | Build step | Status |
 | --- | --- |
 | 1. Worker Apps (`claude-dev-gh`, `codex-dev-gh`) | Done. Installed on all of Kenny's repositories with contents, issues and pull requests read and write. |
 | 2. Intake watcher | Live: launchd runs it every 5 minutes. Trusts Kenny and `openclaw-ops-assist[bot]`; the 6 issues open at install were skipped. |
 | 3. Analysis step | Live: launchd runs `tick` (intake, then one analysis) every 5 minutes. |
-| 4. Clarity, policy and red-check gates, agent plan approval, orchestrator runs, draft PRs | Designed (no human approval; the other agent approves). Not built. |
+| 4. Clarity, policy and red-check gates, agent plan approval, orchestrator runs, draft PRs | 4a, gates and approval: built, runs when `approval_live` is set. 4b, coding and draft PRs: built and tested with fakes, pilot on `kennylhilljr/ecc-customization`, not yet run live; runs when `coding_live` is set. |
 | 5. Review hand-off and repair round | Not started. |
 | 6. More repositories and model tuning | Not started. |
 
@@ -36,7 +36,7 @@ flowchart LR
     ANALYZE --> NOCODE["bot:no-code"]
     ANALYZE --> QUESTIONS["bot:needs-info"]
     ANALYZE --> PLAN["bot:planned, plan in orchestrator format"]
-    PLAN --> STEP4["Step 4, not built: gates, agent approval, orchestrator run, draft PR"]
+    PLAN --> STEP4["Step 4: gates, agent approval, orchestrator run, draft PR (switched off by default)"]
     QUESTIONS --> OPENCLAW["OpenClaw attention event"]
     PLAN --> OPENCLAW
     INTAKE --> PRBOT["prbot: one-hour token for one repo"]
@@ -123,7 +123,7 @@ The worker is chosen by an `agent:claude` or `agent:codex` label; otherwise the 
 
 ### Analysis
 
-`iwb analyze` takes one picked-up issue per pass, clones its repository read-only with the worker bot's token, and runs the worker's strongest model on it (override the models in `config.json` under `analysis_models`). Only the issue and comments from Kenny, trusted openers and the worker bots go into the prompt; other people's comments are left out.
+`iwb analyze` takes one picked-up issue per pass, clones its repository read-only with the worker bot's token, and runs the worker's strongest model on it (override the models in `config.json` under `analysis_models`). Only the issue and comments from Kenny, trusted openers and the worker bots, plus the review bots' plan verdicts, go into the prompt; other people's comments are left out.
 
 The model answers with exactly one of:
 
@@ -134,6 +134,30 @@ The model answers with exactly one of:
 | A plan | A unit table plus the full plan in orchestrator format, saved to `~/.config/issue-worker-bots/plans/` | `bot:planned` |
 
 Plans are checked before posting: 1 to 8 units, unique ids, every work-unit field present, files and acceptance commands on every unit, dependencies that exist. Two unusable answers mark the issue `bot:blocked`; removing that label tries again. A model failure such as a usage limit retries after an hour.
+
+### Coding (step 4b)
+
+`iwb code` takes one plan per pass that step 4a approved (the plan file must be unchanged since the approval) in a repository listed in `coding_repos`. The worker labels the issue `bot:in-progress` and runs the orchestrator in `iwb`'s own clone of the repository: `ecc review-plan --approve` with the approving review bot as operator, `ecc create-run --yes --review-id`, then the same pair for `ecc drive`, with `bot/<n>-<slug>` as the target branch. The changed files are checked against the plan's scope and the protected paths, committed once as the worker bot, and pushed to the `bot/` branch only. A draft PR with `Closes #<n>` and `agent:claude` or `agent:codex` is opened and marked ready, so `prbot watch` reviews it, and the issue gets `bot:pr-open`. A run that stops, or changes a file it shouldn't, gets `bot:blocked` and nothing is pushed. Nothing is ever merged.
+
+Settings in `~/.config/issue-worker-bots/config.json`; nothing is coded until both of the first two are set:
+
+```json
+{
+  "coding_live": true,
+  "coding_repos": ["kennylhilljr/ecc-customization"],
+  "policy": {"kennylhilljr/ecc-customization": ["bootstrap.sh", "stack.conf", "machine/**"]},
+  "ecc_config": {"certifications": "~/.local/share/openclaw-ecc-orchestrator/runtime/.orchestration/runtime/cert-latest.json"}
+}
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `coding_live` | false | `tick` runs `iwb code`. |
+| `coding_repos` | none | Repositories where approved plans are coded. Elsewhere the worker posts one note and the plan waits. |
+| `policy` | the seed list above for `ecc-customization` | Protected globs per repository for the check after the run, on top of `.github/workflows/**`, `**/.env*`, `**/*.pem`, `**/*.key` and `**/secrets/**`. A list replaces the seed list. |
+| `ecc_config` | certifications and catalog from the orchestrator runtime | Orchestrator config keys for the run (for example `repo_checks`). Coding waits, without posting, while the certifications file is missing. |
+
+The orchestrator is `../openclaw-ecc-orchestrator/bin/ecc` (override with `IWB_ECC`). Its state, worktrees and `iwb`'s clones live in `~/.local/state/issue-worker-bots/` (override with `IWB_WORK`), apart from Kenny's own orchestrator runs.
 
 ### Talking to the bots
 
@@ -157,11 +181,12 @@ Plans ready, questions posted and blocked issues appear in OpenClaw as `attentio
 
 | Command | What it does |
 | --- | --- |
-| `iwb tick` | What launchd runs: intake, then one analysis. |
+| `iwb tick` | What launchd runs: intake, then one analysis, then step 4a when `approval_live` is set and step 4b when `coding_live` is set. |
+| `iwb code [--dry-run]` | Codes one approved plan and opens its PR. `--dry-run` prints what it would do. |
 | `iwb intake [--dry-run] [--baseline] [--limit N]` | One pass over open issues; picks up at most N (default 5). `--dry-run` prints and saves nothing; `--baseline` marks the open issues as seen without commenting. |
 | `iwb analyze [--dry-run] [--limit N]` | Analyzes up to N picked-up issues (default 1) and posts a no-code answer, questions or a plan. |
 
-Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned` and `bot:blocked` today; `bot:approved`, `bot:in-progress`, `bot:pr-open`, `bot:done` and `bot:stale` arrive with the later steps. `bot:stop` is set by Kenny.
+Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bot:approved`, `bot:in-progress`, `bot:pr-open` and `bot:blocked`; `bot:done` and `bot:stale` arrive with step 5. `bot:stop` is set by Kenny.
 
 ## Repository layout
 
@@ -172,13 +197,13 @@ Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned` and 
 | `bots/` | App specs for `prbot register --spec`, including each App's permissions. |
 | `logos/` | Bot logos: SVG sources and 512 px PNGs uploaded to GitHub. |
 | `docs/assets/` | The README header (SVG source and WebP). |
-| `tests/` | Unit tests for the pick-up and analysis rules, with fake GitHub data. |
+| `tests/` | Unit tests with fake GitHub, models and orchestrator: pick-up, analysis, plan approval, coding and label changes. |
 | [`DESIGN.md`](DESIGN.md) | The design: pipeline, model choice, budgets, safety and the OpenClaw bridge. |
 
 ## Security boundaries
 
 - Only issues opened by Kenny or a trusted opener, or labeled `bot:work` by Kenny, are worked on.
-- Analysis runs read-only on a fresh clone. Coding, once built, runs only inside orchestrator worktrees, never on `main` or a checkout Kenny uses.
+- Analysis runs read-only on a fresh clone. Coding runs only in repositories listed in `coding_repos`, inside orchestrator worktrees of `iwb`'s own clone, never on `main` or a checkout Kenny uses; its changes are checked against the plan's scope and protected paths before anything is pushed.
 - Workers never merge, never push to the default branch, and never change repository settings, secrets or workflows. In step 4 a policy gate refuses plans that touch `.github/workflows`, secrets, credentials or deploy configuration; no agent can approve them.
 - Tokens come from `prbot`: one hour, one repository, never printed or saved. App private keys live in macOS Keychain.
 - The `pr-review-bots` guard hook and `cross-review` skill stop agents from posting or pushing as Kenny.

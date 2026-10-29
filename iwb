@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """iwb: issue worker bots. Step 2 of DESIGN.md: intake only.
 
-  iwb tick                  what launchd runs: intake, then analyze
+  iwb tick                  what launchd runs: intake, then analyze, then approve and code when switched on
+  iwb code [--dry-run]
+      Step 4b: for one plan that step 4a approved, in a repository listed in config.json "coding_repos": an
+      orchestrator run in iwb's own clone, one commit by the worker bot on bot/<n>-<slug>, and a draft PR marked
+      ready (bot:in-progress, then bot:pr-open). Never merges. In tick only when "coding_live" is true.
   iwb analyze [--dry-run] [--limit N]
       Step 3: for each picked-up issue (or one where the owner answered the bot's questions), run the
       worker's strongest model read-only on a fresh clone and post either questions (bot:needs-info) or
@@ -203,7 +207,9 @@ LABELS = {"bot:needs-info": ("FBCA04", "The worker bot has questions before it c
           "bot:planned": ("0E8A16", "The worker bot posted a plan"),
           "bot:blocked": ("B60205", "The worker bot could not continue; see its last comment"),
           "bot:no-code": ("D4C5F9", "The worker bot found no code change to make"),
-          "bot:approved": ("1D76DB", "The other agent approved the plan")}
+          "bot:approved": ("1D76DB", "The other agent approved the plan"),
+          "bot:in-progress": ("5319E7", "The worker bot is coding the approved plan"),
+          "bot:pr-open": ("0052CC", "The worker bot opened a pull request")}
 
 ANALYSIS_PROMPT = """You are the analysis step of an automated worker for the GitHub repository {repo}.
 The repository is checked out read-only in the current directory at {branch} ({sha}).
@@ -256,15 +262,17 @@ def analysis_model(agent):
     return {**ANALYSIS_MODELS[agent], **read_config().get("analysis_models", {}).get(agent, {})}
 
 
-def issue_text(repo, number, trusted, bot_logins):
-    """Title, body, and comments by trusted accounts only, so strangers' comments never reach the model."""
+def issue_text(repo, number, trusted, bot_logins, approver_logins=()):
+    """Title, body, and comments by trusted accounts only, so strangers' comments never reach the model. The
+    review bots' plan verdicts count too, so a revise verdict reaches the planner."""
     i = gh_json(["api", f"repos/{repo}/issues/{number}", "--jq", "{title, body, state, user: .user.login, labels: [.labels[].name]}"])[0]
     comments = gh_json(["api", f"repos/{repo}/issues/{number}/comments?per_page=100", "--paginate",
                         "--jq", ".[] | {user: .user.login, body: .body, at: .created_at}"])
-    kept = [c for c in comments if c["user"] in trusted or c["user"] in bot_logins]
+    kept = [c for c in comments if c["user"] in trusted or c["user"] in bot_logins
+            or c["user"] in approver_logins and "<!-- iwb:approval -->" in (c["body"] or "")]
     text = f"# {i['title']}\n\n{i['body'] or '(no description)'}\n"
     for c in kept:
-        text += f"\n--- comment by {c['user']} at {c['at']} ---\n{(c['body'] or '').replace(MARKER, '').replace(A_MARKER, '').replace(R_MARKER, '')}\n"
+        text += f"\n--- comment by {c['user']} at {c['at']} ---\n{(c['body'] or '').replace(MARKER, '').replace(A_MARKER, '').replace(R_MARKER, '').replace('<!-- iwb:approval -->', '')}\n"
     return i, comments, text
 
 
@@ -380,6 +388,8 @@ def needs_analysis(entry, comments, trusted, digest):
     (plan included) or an edit to the title or body brings the bot back."""
     if "agent" not in entry or entry.get("closed") or entry.get("blocked"):
         return None
+    if (entry.get("work") or {}).get("status") in ("in-progress", "pr-open"):
+        return None                       # coding started; the PR is where feedback goes now (step 5)
     a = entry.get("analysis")
     if a is None:
         return entry.pop("reason", "new")
@@ -431,6 +441,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
     trusted = trusted_openers(owner)
     bot_logins = {cfg[b]["slug"] + "[bot]" for b in WORKERS.values() if b in cfg}
     worker_slugs = [cfg[b]["slug"] for b in WORKERS.values() if b in cfg]
+    approver_logins = {cfg[b]["slug"] + "[bot]" for b in ("claude", "codex") if b in cfg}   # the review bots
     runs = 0
     for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
         if "agent" not in entry or paused:
@@ -439,7 +450,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
             continue
         repo, number = key.rsplit("#", 1)
         try:
-            issue, comments, text = issue_text(repo, number, trusted, bot_logins)
+            issue, comments, text = issue_text(repo, number, trusted, bot_logins, approver_logins)
         except SystemExit:
             log(f"{key}: could not read the issue; will retry")
             continue
@@ -462,6 +473,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
             entry.pop("blocked")          # the owner removed bot:blocked: try again from scratch
             entry["attempts"] = 0
             entry.pop("analysis", None)
+            entry.pop("work", None)
         digest = issue_digest(issue)
         a = entry.get("analysis")
         if a:   # short commands get an answer, not another expensive analysis
@@ -951,6 +963,362 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
     return 0
 
 
+# ---------- step 4b: coding the approved plan and opening the PR ----------
+
+CODE_LIMIT = 1             # coding runs per pass
+IN_PROGRESS_LIMIT = 2      # issues being coded at once (DESIGN.md "Budgets and limits")
+DRIVE_TIMEOUT = 6 * 3600
+ALWAYS_BLOCKED = (".github/workflows/**", "**/.env*", "**/*.pem", "**/*.key", "**/secrets/**")
+SEED_POLICY = {"kennylhilljr/ecc-customization": ["bootstrap.sh", "stack.conf", "machine/**"]}
+W_MARKER = "<!-- iwb:work -->"
+ECC = Path(os.environ.get("IWB_ECC", ROOT.parent / "openclaw-ecc-orchestrator" / "bin" / "ecc"))
+WORK_DIR = Path(os.environ.get("IWB_WORK", Path.home() / ".local" / "state" / "issue-worker-bots"))
+ECC_DEFAULTS = {   # the orchestrator assigns no runner without certifications, so drive needs these
+    "certifications": str(Path.home() / ".local/share/openclaw-ecc-orchestrator/runtime/.orchestration/runtime/"
+                                        "cert-latest.json"),
+    "catalog": str(Path.home() / ".local/state/openclaw-ecc-orchestrator/catalog-latest.json")}
+
+
+class WorkError(Exception):
+    """A step of the coding run failed in a way that needs Kenny: the issue is blocked with this reason."""
+
+
+def glob_rx(pattern):
+    """Path glob as a regex: ** crosses directories, * and ? stay inside one. **/x also matches x at the root."""
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif pattern.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif pattern[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif pattern[i] == "?":
+            out, i = out + "[^/]", i + 1
+        else:
+            out, i = out + re.escape(pattern[i]), i + 1
+    return re.compile(out + r"\Z", re.I)
+
+
+def clean_path(f):
+    """The path relative to the repository root, or None when it points outside it."""
+    p = f.strip()
+    while p.startswith("./"):
+        p = p[2:]
+    if not p or p.startswith("/") or "\\" in p or ".." in p.split("/"):
+        return None
+    return p
+
+
+def protected_globs(repo):
+    """Always-blocked paths plus the repository's own globs: config.json "policy" if it names the repository as a
+    list of globs, otherwise the seed list. (The plan gate reads the dict form {"deny_paths": [regex]} instead.)"""
+    extra = read_config().get("policy", {}).get(repo, SEED_POLICY.get(repo, []))
+    return ALWAYS_BLOCKED + (tuple(extra) if isinstance(extra, list) else tuple(SEED_POLICY.get(repo, [])))
+
+
+def protected(path, globs):
+    return next((g for g in globs if glob_rx(g).match(path)), None)
+
+
+
+def run_ecc(args, timeout=900):
+    """Run the orchestrator CLI. Returns (exit code, JSON envelope or {}, stderr tail). Tests replace this."""
+    r = subprocess.run([str(ECC)] + args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    env = {}
+    for chunk in (r.stdout, (r.stdout.strip().splitlines() or [""])[-1]):
+        try:
+            env = json.loads(chunk)
+            break
+        except ValueError:
+            continue
+    return r.returncode, env if isinstance(env, dict) else {}, (r.stderr or "").strip()[-500:]
+
+
+def ecc_data(ecc, args, what, timeout=900):
+    """The envelope's data when the command succeeded, else WorkError with the failed checks."""
+    code, env, err = ecc(args, timeout)
+    if code != 0:
+        failed = [f"{c.get('name')}: {c.get('detail', '')}" for c in env.get("checks", []) if not c.get("ok")]
+        stop = (env.get("data") or {}).get("stop")
+        detail = "; ".join(([f"stopped: {stop}"] if stop else []) + failed) or err or "no output"
+        raise WorkError(f"`ecc {what}` failed (exit {code}): {detail[:500]}")
+    return env.get("data") or {}
+
+
+
+
+def save_state(state):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(state, indent=1) + "\n")
+
+
+def block(entry, bot, repo, number, title, body, problem):
+    """Label bot:blocked, tell OpenClaw. Removing bot:blocked restarts the issue from analysis."""
+    url = post(bot, repo, number, body + "\n\nRemove `bot:blocked` to start again from analysis.", "bot:blocked")
+    entry["blocked"] = True
+    entry["work"] = {**(entry.get("work") or {}), "status": "blocked", "at": time.time(), "comment": url,
+                     "problem": problem[:300]}
+    prbot.openclaw_attention(f"blocked: {repo}#{number}", {"url": url, "title": title, "problem": problem[:300]})
+    log(f"{repo}#{number}: blocked ({problem[:120]}) {url}")
+
+
+
+
+def slugify(title):
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40].strip("-") or "issue"
+
+
+def checkout(repo, bot, branch):
+    """iwb's own clone of the target repository (never one of Kenny's checkouts), with the bot branch created at
+    the default branch's tip. The orchestrator fast-forwards that branch; HEAD stays on the default branch.
+    Returns (dir, default branch, base commit)."""
+    default = gh_json(["api", f"repos/{repo}", "--jq", "{b: .default_branch}"])[0]["b"]
+    d = WORK_DIR / "repos" / repo.replace("/", "__")
+    shutil.rmtree(d, ignore_errors=True)
+    d.parent.mkdir(parents=True, exist_ok=True)
+    env = prbot.git_env(token=prbot.installation_token(bot, repo, permissions={"contents": "read"}))
+    subprocess.run(["git", "clone", "-q", "--single-branch", "--branch", default, f"https://github.com/{repo}.git",
+                    str(d)], env=env, check=True, capture_output=True, timeout=900)
+    base = subprocess.run(["git", "-C", str(d), "rev-parse", "HEAD"], capture_output=True, text=True,
+                          check=True).stdout.strip()
+    subprocess.run(["git", "-C", str(d), "branch", branch, base], check=True, capture_output=True)
+    team = d / ".orchestration" / "team.json"
+    if not team.exists():
+        # the plan approver stands in for Kenny: the orchestrator's agents approve merges into the bot branch of
+        # this clone. Kenny still merges the PR. Kept out of git so it never reaches the PR.
+        team.parent.mkdir(exist_ok=True)
+        team.write_text(json.dumps({"merge_approval": "agents"}) + "\n")
+        with open(d / ".git" / "info" / "exclude", "a") as f:
+            f.write("\n/.orchestration/team.json\n")
+    return str(d), default, base
+
+
+def changed_files(d, base, branch):
+    r = subprocess.run(["git", "-C", d, "diff", "--name-only", base, branch], capture_output=True, text=True, check=True)
+    return [f for f in r.stdout.splitlines() if f.strip()]
+
+
+def scope_problems(files, units, repo):
+    """Changed files outside every unit's scope, or on a protected path. Checked again after the run."""
+    scope = {clean_path(f) for u in units for f in u["scope"]["files"]}
+    globs = protected_globs(repo)
+    out = [f"`{f}` is outside the plan's scope" for f in files if f not in scope]
+    out += [f"`{f}` is a protected path" for f in files if protected(f, globs)]
+    return out
+
+
+def prbot_git(bot, repo, d, args):
+    r = subprocess.run([sys.executable, str(PRBOT_PATH), "git", bot, "-R", repo, "--", "-C", d] + args,
+                       capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise WorkError(f"prbot git {args[0]} failed: {(r.stderr or r.stdout).strip()[-300:]}")
+    return r.stdout.strip()
+
+
+def commit_as(bot, repo, d, base, branch, message):
+    """One commit with the run's result, authored and committed by the worker bot through prbot."""
+    tree = subprocess.run(["git", "-C", d, "rev-parse", f"{branch}^{{tree}}"], capture_output=True, text=True,
+                          check=True).stdout.strip()
+    return prbot_git(bot, repo, d, ["commit-tree", tree, "-p", base, "-m", message])
+
+
+def push_branch(bot, repo, d, sha, branch, default):
+    """Push to bot/<n>-<slug> only. Never the default branch."""
+    if branch == default or not branch.startswith("bot/"):
+        raise WorkError(f"refusing to push to `{branch}`: workers push only to bot/ branches")
+    prbot_git(bot, repo, d, ["push", "origin", f"{sha}:refs/heads/{branch}"])
+
+
+def open_pr(bot, repo, branch, default, title, body, agent):
+    """Draft PR with the agent label, then marked ready so the prbot watcher reviews it."""
+    try:
+        run_gh_as(bot, repo, ["label", "create", f"agent:{agent}", "-R", repo, "--color", "BFD4F2",
+                              "--description", f"Written by {agent}"])
+    except RuntimeError:
+        pass                        # the label already exists
+    url = run_gh_as(bot, repo, ["pr", "create", "-R", repo, "--draft", "--base", default, "--head", branch,
+                                "--title", title, "--body", body, "--label", f"agent:{agent}"])
+    run_gh_as(bot, repo, ["pr", "ready", url, "-R", repo])
+    return url
+
+
+def orchestrator_config(path):
+    """Write the orchestrator config for a run: certifications and catalog by default, overridden or extended by
+    config.json "ecc_config" (any orchestrator config key, for example repo_checks). RuntimeError if the
+    certifications file is missing, since no runner could be assigned."""
+    c = {**ECC_DEFAULTS, **read_config().get("ecc_config", {})}
+    c = {k: os.path.expanduser(v) if isinstance(v, str) else v for k, v in c.items()}
+    if not Path(c.get("certifications") or "").is_file():
+        raise RuntimeError(f"no orchestrator certifications at {c.get('certifications')}; set ecc_config in config.json")
+    if c.get("catalog") and not Path(c["catalog"]).is_file():
+        c.pop("catalog")
+    Path(path).write_text(json.dumps(c, indent=1) + "\n")
+    return path
+
+
+def code_plan(key, entry, issue, state, ecc):
+    """Orchestrator run in iwb's own clone, one commit by the worker bot on bot/<n>-<slug>, then a PR."""
+    repo, number = key.rsplit("#", 1)
+    (WORK_DIR / "repos").mkdir(parents=True, exist_ok=True)
+    ecc_cfg = orchestrator_config(WORK_DIR / "repos" / f"{repo.replace('/', '__')}.ecc.json")   # before any post
+    agent, w = entry["agent"], entry["work"]
+    worker = WORKERS[agent]
+    units = json.loads(Path(entry["plan_file"]).read_text())["units"]
+    branch = f"bot/{number}-{slugify(issue['title'])}"
+    run_id = f"iwb.{repo.split('/')[1]}.{number}.{int(w['approved_at'])}"
+    session = f"iwb.{repo.replace('/', '.')}.{number}"
+    wslug = prbot.bot_config(worker)["slug"]
+    url = post(worker, repo, number, f"{W_MARKER}\nPlan approved by `{w['approver']}`. Coding started on "
+               f"`{branch}` (orchestrator run `{run_id}`).", "bot:in-progress")
+    w.update(status="in-progress", branch=branch, run_id=run_id, started_at=time.time(), started_comment=url)
+    save_state(state)               # a pass that dies mid-run leaves in-progress behind, which the next pass reports
+    log(f"{key}: coding started, run {run_id}")
+    try:
+        d, default, base = checkout(repo, worker, branch)
+        plan = str(Path(d).parent / f"{Path(d).name}.plan.json")
+        Path(plan).write_text(json.dumps({"units": units}, indent=1) + "\n")
+        cfg = ["--config", str(ecc_cfg), "--repo", d, "--target-branch", branch,
+               "--state-dir", str(WORK_DIR / "ecc-state"), "--worktree-root", str(WORK_DIR / "worktrees")]
+        approve = ["review-plan", "--json", "--approve", "--operator", w["approver"], "--session", session, "--"]
+        create = ["create-run", "--run-id", run_id, "--plan", plan] + cfg
+        review = ecc_data(ecc, approve + create, "review-plan create-run")
+        w["plan_sha256"] = review.get("plan_sha256")
+        ecc_data(ecc, create + ["--yes", "--review-id", review["review_id"], "--json"], "create-run")
+        hours = max(1, -(-sum(u["budget"]["minutes"] for u in units) // 60))
+        drive = ["drive", "--run-id", run_id, "--max-hours", str(hours)] + cfg
+        review = ecc_data(ecc, approve + drive, "review-plan drive")
+        ecc_data(ecc, drive + ["--yes", "--review-id", review["review_id"], "--json"], "drive", DRIVE_TIMEOUT)
+        files = changed_files(d, base, branch)
+        if not files:
+            raise WorkError("the run finished without changing any file")
+        problems = scope_problems(files, units, repo)
+        if problems:
+            raise WorkError("the run changed files the plan doesn't allow: " + "; ".join(problems))
+        sha = commit_as(worker, repo, d, base, branch, f"{issue['title']} (#{number})\n\nCloses #{number}. "
+                        f"Planned by {wslug}, approved by {w['approver']}, orchestrator run {run_id}.")
+        push_branch(worker, repo, d, sha, branch, default)
+        rows = "\n".join(f"| `{u['id']}` | {u['title']} | {u['routing']['initial_tier']} |" for u in units)
+        body = (f"Closes #{number}\n\nPlanned by `{wslug}` ({entry['analysis'].get('comment', '')}), approved by "
+                f"`{w['approver']}` ({w.get('approval_comment', '')}), coded by orchestrator run `{run_id}`.\n\n"
+                f"| Unit | What | Tier |\n| --- | --- | --- |\n{rows}\n\nKenny merges; the bots never do.")
+        pr = open_pr(worker, repo, branch, default, issue["title"], body, agent)
+    except (WorkError, RuntimeError, subprocess.SubprocessError, SystemExit, OSError, KeyError) as e:
+        block(entry, worker, repo, number, issue["title"], f"{W_MARKER}\nCoding stopped: {e}", f"coding: {e}")
+        return
+    w.update(status="pr-open", pr=pr, done_at=time.time())    # recorded first: the PR exists even if the note fails
+    log(f"{key}: PR opened {pr}")
+    w["comment"] = post(worker, repo, number, f"{W_MARKER}\nPull request opened and marked ready for review: {pr}",
+                        "bot:pr-open")
+
+
+def work_lock():
+    """One step-4 pass at a time, so a manual `iwb work` never mistakes a running pass for an interrupted one."""
+    import fcntl
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    f = open(WORK_DIR / "work.lock", "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+
+
+def approved_plan(entry):
+    """(approval record, units) when main's step 4a approved the plan file as it is now, else (None, None)."""
+    ap = entry.get("approval") or {}
+    if ap.get("verdict") != "approve" or not entry.get("plan_file") or not Path(entry["plan_file"]).exists():
+        return None, None
+    units = json.loads(Path(entry["plan_file"]).read_text())["units"]
+    return (ap, units) if ap.get("plan_digest") == plan_digest(units) else (None, None)
+
+
+def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None):
+    """Step 4b: code plans that step 4a approved, in repositories listed in config.json "coding_repos"."""
+    ecc = ecc or run_ecc
+    conf = read_config()
+    if conf.get("paused"):
+        log("paused in config.json; no coding")
+        return 0
+    lock = work_lock()
+    if lock is None:
+        log("another coding pass is running; skipping")
+        return 0
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    coding = set(conf.get("coding_repos", []))
+    runs = 0
+    try:
+        for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
+            if entry.get("blocked") or entry.get("closed") or (entry.get("analysis") or {}).get("decision") != "plan":
+                continue
+            ap, units = approved_plan(entry)
+            if not ap:
+                continue
+            w = entry.get("work") or {}
+            current = w.get("plan_digest") == ap["plan_digest"]
+            if current and w.get("status") in ("pr-open", "blocked"):
+                continue                    # waiting for step 5 or for Kenny
+            repo, number = key.rsplit("#", 1)
+            if repo not in coding:
+                step = None if entry.get("coding_note") == ap["plan_digest"] else "note"
+            elif current and w.get("status") == "in-progress":
+                step = "interrupted"
+            elif time.time() - entry.get("work_failed_at", 0) < RETRY_AFTER:
+                step = None                 # the last try failed for a reason outside the plan (outage, setup)
+            else:
+                step = "code"
+            if not step:
+                continue
+            if step == "code":
+                busy = sum(1 for e in state.values() if isinstance(e, dict) and not e.get("blocked")
+                           and (e.get("work") or {}).get("status") == "in-progress")
+                if runs >= limit or busy >= IN_PROGRESS_LIMIT:
+                    log(f"{key}: coding waits for the next pass")
+                    continue
+            try:
+                issue = gh_json(["api", f"repos/{repo}/issues/{number}", "--jq",
+                                 "{state, title, labels: [.labels[].name]}"])[0]
+            except SystemExit:
+                log(f"{key}: could not read the issue; will retry")
+                continue
+            if issue["state"] != "open" or "bot:stop" in issue["labels"]:
+                continue
+            bot = WORKERS[entry["agent"]]
+            if dry_run:
+                log(f"{key}: would {step}")
+                continue
+            if step == "note":
+                try:
+                    run_gh_as(bot, repo, ["issue", "comment", number, "-R", repo, "--body",
+                                          f"{W_MARKER}\nCoding isn't enabled for `{repo}`, so this approved plan "
+                                          f"waits here. It is coded once the repository is in `coding_repos`."])
+                    entry["coding_note"] = ap["plan_digest"]
+                except RuntimeError as e:
+                    log(f"{key}: could not post the coding note, will retry: {e}")
+                continue
+            try:
+                if step == "interrupted":
+                    block(entry, bot, repo, number, issue["title"], f"{W_MARKER}\nCoding was interrupted before "
+                          f"it finished (run `{w.get('run_id')}`).", "coding was interrupted")
+                    continue
+                runs += 1
+                entry["work"] = {"status": "approved", "plan_digest": ap["plan_digest"], "approver": ap["approver"],
+                                 "approved_at": ap["at"], "approval_comment": ap.get("comment", "")}
+                code_plan(key, entry, issue, state, ecc)
+            except (RuntimeError, subprocess.SubprocessError, SystemExit, OSError) as e:
+                entry["work_failed_at"] = time.time()
+                log(f"{key}: {step} could not run; retrying in {RETRY_AFTER // 60} minutes: {e}")
+    finally:
+        if not dry_run:
+            save_state(state)
+        lock.close()
+    log(f"coding pass done: {runs} run{'s' if runs != 1 else ''}")
+    return 0
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
@@ -963,11 +1331,15 @@ def main(argv):
         return cmd_analyze(dry_run="--dry-run" in argv, limit=limit)
     if argv[0] == "approve":
         return cmd_approve(dry_run="--dry-run" in argv)
+    if argv[0] == "code":
+        return cmd_code(dry_run="--dry-run" in argv)
     if argv[0] == "tick":   # what launchd runs: pick up new issues, then analyze one
         cmd_intake()
         cmd_analyze()
         if read_config().get("approval_live"):   # step 4a joins the scheduled job only once switched on
-            return cmd_approve()
+            cmd_approve()
+        if read_config().get("coding_live"):     # step 4b too, separately
+            return cmd_code()
         return 0
     prbot.die(f"unknown command '{argv[0]}'")
 
