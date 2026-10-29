@@ -664,11 +664,29 @@ def fixable_problems(units):
             for u in units for c in u["acceptance"]["commands"] if SHELL_SYNTAX.search(c)]
 
 
+# Toolchain folders under the home folder that test runners read (uv, pip, npm, nvm, rustup and the like).
+HOME_READ_OK = (".local", ".cache", ".nvm", ".npm", ".cargo", ".rustup", ".pyenv", ".bun", "go", "Library/Caches")
+
+
 def sandbox_profile(workdir):
-    """macOS sandbox for model-written commands: no network, writes only inside the throwaway clone and temp."""
+    """macOS sandbox for model-written commands: no network, writes only inside the throwaway clone and temp, no
+    reads of the home folder except toolchain caches, and no Keychain. A command could otherwise print a private
+    key, fail on purpose, and send the key to the approver model in its output (Codex review of PR #5)."""
+    home = str(Path.home().resolve())
+    reads = " ".join(f'(subpath "{home}/{d}")' for d in HOME_READ_OK)
     return ("(version 1)(allow default)(deny network*)(deny file-write*)"
             f'(allow file-write* (subpath "{workdir}") (subpath "/private/var/folders") (subpath "/private/tmp")'
-            ' (literal "/dev/null") (literal "/dev/tty") (literal "/dev/stdout") (literal "/dev/stderr"))')
+            ' (literal "/dev/null") (literal "/dev/tty") (literal "/dev/stdout") (literal "/dev/stderr"))'
+            f'(deny file-read* (subpath "{home}"))(allow file-read* (literal "{home}") {reads} (subpath "{workdir}"))'
+            '(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))')
+
+
+def reset_to_base(repo_dir):
+    """Put a git clone back to its committed tree, so each acceptance command sees the base code and not files an
+    earlier command created (Codex review of PR #5)."""
+    if Path(repo_dir, ".git").exists():
+        subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "-q"], capture_output=True)
+        subprocess.run(["git", "-C", repo_dir, "clean", "-fdxq"], capture_output=True)
 
 
 def red_check(units, repo_dir):
@@ -682,6 +700,7 @@ def red_check(units, repo_dir):
         runs = []
         for c in u["acceptance"]["commands"]:
             try:
+                reset_to_base(repo_dir)
                 argv = shlex.split(c)
                 r = subprocess.run(["sandbox-exec", "-p", profile] + argv, cwd=repo_dir, env=env,
                                    capture_output=True, text=True, timeout=RED_TIMEOUT)
@@ -693,6 +712,7 @@ def red_check(units, repo_dir):
         mechanical = "mechanical" in u.get("traits", []) or is_docs_unit(u)
         red = any(x["exit"] != 0 for x in runs)
         results[u["id"]] = {"runs": runs, "red": red, "mechanical": mechanical, "ok": red or mechanical}
+    reset_to_base(repo_dir)
     return results
 
 
@@ -707,6 +727,14 @@ def parse_verdict(text):
         raise ValueError(f"unknown verdict {v.get('verdict')!r}")
     if v["verdict"] == "revise" and not v.get("changes"):
         raise ValueError("verdict is revise but no changes were given")
+    tiers, adds = v.get("raise_tiers", {}), v.get("add_acceptance", {})
+    if not isinstance(tiers, dict) or not all(isinstance(k, str) and isinstance(x, int) and not isinstance(x, bool)
+                                              for k, x in tiers.items()):
+        raise ValueError("raise_tiers must map unit ids to whole-number tiers")
+    if not isinstance(adds, dict) or not all(isinstance(k, str) and isinstance(x, list)
+                                             and all(isinstance(c, str) and c.strip() for c in x)
+                                             for k, x in adds.items()):
+        raise ValueError("add_acceptance must map unit ids to lists of commands")
     return v
 
 
@@ -815,6 +843,10 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
     if read_config().get("paused"):
         return 0
+    cfg = prbot.load_config()
+    owner = cfg[next(b for b in WORKERS.values() if b in cfg)]["owner"]
+    trusted = trusted_openers(owner)
+    bot_logins = {cfg[b]["slug"] + "[bot]" for b in WORKERS.values() if b in cfg}
     runs = 0
     for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
         a = entry.get("analysis") or {}
@@ -885,7 +917,8 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
             runs += 1                          # only a model review counts against the per-pass limit
             log(f"{key}: red check and {level} approval by {slug} with {model['model']} ({model['effort']} effort)")
             red = red_check(units, f"{work}/repo")
-            stdin = (f"# Issue\n{issue['title']}\n{issue['url']}\n\n# Plan\n```json\n{json.dumps({'units': units}, indent=1)}\n```\n\n"
+            _, _, text = issue_text(repo, number, trusted, bot_logins)   # the same issue text the planner saw
+            stdin = (f"# Issue ({issue['url']})\n{text}\n\n# Plan\n```json\n{json.dumps({'units': units}, indent=1)}\n```\n\n"
                      f"# Red check\n```json\n{json.dumps(red, indent=1)}\n```\n")
             prompt = APPROVAL_PROMPT.format(url=issue["url"], repo=repo, branch=branch, sha=sha[:10])
             v = parse_verdict(run_model(approver_agent, prompt, stdin, f"{work}/repo", model=model))

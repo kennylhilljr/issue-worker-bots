@@ -1,7 +1,4 @@
-<p align="center">
-  <img src="logos/claude-dev.png" alt="claude-dev-gh" width="120">
-  <img src="logos/codex-dev.png" alt="codex-dev-gh" width="120">
-</p>
+![issue-worker-bots: claude-dev-gh and codex-dev-gh picking up issues](docs/assets/readme-header.webp)
 
 <p align="center">
   <img alt="Python 3.9+" src="https://img.shields.io/badge/Python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white">
@@ -199,6 +196,7 @@ Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bo
 | `install-intake.sh` | Installs the launchd job that runs `iwb tick` every 5 minutes. |
 | `bots/` | App specs for `prbot register --spec`, including each App's permissions. |
 | `logos/` | Bot logos: SVG sources and 512 px PNGs uploaded to GitHub. |
+| `docs/assets/` | The README header (SVG source and WebP). |
 | `tests/` | Unit tests with fake GitHub, models and orchestrator: pick-up, analysis, plan approval, coding and label changes. |
 | [`DESIGN.md`](DESIGN.md) | The design: pipeline, model choice, budgets, safety and the OpenClaw bridge. |
 
