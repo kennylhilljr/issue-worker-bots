@@ -803,6 +803,10 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
     if read_config().get("paused"):
         return 0
+    cfg = prbot.load_config()
+    owner = cfg[next(b for b in WORKERS.values() if b in cfg)]["owner"]
+    trusted = trusted_openers(owner)
+    bot_logins = {cfg[b]["slug"] + "[bot]" for b in WORKERS.values() if b in cfg}
     runs = 0
     for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
         a = entry.get("analysis") or {}
@@ -873,7 +877,8 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
             runs += 1                          # only a model review counts against the per-pass limit
             log(f"{key}: red check and {level} approval by {slug} with {model['model']} ({model['effort']} effort)")
             red = red_check(units, f"{work}/repo")
-            stdin = (f"# Issue\n{issue['title']}\n{issue['url']}\n\n# Plan\n```json\n{json.dumps({'units': units}, indent=1)}\n```\n\n"
+            _, _, text = issue_text(repo, number, trusted, bot_logins)   # the same issue text the planner saw
+            stdin = (f"# Issue ({issue['url']})\n{text}\n\n# Plan\n```json\n{json.dumps({'units': units}, indent=1)}\n```\n\n"
                      f"# Red check\n```json\n{json.dumps(red, indent=1)}\n```\n")
             prompt = APPROVAL_PROMPT.format(url=issue["url"], repo=repo, branch=branch, sha=sha[:10])
             v = parse_verdict(run_model(approver_agent, prompt, stdin, f"{work}/repo", model=model))

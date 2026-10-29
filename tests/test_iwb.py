@@ -384,10 +384,12 @@ class Approve(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         names = ("STATE", "CONFIG", "clone", "run_model", "post", "red_check", "lint_findings")
         self.saved_iwb = {k: getattr(iwb, k) for k in names}
-        self.saved = {k: getattr(iwb.prbot, k) for k in ("gh_read", "bot_config", "openclaw_attention")}
+        self.saved = {k: getattr(iwb.prbot, k) for k in ("gh_read", "bot_config", "openclaw_attention", "load_config")}
         iwb.STATE = Path(self.tmp.name, "state.json")
         iwb.CONFIG = Path(self.tmp.name, "config.json")
-        iwb.prbot.gh_read = lambda args: json.dumps({"state": "open", "labels": [], "title": "T", "url": "https://x/1"})
+        iwb.prbot.gh_read = self.fake_gh
+        iwb.prbot.load_config = lambda: {"claude-dev": {"owner": OWNER, "slug": "claude-dev-gh"},
+                                         "codex-dev": {"owner": OWNER, "slug": "codex-dev-gh"}}
         iwb.prbot.bot_config = lambda bot: {"slug": {"claude": "claude-pr-gh", "codex": "codex-pr-gh"}.get(bot, bot + "-gh")}
         self.events = []
         iwb.prbot.openclaw_attention = lambda r, d: self.events.append(r)
@@ -409,6 +411,23 @@ class Approve(unittest.TestCase):
         for k, v in self.saved.items():
             setattr(iwb.prbot, k, v)
         self.tmp.cleanup()
+
+    def fake_gh(self, args):
+        if "/comments" in args[1]:
+            return json.dumps({"user": OWNER, "body": "Make the header match the example.", "at": "2026-01-01T00:00:00Z"})
+        return json.dumps({"state": "open", "labels": [], "title": "T", "url": "https://x/1",
+                           "body": "Update the README.", "user": OWNER})
+
+    def test_approver_sees_the_issue_body_and_trusted_comments(self):
+        # regression: issue-worker-bots#2 was rejected as "an unspecified README update" because the approver
+        # only got the title and URL, not the body or Kenny's comment about the header
+        self.plan(code_unit())
+        seen = []
+        iwb.run_model = lambda agent, prompt, stdin, cwd, model=None: seen.append(stdin) or \
+            '```json\n{"verdict": "approve", "summary": "ok"}\n```'
+        self.run_pass()
+        self.assertIn("Update the README.", seen[0])
+        self.assertIn("Make the header match the example.", seen[0])
 
     def plan(self, *units, agent="claude"):
         f = Path(self.tmp.name, "plan.json")
