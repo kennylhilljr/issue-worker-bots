@@ -156,6 +156,68 @@ Two cautions:
 - Tokens come from `prbot`: one hour, one repository, never printed or saved.
 - The guard hook and the `cross-review` skill already stop agents from posting or pushing as Kenny.
 
+## Bridge to OpenClaw
+
+Goal: what the bots do on GitHub shows up in OpenClaw, Kenny can answer from either side, and nothing about OpenClaw gets exposed to the internet unless that is chosen on purpose.
+
+### What OpenClaw accepts today
+
+| Piece | Where | Rule that matters here |
+| --- | --- | --- |
+| Event log | `~/.local/state/openclaw-ecc-orchestrator/openclaw-events.jsonl` | One JSON event per line. `seq` must rise across every writer, so writers go through the runtime's `JsonlEventSink`, which takes a file lock, redacts secrets and truncates long text. |
+| Event types | `docs/openclaw-events.md` | The plugin renders seven known types and ignores any other type. Every event needs a `run_id` matching `^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$`. |
+| Decision inbox | `~/.local/state/openclaw-ecc-orchestrator/decisions/` | One decision per file, written to a temp name and renamed in. A decision only counts if its binding fields (request id, run, unit, action, plan hash, session) match a pending `approval.requested`. Replays are rejected. |
+| Gateway | `http://127.0.0.1:18789/` | Local only. GitHub cannot reach it. |
+
+One detail drives the event choice below: the plugin creates a run entry for every `run_id` it sees, including on `attention.required`. Emitting one event per GitHub issue under its own `run_id` would fill OpenClaw's run list with one fake run per issue.
+
+### Phase A: polling bridge (no exposure)
+
+The bots already look at GitHub every 5 minutes. They also emit what they did into the event log.
+
+- **Writer.** `iwb` and `prbot` import `JsonlEventSink` from the installed runtime (`~/.local/share/openclaw-ecc-orchestrator/runtime/src`) and call `emit(type, run_id, unit_id, data)`. Locking, ordering, redaction and truncation come with it. If the runtime can't be imported or the file is locked for too long, the bot logs it once and carries on; GitHub work never waits on OpenClaw.
+- **One pseudo-run.** All GitHub activity uses a single `run_id`, `github`, so OpenClaw shows one entry for it instead of one per issue.
+- **Only what needs Kenny, as `attention.required`.** This type renders today with no plugin change:
+
+| Bot moment | `reason` (100 characters max) | `detail` |
+| --- | --- | --- |
+| Questions posted | `questions: <repo>#<n>` | issue title, URL, worker bot, model |
+| Plan posted | `plan ready: <repo>#<n>` | title, URL, number of units, highest tier |
+| Issue blocked | `blocked: <repo>#<n>` | the reason, URL |
+| Review with P1 or P2 findings | `review findings: <repo>#<pr>` | reviewer bot, number of findings, URL |
+
+- **Everything else, as `github.activity`, later.** Picked up, no-code answers, PRs opened, reviews without findings, pushes. The runtime's `make_event` rejects types it doesn't know, so this needs two small changes first: `github.activity` added to `EVENT_TYPES` in the orchestrator runtime (required field `kind`, no unit), and a plugin case that keeps a bounded list (like `merges`) and never creates a run. Until then, only the four moments above are emitted.
+- **Once per moment.** Each emitted event is recorded in the bot's state file (for example `events: ["plan ready"]` on the issue entry), so a pass never emits the same moment twice.
+
+All text from GitHub stays display data. The plugin already sanitizes it, and nothing in OpenClaw acts on its content.
+
+### Phase B: webhooks (optional, seconds instead of minutes)
+
+Only worth it if 5 minutes is too slow.
+
+- **Which App.** `openclaw-ops-assist`, if Kenny controls its settings and it should be OpenClaw's GitHub identity; otherwise a new read-only App, `openclaw-gh-events`, subscribed to issues, issue comments, pull requests and pull request reviews. The worker and review bots keep webhooks off.
+- **Receiver.** A small standard-library HTTP server on `127.0.0.1`, published through Tailscale Funnel (already on Kenny's tailnet) or a Cloudflare Tunnel. Before anything else it checks `X-Hub-Signature-256` against a webhook secret kept in Keychain, rejects bodies over 1 MB, and drops repeated `X-GitHub-Delivery` ids.
+- **Nudge, never trust.** A valid delivery only triggers `launchctl kickstart` of the intake and review jobs, at most once every 30 seconds. The jobs then read GitHub themselves, exactly as when polling. Nothing in the payload is executed, stored or sent to a model.
+- **Polling stays.** If the tunnel or receiver is down, the 5-minute jobs still catch everything.
+
+The risk is the public endpoint itself: it is a door into a machine that runs coding agents. Keeping the receiver to signature checking plus a nudge keeps that door narrow.
+
+### Phase C: approvals from either side (after step 4)
+
+Step 4 starts orchestrator runs, and Tier 2 plans need Kenny's approval. The runtime emits `approval.requested` with the plan hash. Approvals can then come from either place:
+
+- **From GitHub.** The worker bot posts the plan with the first 8 characters of its hash and asks for `/approve <hash>` or `/reject <hash>`. When intake sees that comment from `kennylhilljr` (checked by author, never from anyone else), it copies the binding fields from the pending `approval.requested` event, adds `decision` and `decided_by: "kennylhilljr via GitHub"`, and writes the file into the decision inbox the same way the plugin does (temp file with mode 0600, fsync, rename). A hash that doesn't match the pending request is answered with a comment and not written; if the plan changed, the old approval cannot bind to the new one. A 👍 reaction is not enough on its own, because it carries no hash.
+- **From OpenClaw.** Kenny decides in OpenClaw as today. On the next pass the bot sees `approval.resolved` in the event log and posts "Approved in OpenClaw by Kenny" (or rejected) on the issue, so the GitHub thread stays complete.
+
+The runtime's validation is unchanged either way: binding fields, plan hash and replay protection decide whether an approval counts. One timing caveat from the plugin README: the runtime consumes inbox files only in `approvals approve`, `approvals reject` or `DecisionInbox.process`, so a decision written from GitHub waits until one of those runs. Step 4's runner should call `DecisionInbox.process` on each pass.
+
+### Bridge build order
+
+1. Phase A writer in `iwb` with the four `attention.required` moments, then in `prbot` for review findings.
+2. `github.activity`: add the type to the runtime's `EVENT_TYPES` and the plugin, then emit it.
+3. Phase C once step 4 creates real runs.
+4. Phase B only if the 5-minute delay turns out to matter.
+
 ## Where it lives
 
 A new repository, `issue-worker-bots`, holds the intake watcher, the analysis prompt and its output schema, the clarity gate, and the glue that starts orchestrator runs and opens PRs. It depends on two existing pieces:
@@ -179,3 +241,5 @@ A new repository, `issue-worker-bots`, holds the intake watcher, the analysis pr
 3. Should Tier 1 plans also wait for your 👍, at least at first?
 4. All 21 repositories, or start with a list?
 5. Once the workers push, should the review bots go back to contents read-only?
+6. For webhooks, if ever: reuse `openclaw-ops-assist`, or a new `openclaw-gh-events` App?
+7. Is one `github` pseudo-run in OpenClaw the right grouping, or one per repository?
