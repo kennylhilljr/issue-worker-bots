@@ -366,6 +366,52 @@ class Analyze(unittest.TestCase):
         self.assertNotIn("analysis", self.state())
 
 
+class RedCheckReview(unittest.TestCase):
+    """Codex review of PR #5 (2026-10-29), which applies to step 4a on main."""
+
+    def test_cannot_read_files_in_the_home_folder(self):
+        # P1: a model-written command could print a private key, fail on purpose and pass the red check,
+        # and its output went to the approver model.
+        with tempfile.TemporaryDirectory(dir=Path.home()) as home_tmp, tempfile.TemporaryDirectory() as work:
+            secret = Path(home_tmp, "id_test")
+            secret.write_text("SECRET-VALUE")
+            repo = Path(work, "repo")
+            repo.mkdir()
+            units = [code_unit("u", cmds=[f"python3 -c \"print(open('{secret}').read())\""])]
+            r = iwb.red_check(units, str(repo))["u"]
+            self.assertNotEqual(r["runs"][0]["exit"], 0)
+            self.assertNotIn("SECRET-VALUE", r["runs"][0]["output"])
+
+    def test_each_command_starts_from_the_base_tree(self):
+        # P2: a first command created a file and failed; a later `test -f` then passed although it fails on base.
+        with tempfile.TemporaryDirectory() as work:
+            repo = Path(work, "repo")
+            repo.mkdir()
+            for args in (["init", "-q"], ["config", "user.email", "t@example.net"], ["config", "user.name", "t"]):
+                iwb.subprocess.run(["git", "-C", str(repo)] + args, check=True)
+            Path(repo, "README").write_text("base\n")
+            iwb.subprocess.run(["git", "-C", str(repo), "add", "README"], check=True)
+            iwb.subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+            units = [code_unit("a", cmds=["python3 -c \"open('flag', 'w').write('x'); raise SystemExit(1)\""]),
+                     code_unit("b", cmds=["test -f flag"])]
+            r = iwb.red_check(units, str(repo))
+            self.assertNotEqual(r["b"]["runs"][0]["exit"], 0)
+            self.assertTrue(r["b"]["red"])
+
+    def test_malformed_verdict_fields_are_refused(self):
+        # P2: a string in add_acceptance was iterated character by character into commands.
+        bad = ('```json\n{"verdict": "approve", "add_acceptance": {"u1": "pytest tests/x.py"}}\n```',
+               '```json\n{"verdict": "approve", "raise_tiers": {"u1": "2"}}\n```',
+               '```json\n{"verdict": "approve", "add_acceptance": [["pytest"]]}\n```')
+        for text in bad:
+            with self.assertRaises(ValueError):
+                iwb.parse_verdict(text)
+        units = [code_unit("u1")]
+        v = iwb.parse_verdict('```json\n{"verdict": "approve", "add_acceptance": {"nope": ["x"], "u1": ["pytest -q"]}}\n```')
+        out = iwb.apply_verdict(units, v)
+        self.assertIn("pytest -q", out[0]["acceptance"]["commands"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
