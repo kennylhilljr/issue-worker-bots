@@ -652,11 +652,29 @@ def fixable_problems(units):
             for u in units for c in u["acceptance"]["commands"] if SHELL_SYNTAX.search(c)]
 
 
+# Toolchain folders under the home folder that test runners read (uv, pip, npm, nvm, rustup and the like).
+HOME_READ_OK = (".local", ".cache", ".nvm", ".npm", ".cargo", ".rustup", ".pyenv", ".bun", "go", "Library/Caches")
+
+
 def sandbox_profile(workdir):
-    """macOS sandbox for model-written commands: no network, writes only inside the throwaway clone and temp."""
+    """macOS sandbox for model-written commands: no network, writes only inside the throwaway clone and temp, no
+    reads of the home folder except toolchain caches, and no Keychain. A command could otherwise print a private
+    key, fail on purpose, and send the key to the approver model in its output (Codex review of PR #5)."""
+    home = str(Path.home().resolve())
+    reads = " ".join(f'(subpath "{home}/{d}")' for d in HOME_READ_OK)
     return ("(version 1)(allow default)(deny network*)(deny file-write*)"
             f'(allow file-write* (subpath "{workdir}") (subpath "/private/var/folders") (subpath "/private/tmp")'
-            ' (literal "/dev/null") (literal "/dev/tty") (literal "/dev/stdout") (literal "/dev/stderr"))')
+            ' (literal "/dev/null") (literal "/dev/tty") (literal "/dev/stdout") (literal "/dev/stderr"))'
+            f'(deny file-read* (subpath "{home}"))(allow file-read* (literal "{home}") {reads} (subpath "{workdir}"))'
+            '(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))')
+
+
+def reset_to_base(repo_dir):
+    """Put a git clone back to its committed tree, so each acceptance command sees the base code and not files an
+    earlier command created (Codex review of PR #5)."""
+    if Path(repo_dir, ".git").exists():
+        subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "-q"], capture_output=True)
+        subprocess.run(["git", "-C", repo_dir, "clean", "-fdxq"], capture_output=True)
 
 
 def red_check(units, repo_dir):
@@ -670,6 +688,7 @@ def red_check(units, repo_dir):
         runs = []
         for c in u["acceptance"]["commands"]:
             try:
+                reset_to_base(repo_dir)
                 argv = shlex.split(c)
                 r = subprocess.run(["sandbox-exec", "-p", profile] + argv, cwd=repo_dir, env=env,
                                    capture_output=True, text=True, timeout=RED_TIMEOUT)
@@ -681,6 +700,7 @@ def red_check(units, repo_dir):
         mechanical = "mechanical" in u.get("traits", []) or is_docs_unit(u)
         red = any(x["exit"] != 0 for x in runs)
         results[u["id"]] = {"runs": runs, "red": red, "mechanical": mechanical, "ok": red or mechanical}
+    reset_to_base(repo_dir)
     return results
 
 
@@ -695,6 +715,14 @@ def parse_verdict(text):
         raise ValueError(f"unknown verdict {v.get('verdict')!r}")
     if v["verdict"] == "revise" and not v.get("changes"):
         raise ValueError("verdict is revise but no changes were given")
+    tiers, adds = v.get("raise_tiers", {}), v.get("add_acceptance", {})
+    if not isinstance(tiers, dict) or not all(isinstance(k, str) and isinstance(x, int) and not isinstance(x, bool)
+                                              for k, x in tiers.items()):
+        raise ValueError("raise_tiers must map unit ids to whole-number tiers")
+    if not isinstance(adds, dict) or not all(isinstance(k, str) and isinstance(x, list)
+                                             and all(isinstance(c, str) and c.strip() for c in x)
+                                             for k, x in adds.items()):
+        raise ValueError("add_acceptance must map unit ids to lists of commands")
     return v
 
 
