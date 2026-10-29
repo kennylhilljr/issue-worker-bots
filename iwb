@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""iwb: issue worker bots. Step 2 of DESIGN.md: intake only.
+
+  iwb intake [--dry-run] [--baseline] [--limit N]
+      One pass over open issues on every repository the worker bots are installed on. An issue
+      qualifies when the owner opened it, or the owner added the bot:work label. The chosen worker
+      bot comments once and adds bot:queued. Nothing else happens yet; analysis is step 3.
+      --dry-run   print what would be picked up; post and save nothing
+      --baseline  mark the issues open right now as seen, without commenting
+      --limit N   pick up at most N issues per pass (default 5)
+
+Sign-in, tokens and repository lists come from prbot (PRBOT_PATH, default ../pr-review-bots/prbot).
+"""
+import importlib.util, json, os, subprocess, sys, time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+PRBOT_PATH = Path(os.environ.get("PRBOT_PATH", ROOT.parent / "pr-review-bots" / "prbot"))
+STATE = Path(os.environ.get("IWB_STATE", Path.home() / ".config" / "issue-worker-bots" / "state.json"))
+CONFIG = Path(os.environ.get("IWB_CONFIG", Path.home() / ".config" / "issue-worker-bots" / "config.json"))
+WORKERS = {"claude": "claude-dev", "codex": "codex-dev"}   # agent -> prbot bot name
+LIMIT = 5
+MARKER = "<!-- iwb:picked-up -->"
+QUEUED = ("bot:queued", "C5DEF5", "Picked up by an issue worker bot; waiting for analysis")
+
+
+def load_prbot():
+    loader = SourceFileLoader("prbot", str(PRBOT_PATH))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("prbot", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+prbot = load_prbot()
+
+
+def log(msg):
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
+
+
+def gh_json(args):
+    out = prbot.gh_read(args)
+    return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+
+def open_issues(repo):
+    """Open issues (not pull requests), one JSON object per issue."""
+    return gh_json(["api", f"repos/{repo}/issues?state=open&per_page=100", "--paginate",
+                    "--jq", ".[] | select(.pull_request | not)"])
+
+
+def label_added_by(repo, number, label):
+    """Login of whoever most recently added this label, read from the issue's history."""
+    events = gh_json(["api", f"repos/{repo}/issues/{number}/events?per_page=100", "--paginate",
+                      "--jq", '.[] | select(.event == "labeled") | {label: .label.name, actor: .actor.login}'])
+    who = [e["actor"] for e in events if e["label"] == label]
+    return who[-1] if who else None
+
+
+def already_commented(repo, number, bot_logins):
+    comments = gh_json(["api", f"repos/{repo}/issues/{number}/comments?per_page=100", "--paginate",
+                        "--jq", ".[] | {user: .user.login, body: .body}"])
+    return any(c["user"] in bot_logins and MARKER in (c["body"] or "") for c in comments)
+
+
+def trusted_openers(owner):
+    """The owner, plus any accounts listed in config.json "trusted_openers" (for example the owner's own bots)."""
+    extra = json.loads(CONFIG.read_text()).get("trusted_openers", []) if CONFIG.exists() else []
+    return {owner, *extra}
+
+
+def qualifies(repo, issue, owner):
+    """(True, reason) if the bots may work on this issue, else (False, reason). Only the owner can add bot:work."""
+    labels = {l["name"] for l in issue.get("labels", [])}
+    if "bot:skip" in labels:
+        return False, "labeled bot:skip"
+    if any(a.get("type") == "User" for a in issue.get("assignees", [])):
+        return False, "assigned to a person"
+    opener = issue["user"]["login"]
+    if opener in trusted_openers(owner):
+        return True, f"opened by {opener}"
+    if "bot:work" in labels:
+        who = label_added_by(repo, issue["number"], "bot:work")
+        if who == owner:
+            return True, f"bot:work added by {owner}"
+        return False, f"bot:work added by {who or 'unknown'}, not {owner}"
+    return False, f"opened by {issue['user']['login']}, not {owner}"
+
+
+def choose_agent(issue, state):
+    labels = {l["name"] for l in issue.get("labels", [])}
+    for agent in WORKERS:
+        if f"agent:{agent}" in labels:
+            return agent
+    last = state.get("_last_agent")
+    return "codex" if last == "claude" else "claude"   # alternate so neither subscription runs out first
+
+
+def run_gh_as(bot, repo, args):
+    env = dict(os.environ, GH_TOKEN=prbot.installation_token(bot, repo), PRBOT_ACTIVE=bot)
+    env.pop("GITHUB_TOKEN", None)
+    r = subprocess.run([prbot._real_gh()] + args, env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args[:2])} failed: {r.stderr.strip()[:300]}")
+    return r.stdout.strip()
+
+
+def pick_up(repo, issue, agent, reason):
+    bot = WORKERS[agent]
+    slug = prbot.bot_config(bot)["slug"]
+    body = (f"{MARKER}\nPicked up by `{slug}` ({reason}). Queued for analysis.\n\n"
+            f"Analysis and coding aren't running yet, so nothing else will happen on this issue for now. "
+            f"Add `bot:skip` to opt out, or `agent:claude` / `agent:codex` to choose the worker.")
+    name, color, desc = QUEUED
+    run_gh_as(bot, repo, ["label", "create", name, "-R", repo, "--color", color, "--description", desc, "--force"])
+    run_gh_as(bot, repo, ["issue", "edit", str(issue["number"]), "-R", repo, "--add-label", name])
+    return run_gh_as(bot, repo, ["issue", "comment", str(issue["number"]), "-R", repo, "--body", body])
+
+
+def cmd_intake(dry_run=False, baseline=False, limit=LIMIT):
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    cfg = prbot.load_config()
+    bots = [b for b in WORKERS.values() if b in cfg]
+    if not bots:
+        prbot.die("no worker bot is registered; run prbot register claude-dev --spec bots/claude-dev.json")
+    owner = cfg[bots[0]]["owner"]
+    bot_logins = {cfg[b]["slug"] + "[bot]" for b in bots}
+    installed = {b: prbot.installed_repos(b) for b in bots}
+    picked = 0
+    for repo in sorted(set().union(*installed.values())):
+        try:
+            issues = open_issues(repo)
+        except SystemExit:
+            log(f"{repo}: could not list issues; skipping this pass")
+            continue
+        for issue in issues:
+            key = f"{repo}#{issue['number']}"
+            if key in state:
+                continue
+            if baseline:
+                state[key] = {"baseline": True}
+                log(f"{key}: marked as seen; it will not be picked up")
+                continue
+            try:
+                ok, reason = qualifies(repo, issue, owner)
+                if not ok:
+                    continue
+                if already_commented(repo, issue["number"], bot_logins):
+                    state[key] = {"picked_up_at": time.time(), "note": "found an earlier pick-up comment"}
+                    continue
+            except SystemExit:
+                log(f"{key}: could not read the issue; will retry")
+                continue
+            agent = choose_agent(issue, state)
+            if WORKERS[agent] not in bots or repo not in installed[WORKERS[agent]]:
+                log(f"{key}: qualifies ({reason}), but {WORKERS[agent]}-gh is not registered or installed here")
+                continue
+            if picked >= limit:
+                log(f"{key}: qualifies ({reason}); waits for the next pass (limit {limit})")
+                continue
+            picked += 1
+            if dry_run:
+                state["_last_agent"] = agent   # not saved; keeps the alternation honest in the preview
+                log(f"{key}: would be picked up by {WORKERS[agent]}-gh ({reason}): {issue['title'][:70]}")
+                continue
+            try:
+                url = pick_up(repo, issue, agent, reason)
+            except RuntimeError as e:
+                log(f"{key}: pick-up failed, will retry: {e}")
+                continue
+            state[key] = {"agent": agent, "picked_up_at": time.time(), "comment": url}
+            state["_last_agent"] = agent
+            log(f"{key}: picked up by {WORKERS[agent]}-gh ({reason}) {url}")
+    if not dry_run:
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(json.dumps(state, indent=1) + "\n")
+    log(f"pass done: {picked} issue{'s' if picked != 1 else ''} {'would be ' if dry_run else ''}picked up")
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if argv[0] == "intake":
+        limit = int(argv[argv.index("--limit") + 1]) if "--limit" in argv else LIMIT
+        return cmd_intake(dry_run="--dry-run" in argv, baseline="--baseline" in argv, limit=limit)
+    prbot.die(f"unknown command '{argv[0]}'")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
