@@ -368,3 +368,144 @@ class Analyze(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def code_unit(uid="fix", tier=1, risk="low", files=("src/app.py", "tests/test_app.py"), cmds=("python3 -m unittest",), **kw):
+    u = unit(uid, scope={"files": list(files)}, acceptance={"commands": list(cmds)}, risk=risk)
+    u["routing"] = {**u["routing"], "initial_tier": tier}
+    u.update(kw)
+    return u
+
+
+class Approve(unittest.TestCase):
+    KEY = "kennylhilljr/demo#1"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        names = ("STATE", "CONFIG", "clone", "run_model", "post", "red_check", "lint_findings")
+        self.saved_iwb = {k: getattr(iwb, k) for k in names}
+        self.saved = {k: getattr(iwb.prbot, k) for k in ("gh_read", "bot_config", "openclaw_attention")}
+        iwb.STATE = Path(self.tmp.name, "state.json")
+        iwb.CONFIG = Path(self.tmp.name, "config.json")
+        iwb.prbot.gh_read = lambda args: json.dumps({"state": "open", "labels": [], "title": "T", "url": "https://x/1"})
+        iwb.prbot.bot_config = lambda bot: {"slug": {"claude": "claude-pr-gh", "codex": "codex-pr-gh"}.get(bot, bot + "-gh")}
+        self.events = []
+        iwb.prbot.openclaw_attention = lambda r, d: self.events.append(r)
+        iwb.clone = lambda repo, bot: (tempfile.mkdtemp(dir=self.tmp.name), "main", "abc123")
+        self.lint, self.red, self.verdicts, self.models, self.posts = [], None, [], [], []
+        iwb.lint_findings = lambda units, d, b: list(self.lint)
+        iwb.red_check = lambda units, d: self.red or {u["id"]: {"runs": [{"command": "x", "exit": 1, "output": ""}],
+                                                                "red": True, "mechanical": False, "ok": True} for u in units}
+
+        def fake_model(agent, prompt, stdin, cwd, model=None):
+            self.models.append((agent, model))
+            return "```json\n" + json.dumps(self.verdicts.pop(0)) + "\n```"
+        iwb.run_model = fake_model
+        iwb.post = lambda bot, repo, n, body, label: self.posts.append((bot, label, body)) or "https://x/c"
+
+    def tearDown(self):
+        for k, v in self.saved_iwb.items():
+            setattr(iwb, k, v)
+        for k, v in self.saved.items():
+            setattr(iwb.prbot, k, v)
+        self.tmp.cleanup()
+
+    def plan(self, *units, agent="claude"):
+        f = Path(self.tmp.name, "plan.json")
+        f.write_text(json.dumps({"units": list(units)}))
+        iwb.STATE.write_text(json.dumps({self.KEY: {"agent": agent, "plan_file": str(f),
+                                                    "analysis": {"decision": "plan", "at": 1}}}))
+
+    def entry(self):
+        return json.loads(iwb.STATE.read_text())[self.KEY]
+
+    def run_pass(self, **kw):
+        with redirect_stdout(io.StringIO()):
+            iwb.cmd_approve(**kw)
+
+    def test_docs_plan_is_approved_by_rule_with_no_model(self):
+        # issue-worker-bots#2: a README update must not pay for a frontier-model review
+        self.plan(code_unit("readme", files=["README.md"], cmds=["python3 -m unittest tests.test_readme"]))
+        self.run_pass()
+        self.assertEqual(self.models, [])
+        self.assertEqual(self.posts[0][:2], ("codex", "bot:approved"))   # Claude's plan, Codex's review bot
+        self.assertEqual(self.entry()["approval"]["level"], "auto")
+        self.run_pass()
+        self.assertEqual(len(self.posts), 1)                             # the same plan is judged once
+
+    def test_docs_at_tier_two_get_the_cheap_reviewer_not_the_frontier_one(self):
+        self.plan(code_unit("runbook", tier=2, files=["skills/x/SKILL.md"]))
+        self.verdicts = [{"verdict": "approve", "summary": "ok"}]
+        self.run_pass()
+        self.assertEqual(self.models[0], ("codex", {"model": "gpt-6.1-sol", "effort": "low"}))
+
+    def test_code_levels_pick_the_reviewer_by_risk(self):
+        self.plan(code_unit(tier=1))
+        self.verdicts = [{"verdict": "approve", "summary": "ok", "raise_tiers": {"fix": 0}}]
+        self.run_pass()
+        self.assertEqual(self.models[0], ("codex", {"model": "gpt-6.1-sol", "effort": "low"}))
+        saved = json.loads(Path(self.entry()["plan_file"]).read_text())["units"][0]
+        self.assertEqual(saved["routing"]["initial_tier"], 1)            # a reviewer can never lower a tier
+        self.plan(code_unit(tier=2, traits=["security"]), agent="codex")
+        self.verdicts = [{"verdict": "approve", "summary": "ok", "add_acceptance": {"fix": ["python3 -m pytest -q"]}}]
+        self.run_pass()
+        self.assertEqual(self.models[1], ("claude", {"model": "opus", "effort": "high"}))
+        saved = json.loads(Path(self.entry()["plan_file"]).read_text())["units"][0]
+        self.assertIn("python3 -m pytest -q", saved["acceptance"]["commands"])
+
+    def test_revise_once_then_block_and_reject_blocks(self):
+        self.plan(code_unit())
+        self.verdicts = [{"verdict": "revise", "summary": "x", "changes": ["test the error path"]}]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:planned")
+        self.assertTrue(self.entry()["replan"])
+        f = Path(self.entry()["plan_file"])
+        f.write_text(json.dumps({"units": [code_unit(files=["src/app.py", "tests/test_err.py"])]}))   # revised plan
+        self.verdicts = [{"verdict": "reject", "summary": "wrong approach"}]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:blocked")
+        self.assertEqual(self.events, ["blocked: kennylhilljr/demo#1"])
+
+    def test_green_before_the_change_turns_approve_into_revise(self):
+        self.plan(code_unit())
+        self.red = {"fix": {"runs": [{"command": "x", "exit": 0, "output": "OK"}], "red": False,
+                            "mechanical": False, "ok": False}}
+        self.verdicts = [{"verdict": "approve", "summary": "fine"}]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:planned")
+        self.assertIn("already pass on the unchanged code", self.posts[-1][2])
+
+    def test_gates(self):
+        self.plan(code_unit(files=[".github/workflows/ci.yml"]))
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:blocked")                 # policy: no agent can approve this
+        self.assertEqual(self.models, [])
+        self.plan(code_unit(cmds=["grep -q foo README.md && echo ok"]))
+        self.run_pass()
+        self.assertIn("needs a shell", self.posts[-1][2])                 # fixable: back to the planner
+        self.assertEqual(self.posts[-1][1], "bot:planned")
+        self.plan(code_unit())
+        self.lint = ["lint acceptance.command_path_missing: x"]
+        self.run_pass()
+        self.assertIn("lint acceptance.command_path_missing", self.posts[-1][2])
+        self.assertEqual(self.models, [])
+
+    def test_command_screen_reads_programs_not_strings(self):
+        self.assertIsNone(iwb.denied_command("python3 -c \"assert 'prbot git' in s\""))
+        self.assertEqual(iwb.denied_command("python3 -m unittest && git push origin main"), "git push")
+        self.assertEqual(iwb.denied_command("curl https://x"), "curl")
+
+
+class RedCheckSandbox(unittest.TestCase):
+    def test_runs_without_a_shell_and_cannot_write_outside_the_clone(self):
+        with tempfile.TemporaryDirectory(dir=Path.home()) as home_tmp, tempfile.TemporaryDirectory() as work:
+            repo = Path(work, "repo")
+            repo.mkdir()
+            outside = Path(home_tmp, "escaped.txt")
+            units = [code_unit("u", cmds=["python3 -c \"import sys; sys.exit(1)\"",
+                                          f"python3 -c \"open('{outside}', 'w').write('x')\""])]
+            r = iwb.red_check(units, str(repo))["u"]
+            self.assertEqual(r["runs"][0]["exit"], 1)
+            self.assertNotEqual(r["runs"][1]["exit"], 0)
+            self.assertFalse(outside.exists())
+            self.assertTrue(r["red"])
