@@ -569,7 +569,7 @@ def tell_openclaw(repo, number, title, slug, model, answer, url):
 APPROVERS = {"claude": "codex", "codex": "claude"}       # worker agent -> agent whose review bot approves
 REVIEW_BOTS = {"claude": "claude", "codex": "codex"}     # agent -> prbot name of its review bot (claude-pr-gh, ...)
 APPROVE_LIMIT = 1
-LIGHT_MODELS = {"claude": {"model": "sonnet", "effort": "low"}, "codex": {"model": "gpt-6.1-sol", "effort": "low"}}
+LIGHT_MODELS = {"claude": {"model": "sonnet", "effort": "low"}, "codex": {"model": "gpt-5.6-sol", "effort": "low"}}   # gpt-6.1-sol isn't available on ChatGPT-account Codex
 DOC_FILE = re.compile(r"(\.(md|mdx|rst|txt|adoc)$|(^|/)docs?/)", re.I)
 RED_TIMEOUT = 600
 P_MARKER = "<!-- iwb:approval -->"
@@ -808,6 +808,8 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
         a = entry.get("analysis") or {}
         if a.get("decision") != "plan" or entry.get("blocked") or entry.get("closed") or not entry.get("plan_file"):
             continue
+        if time.time() - entry.get("approval_failed_at", 0) < RETRY_AFTER:
+            continue                                   # a model failure (limit, outage) retries after an hour
         units = json.loads(Path(entry["plan_file"]).read_text())["units"]
         digest = plan_digest(units)
         done = entry.get("approval") or {}

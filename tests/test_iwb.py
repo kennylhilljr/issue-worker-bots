@@ -437,13 +437,13 @@ class Approve(unittest.TestCase):
         self.plan(code_unit("runbook", tier=2, files=["skills/x/SKILL.md"]))
         self.verdicts = [{"verdict": "approve", "summary": "ok"}]
         self.run_pass()
-        self.assertEqual(self.models[0], ("codex", {"model": "gpt-6.1-sol", "effort": "low"}))
+        self.assertEqual(self.models[0], ("codex", {"model": "gpt-5.6-sol", "effort": "low"}))
 
     def test_code_levels_pick_the_reviewer_by_risk(self):
         self.plan(code_unit(tier=1))
         self.verdicts = [{"verdict": "approve", "summary": "ok", "raise_tiers": {"fix": 0}}]
         self.run_pass()
-        self.assertEqual(self.models[0], ("codex", {"model": "gpt-6.1-sol", "effort": "low"}))
+        self.assertEqual(self.models[0], ("codex", {"model": "gpt-5.6-sol", "effort": "low"}))
         saved = json.loads(Path(self.entry()["plan_file"]).read_text())["units"][0]
         self.assertEqual(saved["routing"]["initial_tier"], 1)            # a reviewer can never lower a tier
         self.plan(code_unit(tier=2, traits=["security"]), agent="codex")
