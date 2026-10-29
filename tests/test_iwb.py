@@ -134,7 +134,9 @@ class Analyze(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         p = iwb.prbot
-        self.saved = {k: getattr(p, k) for k in ("load_config", "gh_read", "bot_config")}
+        self.saved = {k: getattr(p, k) for k in ("load_config", "gh_read", "bot_config", "openclaw_attention")}
+        self.events = []
+        p.openclaw_attention = lambda reason, detail: self.events.append((reason, detail)) or True
         self.saved_iwb = {k: getattr(iwb, k) for k in ("STATE", "CONFIG", "PLANS_DIR", "clone", "run_model", "post")}
         iwb.STATE = Path(self.tmp.name, "state.json")
         iwb.CONFIG = Path(self.tmp.name, "config.json")
@@ -249,6 +251,35 @@ class Analyze(unittest.TestCase):
         self.assertIn("This issue only tests intake.", self.posts[0][2])
         self.run_pass()
         self.assertEqual(len(self.posts), 1)
+
+    def test_openclaw_hears_what_needs_kenny_once(self):
+        self.answers = [answer({"decision": "questions", "summary": "?", "questions": ["a", "b"]})]
+        self.run_pass()
+        self.assertEqual([r for r, _ in self.events], ["questions: kennylhilljr/demo#1"])
+        self.assertEqual(self.events[0][1]["questions"], 2)
+        self.run_pass()
+        self.assertEqual(len(self.events), 1)   # no new event without a new moment
+        later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+        self.comments = [{"user": OWNER, "body": "Only the uploads.", "at": later}]
+        self.answers = [answer({"decision": "plan", "summary": "ok",
+                                "units": [unit("a"), unit("b", routing={**unit()["routing"], "initial_tier": 2})]})]
+        self.run_pass()
+        reason, detail = self.events[1]
+        self.assertEqual(reason, "plan ready: kennylhilljr/demo#1")
+        self.assertEqual((detail["units"], detail["highest_tier"], detail["worker"]), (2, 2, "claude-dev-gh"))
+
+    def test_no_change_and_dry_run_stay_quiet_blocked_does_not(self):
+        self.answers = [answer({"decision": "no_change", "summary": "nothing to do"})]
+        self.run_pass()
+        self.assertEqual(self.events, [])
+        iwb.STATE.write_text(json.dumps({self.KEY: {"agent": "claude"}}))
+        self.answers = [answer({"decision": "plan", "summary": "x", "units": [unit()]})]
+        self.run_pass(dry_run=True)
+        self.assertEqual(self.events, [])
+        self.answers = ["junk", "more junk"]
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual([r for r, _ in self.events], ["blocked: kennylhilljr/demo#1"])
 
     def test_dry_run_posts_and_saves_nothing(self):
         self.answers = [answer({"decision": "plan", "summary": "x", "units": [unit()]})]

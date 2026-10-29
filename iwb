@@ -425,10 +425,12 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
             log(f"{key}: unusable answer ({e}); attempt {entry['attempts']} of {MAX_ATTEMPTS}")
             if entry["attempts"] >= MAX_ATTEMPTS and not dry_run:
                 slug = prbot.bot_config(bot)["slug"]
-                post(bot, repo, number, f"{A_MARKER}\n`{slug}` could not produce a usable plan after "
-                     f"{MAX_ATTEMPTS} tries (last problem: {e}). Clarify the issue and remove `bot:blocked` "
-                     f"to try again.", "bot:blocked")
+                url = post(bot, repo, number, f"{A_MARKER}\n`{slug}` could not produce a usable plan after "
+                           f"{MAX_ATTEMPTS} tries (last problem: {e}). Clarify the issue and remove `bot:blocked` "
+                           f"to try again.", "bot:blocked")
                 entry["blocked"] = True
+                prbot.openclaw_attention(f"blocked: {repo}#{number}",
+                                         {"url": url, "title": issue["title"], "worker": slug, "problem": str(e)})
             continue
         finally:
             if work:
@@ -452,11 +454,24 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
             plan_file.write_text(json.dumps({"units": answer["units"]}, indent=1) + "\n")
             entry["plan_file"] = str(plan_file)
         entry["analysis"] = {"decision": answer["decision"], "at": time.time(), "model": model, "comment": url}
+        tell_openclaw(repo, number, issue["title"], slug, model, answer, url)
         log(f"{key}: posted {answer['decision']} ({label}) {url}")
     if not dry_run:
         STATE.write_text(json.dumps(state, indent=1) + "\n")
     log(f"analysis pass done: {runs} run{'s' if runs != 1 else ''}")
     return 0
+
+
+def tell_openclaw(repo, number, title, slug, model, answer, url):
+    """Plans and questions need Kenny, so they go to OpenClaw. A no-code answer does not."""
+    detail = {"url": url, "title": title, "worker": slug, "model": model}
+    if answer["decision"] == "plan":
+        detail.update(units=len(answer["units"]),
+                      highest_tier=max(u["routing"]["initial_tier"] for u in answer["units"]))
+        prbot.openclaw_attention(f"plan ready: {repo}#{number}", detail)
+    elif answer["decision"] == "questions":
+        detail.update(questions=len(answer["questions"]))
+        prbot.openclaw_attention(f"questions: {repo}#{number}", detail)
 
 
 def main(argv):

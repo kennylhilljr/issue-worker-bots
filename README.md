@@ -64,6 +64,10 @@ A reply from Kenny after questions or a no-code answer runs the analysis again. 
 
 `./iwb tick` runs intake, then one analysis; that is what `install-intake.sh` schedules.
 
+## OpenClaw
+
+Plans ready, questions posted and blocked issues appear in OpenClaw as `attention.required` events under one `github` run (Phase A of the bridge in [`DESIGN.md`](DESIGN.md)). They go through the orchestrator runtime's own event writer via `prbot`, and are skipped quietly if the runtime is not installed. No-code answers and dry runs send nothing.
+
 ## Layout
 
 | Path | Contents |
