@@ -1,0 +1,8 @@
+{
+  "bot": "codex-dev",
+  "name": "codex-dev-gh",
+  "description": "Works on issues in kennylhilljr's repositories with Codex: analyzes, codes and opens pull requests.",
+  "url": "https://github.com/kennylhilljr",
+  "logo": "../logos/codex-dev.png",
+  "permissions": {"contents": "write", "pull_requests": "write", "issues": "write"}
+}

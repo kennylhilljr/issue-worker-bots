@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>claude-dev-gh</title>
+  <circle cx="142" cy="184" r="20" fill="#A94E2E"/>
+  <circle cx="370" cy="184" r="20" fill="#A94E2E"/>
+  <rect x="146" y="106" width="220" height="156" rx="78" fill="#D9774B"/>
+  <rect x="178" y="138" width="156" height="92" rx="46" fill="#FFF6EC"/>
+  <circle cx="222" cy="180" r="14" fill="#5A2A16"/>
+  <circle cx="290" cy="180" r="14" fill="#5A2A16"/>
+  <path d="M236 206 Q256 220 276 206" fill="none" stroke="#5A2A16" stroke-width="8" stroke-linecap="round"/>
+  <rect x="230" y="256" width="52" height="24" rx="8" fill="#A94E2E"/>
+  <ellipse cx="122" cy="360" rx="24" ry="46" fill="#C4623D"/>
+  <ellipse cx="390" cy="360" rx="24" ry="46" fill="#C4623D"/>
+  <ellipse cx="256" cy="364" rx="128" ry="104" fill="#D9774B"/>
+  <rect x="182" y="318" width="148" height="88" rx="30" fill="#FFF6EC"/>
+  <g fill="none" stroke="#C4623D" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="224,340 200,362 224,384"/>
+    <polyline points="288,340 312,362 288,384"/>
+    <line x1="266" y1="334" x2="246" y2="390"/>
+  </g>
+  <path d="M150 120 Q150 48 256 48 Q362 48 362 120 Z" fill="#F5B83D"/><rect x="244" y="52" width="24" height="68" rx="8" fill="#D99A1E"/><rect x="128" y="116" width="256" height="20" rx="10" fill="#F5B83D"/>
+</svg>

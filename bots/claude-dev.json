@@ -1,0 +1,8 @@
+{
+  "bot": "claude-dev",
+  "name": "claude-dev-gh",
+  "description": "Works on issues in kennylhilljr's repositories with Claude: analyzes, codes and opens pull requests.",
+  "url": "https://github.com/kennylhilljr",
+  "logo": "../logos/claude-dev.png",
+  "permissions": {"contents": "write", "pull_requests": "write", "issues": "write"}
+}

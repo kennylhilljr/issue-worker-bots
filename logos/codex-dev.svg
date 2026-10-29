@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>codex-dev-gh</title>
+  <defs>
+    <linearGradient id="cx" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8A9AF8"/>
+      <stop offset="0.5" stop-color="#5F72F6"/>
+      <stop offset="1" stop-color="#3A33F5"/>
+    </linearGradient>
+  </defs>
+  <rect x="150" y="120" width="212" height="138" rx="18" fill="url(#cx)"/>
+  <rect x="176" y="148" width="160" height="70" rx="10" fill="#15124A"/>
+  <rect x="202" y="170" width="32" height="24" rx="4" fill="#B9C6FF"/>
+  <rect x="278" y="170" width="32" height="24" rx="4" fill="#B9C6FF"/>
+  <rect x="232" y="258" width="48" height="20" fill="#342CF5"/>
+  <rect x="100" y="296" width="32" height="110" rx="10" fill="#4A42F5"/>
+  <rect x="380" y="296" width="32" height="110" rx="10" fill="#4A42F5"/>
+  <rect x="136" y="278" width="240" height="168" rx="22" fill="url(#cx)"/>
+  <rect x="176" y="310" width="160" height="98" rx="12" fill="#15124A"/>
+  <g fill="none" stroke="#EEF0FF" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="222,334 196,359 222,384"/>
+    <polyline points="290,334 316,359 290,384"/>
+    <line x1="268" y1="328" x2="244" y2="390"/>
+  </g>
+  <rect x="168" y="446" width="66" height="28" rx="8" fill="#342CF5"/>
+  <rect x="278" y="446" width="66" height="28" rx="8" fill="#342CF5"/>
+  <path d="M154 110 Q154 36 256 36 Q358 36 358 110 Z" fill="#F5B83D"/><rect x="244" y="40" width="24" height="70" rx="8" fill="#D99A1E"/><rect x="132" y="106" width="248" height="20" rx="10" fill="#F5B83D"/>
+</svg>
