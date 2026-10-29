@@ -16,7 +16,7 @@ Design stage. [`DESIGN.md`](DESIGN.md) describes the whole pipeline: which issue
 | 1. Worker Apps registered (`claude-dev-gh`, `codex-dev-gh`) | Done. Installed on all of Kenny's repositories with contents, issues and pull requests read and write. |
 | 2. Intake watcher | Live: launchd runs it every 5 minutes. Trusts Kenny and `openclaw-ops-assist[bot]`; the 6 issues open at install were skipped. |
 | 3. Analysis step | Live: launchd runs `tick` (intake, then one analysis) every 5 minutes. |
-| 4. Clarity gate, approval, orchestrator runs, draft PRs | Not started |
+| 4. Clarity, policy and red-check gates, agent plan approval, orchestrator runs, draft PRs | Designed (no human approval; the other agent approves). Not built. |
 | 5. Review hand-off and repair round | Not started |
 | 6. More repositories and model tuning | Not started |
 
@@ -63,6 +63,20 @@ A reply from Kenny after questions or a no-code answer runs the analysis again. 
 ```
 
 `./iwb tick` runs intake, then one analysis; that is what `install-intake.sh` schedules.
+
+## Talking to the bots
+
+Comment on an issue the bots picked up. Comments from Kenny and trusted openers are read on the next pass; everyone else's are ignored.
+
+| Comment | What happens |
+| --- | --- |
+| `resume`, `continue`, `go`, `proceed`, `approve`, `lgtm` | The bot answers with where things stand. No model run. |
+| `replan` | A fresh analysis. |
+| `status` | The bot reports its last analysis. |
+| `stop` | The bot adds `bot:stop` and does nothing more until it's removed. |
+| Anything else | Treated as feedback: questions get answered, a plan gets revised. |
+
+Commands may be prefixed with `@claude-dev-gh` or `@codex-dev-gh`. Editing the issue's title or body, switching `agent:claude` and `agent:codex`, and reopening the issue also bring the bot back. `"paused": true` in `config.json` stops all workers. The full list of triggers, including the PR ones for later steps, is under "Coming back to an issue" in [`DESIGN.md`](DESIGN.md).
 
 ## OpenClaw
 

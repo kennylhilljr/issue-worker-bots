@@ -16,7 +16,7 @@
 
 Sign-in, tokens and repository lists come from prbot (PRBOT_PATH, default ../pr-review-bots/prbot).
 """
-import calendar, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
+import calendar, hashlib, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -78,8 +78,8 @@ def trusted_openers(owner):
 def qualifies(repo, issue, owner):
     """(True, reason) if the bots may work on this issue, else (False, reason). Only the owner can add bot:work."""
     labels = {l["name"] for l in issue.get("labels", [])}
-    if "bot:skip" in labels:
-        return False, "labeled bot:skip"
+    if "bot:skip" in labels or "bot:stop" in labels:
+        return False, "labeled bot:skip or bot:stop"
     if any(a.get("type") == "User" for a in issue.get("assignees", [])):
         return False, "assigned to a person"
     opener = issue["user"]["login"]
@@ -126,6 +126,9 @@ def pick_up(repo, issue, agent, reason):
 
 def cmd_intake(dry_run=False, baseline=False, limit=LIMIT):
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    if read_config().get("paused") and not baseline:
+        log("paused in config.json; nothing picked up")
+        return 0
     cfg = prbot.load_config()
     bots = [b for b in WORKERS.values() if b in cfg]
     if not bots:
@@ -192,6 +195,7 @@ ANALYZE_LIMIT = 1         # analyses per pass; they are the most expensive step
 MAX_ATTEMPTS = 2          # unusable answers before the issue is marked bot:blocked
 RETRY_AFTER = 3600        # seconds before retrying after a model failure (usage limit, outage)
 A_MARKER = "<!-- iwb:analysis -->"
+R_MARKER = "<!-- iwb:reply -->"
 PLANS_DIR = STATE.parent / "plans"
 UNIT_FIELDS = ("schema_version", "id", "title", "depends_on", "scope", "acceptance", "risk", "capabilities",
                "routing", "budget", "rollback")
@@ -256,7 +260,7 @@ def issue_text(repo, number, trusted, bot_logins):
     kept = [c for c in comments if c["user"] in trusted or c["user"] in bot_logins]
     text = f"# {i['title']}\n\n{i['body'] or '(no description)'}\n"
     for c in kept:
-        text += f"\n--- comment by {c['user']} at {c['at']} ---\n{(c['body'] or '').replace(MARKER, '').replace(A_MARKER, '')}\n"
+        text += f"\n--- comment by {c['user']} at {c['at']} ---\n{(c['body'] or '').replace(MARKER, '').replace(A_MARKER, '').replace(R_MARKER, '')}\n"
     return i, comments, text
 
 
@@ -360,28 +364,69 @@ def iso_epoch(s):
     return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ"))   # GitHub times are UTC
 
 
-def needs_analysis(entry, comments, trusted):
-    """Why this picked-up issue should be analyzed now, or None."""
+def issue_digest(issue):
+    return hashlib.sha256(f"{issue['title']}\n{issue['body'] or ''}".encode()).hexdigest()[:16]
+
+
+def needs_analysis(entry, comments, trusted, digest):
+    """Why this picked-up issue should be analyzed now, or None. A trusted comment after any bot answer
+    (plan included) or an edit to the title or body brings the bot back."""
     if "agent" not in entry or entry.get("closed") or entry.get("blocked"):
         return None
     a = entry.get("analysis")
     if a is None:
-        return "new"
-    if a["decision"] in ("questions", "no_change"):
-        replies = [c for c in comments if c["user"] in trusted and iso_epoch(c["at"]) > a["at"]]
-        return f"reply after {a['decision']}" if replies else None
-    return None
+        return entry.pop("reason", "new")
+    if a.get("digest") and a["digest"] != digest:
+        return "issue edited"
+    cutoff = max(a["at"], entry.get("handled_at", 0))
+    if entry.pop("replan", False):
+        return "replan requested"
+    replies = [c for c in comments if c["user"] in trusted and iso_epoch(c["at"]) > cutoff]
+    return f"reply after {a['decision']}" if replies else None
+
+
+PROCEED = {"resume", "continue", "go", "go ahead", "proceed", "start", "approve", "approved", "lgtm", "ship it", "do it"}
+COMMANDS = {**{w: "proceed" for w in PROCEED}, "stop": "stop", "cancel": "stop", "replan": "replan",
+            "plan again": "replan", "status": "status"}
+
+
+def command_of(body, worker_slugs):
+    """A short command in a trusted comment ("resume", "@claude-dev-gh replan"), or None for ordinary feedback."""
+    t = (body or "").lower()
+    for slug in worker_slugs:
+        t = t.replace(f"@{slug}", " ")
+    t = " ".join(re.sub(r"[^a-z ]", " ", t).split())
+    return COMMANDS.get(t)
+
+
+def command_reply(cmd, entry, slug):
+    a = entry.get("analysis") or {}
+    if cmd == "status":
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(a.get("at", 0)))
+        return (f"Status: last analysis was a **{a.get('decision', 'none')}** by `{a.get('model', '?')}` at {when}. "
+                f"Coding (build step 4) isn't running yet.")
+    if cmd == "stop":
+        return "Stopped. Nothing more will happen on this issue until `bot:stop` is removed."
+    if a.get("decision") == "plan":
+        return ("Got it. The plan above is ready to go, but coding (build step 4) isn't running yet, so nothing more "
+                "happens for now. Once step 4 is live, a ready plan runs without anyone needing to say so. "
+                "Comment with changes if you want the plan revised, or `replan` for a fresh one.")
+    if a.get("decision") == "questions":
+        return "I still need answers to the questions above before I can plan. Reply with them and I'll plan again."
+    return "There's no code change planned here. Describe the change you want and I'll plan it."
 
 
 def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    paused = read_config().get("paused", False)
     cfg = prbot.load_config()
     owner = cfg[next(b for b in WORKERS.values() if b in cfg)]["owner"]
     trusted = trusted_openers(owner)
     bot_logins = {cfg[b]["slug"] + "[bot]" for b in WORKERS.values() if b in cfg}
+    worker_slugs = [cfg[b]["slug"] for b in WORKERS.values() if b in cfg]
     runs = 0
     for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
-        if "agent" not in entry or entry.get("closed"):
+        if "agent" not in entry or paused:
             continue
         if time.time() - entry.get("analysis_failed_at", 0) < RETRY_AFTER:
             continue
@@ -394,13 +439,50 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
         if issue["state"] != "open":
             entry["closed"] = True
             continue
+        if entry.pop("closed", None):         # reopened: start again from analysis
+            entry.pop("analysis", None)
+            entry["reason"] = "reopened"
+        if "bot:stop" in issue["labels"]:
+            continue
+        wanted = next((a for a in WORKERS if f"agent:{a}" in issue["labels"]), None)
+        if wanted and wanted != entry["agent"]:   # Kenny switched the worker: hand the issue over
+            log(f"{key}: handed from {WORKERS[entry['agent']]}-gh to {WORKERS[wanted]}-gh")
+            entry.update(agent=wanted, reason=f"handed over to {WORKERS[wanted]}-gh", attempts=0)
+            entry.pop("analysis", None)
         if entry.get("blocked"):
             if "bot:blocked" in issue["labels"]:
                 continue
             entry.pop("blocked")          # the owner removed bot:blocked: try again from scratch
             entry["attempts"] = 0
             entry.pop("analysis", None)
-        why = needs_analysis(entry, comments, trusted)
+        digest = issue_digest(issue)
+        a = entry.get("analysis")
+        if a:   # short commands get an answer, not another expensive analysis
+            cutoff = max(a["at"], entry.get("handled_at", 0))
+            new = [c for c in comments if c["user"] in trusted and iso_epoch(c["at"]) > cutoff]
+            cmd = command_of(new[-1]["body"], worker_slugs) if new else None
+            if cmd == "replan":
+                entry["handled_at"], entry["replan"] = iso_epoch(new[-1]["at"]), True
+            elif cmd:
+                bot = WORKERS[entry["agent"]]
+                slug = prbot.bot_config(bot)["slug"]
+                body = f"{R_MARKER}\n{command_reply(cmd, entry, slug)}"
+                if dry_run:
+                    log(f"{key}: would answer '{cmd}': {body}")
+                    continue
+                try:
+                    if cmd == "stop":
+                        run_gh_as(bot, repo, ["label", "create", "bot:stop", "-R", repo, "--color", "000000",
+                                              "--description", "Kenny stopped the worker bot", "--force"])
+                        run_gh_as(bot, repo, ["issue", "edit", str(number), "-R", repo, "--add-label", "bot:stop"])
+                    url = run_gh_as(bot, repo, ["issue", "comment", str(number), "-R", repo, "--body", body])
+                except RuntimeError as e:
+                    log(f"{key}: could not answer '{cmd}', will retry: {e}")
+                    continue
+                entry["handled_at"] = iso_epoch(new[-1]["at"])
+                log(f"{key}: answered '{cmd}' {url}")
+                continue
+        why = needs_analysis(entry, comments, trusted, digest)
         if not why:
             continue
         if runs >= limit:
@@ -453,7 +535,8 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
             plan_file = PLANS_DIR / f"{repo.replace('/', '__')}__{number}.json"
             plan_file.write_text(json.dumps({"units": answer["units"]}, indent=1) + "\n")
             entry["plan_file"] = str(plan_file)
-        entry["analysis"] = {"decision": answer["decision"], "at": time.time(), "model": model, "comment": url}
+        entry["analysis"] = {"decision": answer["decision"], "at": time.time(), "model": model, "comment": url,
+                             "digest": digest}
         tell_openclaw(repo, number, issue["title"], slug, model, answer, url)
         log(f"{key}: posted {answer['decision']} ({label}) {url}")
     if not dry_run:

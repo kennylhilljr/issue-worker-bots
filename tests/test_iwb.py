@@ -137,7 +137,10 @@ class Analyze(unittest.TestCase):
         self.saved = {k: getattr(p, k) for k in ("load_config", "gh_read", "bot_config", "openclaw_attention")}
         self.events = []
         p.openclaw_attention = lambda reason, detail: self.events.append((reason, detail)) or True
-        self.saved_iwb = {k: getattr(iwb, k) for k in ("STATE", "CONFIG", "PLANS_DIR", "clone", "run_model", "post")}
+        self.saved_iwb = {k: getattr(iwb, k) for k in ("STATE", "CONFIG", "PLANS_DIR", "clone", "run_model", "post",
+                                                         "run_gh_as")}
+        self.gh_calls = []
+        iwb.run_gh_as = lambda bot, repo, args: self.gh_calls.append((bot, args)) or "https://x/reply"
         iwb.STATE = Path(self.tmp.name, "state.json")
         iwb.CONFIG = Path(self.tmp.name, "config.json")
         iwb.PLANS_DIR = Path(self.tmp.name, "plans")
@@ -148,8 +151,11 @@ class Analyze(unittest.TestCase):
         iwb.clone = lambda repo, bot: (tempfile.mkdtemp(dir=self.tmp.name), "main", "abc123")
         self.answers, self.posts, self.prompts = [], [], []
 
+        self.agents = []
+
         def fake_model(agent, prompt, stdin, cwd):
             self.prompts.append(stdin)
+            self.agents.append(agent)
             a = self.answers.pop(0)
             if isinstance(a, Exception):
                 raise a
@@ -280,6 +286,77 @@ class Analyze(unittest.TestCase):
         self.run_pass()
         self.run_pass()
         self.assertEqual([r for r, _ in self.events], ["blocked: kennylhilljr/demo#1"])
+
+    def later(self, minutes=1):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60 * minutes))
+
+    def plan_first(self):
+        self.answers = [answer({"decision": "plan", "summary": "v1", "units": [unit()]})]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:planned")
+
+    def comments_posted(self):
+        return [a[a.index("--body") + 1] for _, a in self.gh_calls if a[:2] == ["issue", "comment"]]
+
+    def test_resume_after_a_plan_gets_an_answer_not_a_model_run(self):
+        # regression: on issue-worker-bots#2 Kenny commented "resume" after the plan and the bot never came back
+        self.plan_first()
+        self.comments = [{"user": OWNER, "body": "resume", "at": self.later()}]
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 1)              # no second analysis
+        self.assertIn("coding (build step 4) isn't running yet", self.comments_posted()[0])
+        self.run_pass()
+        self.assertEqual(len(self.comments_posted()), 1)    # answered once
+
+    def test_feedback_after_a_plan_revises_it(self):
+        self.plan_first()
+        self.comments = [{"user": OWNER, "body": "Also update the CHANGELOG.", "at": self.later()}]
+        self.answers = [answer({"decision": "plan", "summary": "v2", "units": [unit(), unit("changelog")]})]
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 2)
+        self.assertIn("Also update the CHANGELOG.", self.prompts[1])
+        self.assertIn("v2", self.posts[-1][2])
+
+    def test_replan_stop_and_status_commands(self):
+        self.plan_first()
+        self.comments = [{"user": OWNER, "body": "@claude-dev-gh status", "at": self.later(1)}]
+        self.run_pass()
+        self.assertIn("Status: last analysis was a **plan**", self.comments_posted()[-1])
+        self.comments.append({"user": OWNER, "body": "@claude-dev-gh replan", "at": self.later(2)})
+        self.answers = [answer({"decision": "plan", "summary": "fresh", "units": [unit()]})]
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 2)
+        self.comments.append({"user": OWNER, "body": "Stop.", "at": self.later(3)})
+        self.run_pass()
+        self.assertIn(["issue", "edit", "1", "-R", "kennylhilljr/demo", "--add-label", "bot:stop"],
+                      [a for _, a in self.gh_calls])
+        self.issue["labels"] = ["bot:stop"]
+        self.comments.append({"user": OWNER, "body": "more feedback", "at": self.later(4)})
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 2)               # bot:stop: nothing more happens
+
+    def test_edit_handover_reopen_and_pause(self):
+        self.plan_first()
+        self.issue["body"] = "Retry failed uploads, and log each retry."   # edited
+        self.answers = [answer({"decision": "plan", "summary": "edited", "units": [unit()]})]
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 2)
+        self.issue["labels"] = ["agent:codex"]                           # switched worker
+        self.answers = [answer({"decision": "plan", "summary": "codex", "units": [unit()]})]
+        self.run_pass()
+        self.assertEqual(self.agents[-1], "codex")
+        self.assertEqual(self.posts[-1][0], "codex-dev")
+        self.issue["state"] = "closed"
+        self.run_pass()
+        self.issue["state"] = "open"                                     # reopened
+        self.answers = [answer({"decision": "no_change", "summary": "already done"})]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:no-code")
+        iwb.CONFIG.write_text(json.dumps({"paused": True}))
+        self.comments = [{"user": OWNER, "body": "try again please", "at": self.later()}]
+        n = len(self.prompts)
+        self.run_pass()
+        self.assertEqual(len(self.prompts), n)                           # paused: nothing runs
 
     def test_dry_run_posts_and_saves_nothing(self):
         self.answers = [answer({"decision": "plan", "summary": "x", "units": [unit()]})]

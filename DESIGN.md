@@ -62,10 +62,10 @@ flowchart LR
     INTAKE --> ANALYZE["Analysis, strongest model"]
     ANALYZE --> ASK["Questions posted, label bot:needs-info"]
     ANALYZE --> PLAN["Plan document"]
-    PLAN --> LINT["lint-plan and clarity gate"]
-    LINT --> APPROVE["Kenny approves Tier 2 plans"]
-    LINT --> RUN["Orchestrator run, cheapest fitting model"]
-    APPROVE --> RUN
+    PLAN --> LINT["Clarity, lint-plan and policy gates"]
+    LINT --> RED["Red check: acceptance fails before the change"]
+    RED --> APPROVE["Plan approved by the other agent"]
+    APPROVE --> RUN["Orchestrator run, cheapest fitting model"]
     RUN --> PR["Draft PR by the worker bot"]
     PR --> REVIEW["Cross-review by the other agent"]
     REVIEW --> FIX["One repair round on P1 or P2 findings"]
@@ -81,7 +81,8 @@ A launchd job, like the review watcher, checks every 5 minutes for issues that q
 
 The strongest model reads the issue, the repository and recent history, read-only, and returns exactly one of:
 
-- **Questions.** The issue is ambiguous. The bot posts the questions as a comment, labels the issue `bot:needs-info`, and stops. A reply from Kenny restarts analysis.
+- **No code change.** The issue is a question, already done, or not a change to this repository. The bot says why and labels it `bot:no-code`.
+- **Questions.** The issue is ambiguous. The questions go through agentic clarification first (step 3); whatever is left is posted, the issue is labeled `bot:needs-info`, and a reply from Kenny restarts analysis.
 - **A plan.** An orchestrator plan document: units, the files each unit may touch, acceptance commands that prove it done, declared traits (`mechanical`, `security`, `database` and so on), and dependencies between units.
 
 The plan's summary is posted on the issue, so Kenny can see what the bot intends before code exists.
@@ -98,9 +99,29 @@ This is what lets cheap models do the coding. A unit counts as clear when:
 
 Clear units start at Tier 0 or 1 and are coded by a cheap model. Units that fail the gate go back to analysis once with the specific failures; a second failure turns into questions on the issue.
 
-### 4. Approval
+**Agentic clarification.** Questions get one pass by an agent before they reach Kenny. The other family's strongest model (the same cross-family pairing as review) gets the issue, the repository and the questions, read-only, and answers what it can from the code, docs and issue history, citing the files it used. Answered questions go back into analysis as context. Only what it cannot answer is posted, and questions about intent or priority (what Kenny wants, rather than how the code works) always go to Kenny.
 
-Plans whose units are all Tier 0 or 1 run without waiting. Any Tier 2 unit (security, database, architecture, or a high-risk path) waits for Kenny to react with 👍 to the plan comment or add `bot:approved`. The orchestrator's existing risk rules decide the tier; the bots cannot lower it.
+### 4. Approval, by an agent
+
+No person approves plans. A plan runs when three checks pass, and none of them is done by the agent that wrote the plan.
+
+1. **Deterministic gates.** The clarity gate above, the orchestrator's `lint-plan`, and a policy gate that no agent can override: no unit may touch secrets or credentials (`.env*`, `*.pem`, key files), `.github/workflows/`, deploy or release configuration named in the repository's policy, or files outside its own scope, and budgets must fit the caps. A plan that needs any of that is not approved; the issue gets `bot:blocked` with the reason and an OpenClaw attention event. Kenny can widen the policy per repository, never per plan.
+2. **Red check.** Before any code is written, each unit's acceptance commands run against the base tree in a throwaway worktree. For a unit that adds or fixes behavior, at least one command must fail there; if they all already pass, they prove nothing, and the plan goes back for stronger checks. Units marked `mechanical` (renames, refactors) are exempt, since their tests should stay green.
+3. **Plan approver.** The other agent's review bot approves: `codex-pr-gh` approves plans from `claude-dev-gh`, and `claude-pr-gh` approves plans from `codex-dev-gh`. It runs that family's strongest model read-only on the issue, the repository, the plan and the gate results, and judges whether the plan solves the issue as written, whether each unit is minimal and inside its scope, whether the acceptance commands would catch a wrong implementation, and whether tiers and risks are honest. Its verdict is one of:
+   - **approve**;
+   - **revise**, with specific changes, sent back to analysis once and then reviewed again;
+   - **reject**, which marks the issue `bot:blocked` with the reasons.
+
+   The approver may raise a unit's tier or risk and may add acceptance commands. It can never lower a tier or remove a check. Tier 2 plans get the approver at high effort, and every non-mechanical Tier 2 unit must pass the red check.
+
+On approval, the approver records it the way the orchestrator already expects: `review-plan approve operator codex-pr-gh session iwb.<owner>.<repo>.<n> create-run ...` writes a review record, and the worker then runs `create-run ... yes review-id <id>`. The record is bound to the plan hash, expires, and is consumed by one run, so a revised plan needs a new approval. The approver posts its verdict and reasons on the issue as its review bot and adds `bot:approved`.
+
+Why this is safe without a person in the loop:
+
+- The bots never use the orchestrator's merge, its only destructive step. Work stays in worktrees and reaches GitHub only as a draft PR on a `bot/` branch.
+- Every PR gets a second cross-family review, of the code this time.
+- Kenny merges. Nothing reaches a default branch without him.
+- Kenny can stop anything at any time: `bot:stop` on an issue or PR stops it at the next pass, and `"paused": true` in `config.json` stops every worker.
 
 ### 5. Coding
 
@@ -114,6 +135,27 @@ If the review raises P1 or P2 findings, the worker runs one repair round. Each f
 
 Merging stays with Kenny.
 
+## Coming back to an issue
+
+The bots look at every open issue they picked up on each 5-minute pass (seconds, once webhooks from the OpenClaw bridge's Phase B exist). These are the things that bring a bot back:
+
+| Trigger | How it's detected | What the bot does |
+| --- | --- | --- |
+| A trusted comment after any bot answer (questions, no-code, plan, approval, blocked) | Comments from Kenny or a trusted opener newer than the bot's last post | Analysis again, with the comment as input; on a plan, a revised plan that goes through approval again |
+| The issue's title or body is edited | A hash of title and body saved at the last analysis | Analysis again |
+| `agent:claude` or `agent:codex` changed after pick-up | The label against the worker on record | Hand over: the new worker analyzes from scratch, the old one posts a one-line hand-off |
+| The issue is reopened | Open again after being recorded as closed | Back to analysis unless a bot PR is still open |
+| `bot:blocked` removed by Kenny | Label gone | Retry from analysis |
+| `bot:stop` added | Label | Stop at once: cancel any run, comment, take no further action until it is removed |
+| A trusted comment that mentions the worker bot | `@claude-dev-gh` or `@codex-dev-gh` plus a command: `replan`, `stop`, `switch codex`, `status` | Runs the command |
+| P1 or P2 findings on the worker's PR | `prbot review` findings (already sent to OpenClaw) | One repair round (step 6) |
+| CI failing on the worker's PR | Check runs on the PR head | One fix round, with the failing log as the instructions |
+| The worker's PR closed without merging | PR state | Comment on the issue, `bot:blocked`, OpenClaw attention |
+| The worker's PR merged | PR state | Comment, `bot:done`, nothing further |
+| No reply to questions | 7 days after the questions | One reminder; after 14 days `bot:stale`, and the bot stops |
+
+What never brings a bot back: comments from accounts that are not trusted, the bots' own comments, other bots' comments except reviews on the worker's PR, and reactions.
+
 ## Model choice
 
 Expensive models where judgment matters, cheaper models where the instructions are clear, and escalation instead of starting big.
@@ -124,6 +166,7 @@ Expensive models where judgment matters, cheaper models where the instructions a
 | Tier 0 coding: mechanical, small, fully specified | `haiku` (Haiku 5.5) | `gpt-5.6-terra`, low effort | Renames, fixture updates, one-function fixes with a failing test to satisfy |
 | Tier 1 coding: normal, clear plan | `sonnet` (Sonnet 5.5) | `gpt-5.6-sol`, medium effort | Most units after a good plan; the older workhorse is enough when the plan is specific |
 | Tier 2 coding: risky or hard | `opus` (Opus 5.5) | `gpt-6-astra` | Security, data and architecture work, or after cheaper tiers failed |
+| Plan approval and agentic clarification | `opus` (Opus 5.5), approving Codex's plans | `gpt-6-astra`, approving Claude's plans | Judging a plan is judgment work, and a different model family catches different mistakes |
 | Repair after review | Same tier as the original unit | Same | Findings are specific instructions, so the cheap tier usually suffices |
 | Issue comments and status notes | `haiku` | `gpt-6-luna` | Short summaries |
 
@@ -131,7 +174,7 @@ These go in the orchestrator policy (`cli_models` and `model_preferences`), not 
 
 Two cautions:
 
-- **Subscription quota is the real budget.** Codex is currently at its usage limit until Nov 4. Analysis on the frontier models spends quota fastest, so it runs once per issue, and re-analysis only happens on a failed gate or a reply from Kenny.
+- **Subscription quota is the real budget.** Analysis and approval on the frontier models spend quota fastest, so each runs once per version of a plan, and re-analysis only happens on the triggers listed under "Coming back to an issue".
 - **Measure before trusting the table.** The tiers above are a starting point. After the first 20 or so issues, compare escalation rates per tier: a tier that escalates most of the time should start one tier higher, and one that never escalates might drop a tier.
 
 ## Budgets and limits
@@ -146,13 +189,13 @@ Two cautions:
 
 ## Status labels
 
-`bot:analyzing`, `bot:needs-info`, `bot:awaiting-approval`, `bot:in-progress`, `bot:pr-open`, `bot:blocked`, `bot:queued`. Each change also posts a one-line comment from the worker bot, so the issue timeline tells the story.
+`bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bot:approved`, `bot:in-progress`, `bot:pr-open`, `bot:done`, `bot:blocked`, `bot:stale`, and `bot:stop` (set by Kenny). Each change also posts a one-line comment from the worker bot, so the issue timeline tells the story.
 
 ## Safety
 
 - Only issues opened or labeled by Kenny are worked on.
 - Analysis runs read-only. Coding runs only inside orchestrator worktrees, never on `main` or a checkout Kenny uses.
-- Workers never merge, never push to the default branch, and never change repository settings, secrets or workflows. Changes to `.github/workflows` count as a Tier 2 unit and always need approval.
+- Workers never merge, never push to the default branch, and never change repository settings, secrets or workflows. Changes to `.github/workflows`, secrets, credentials and deploy configuration are refused by the policy gate; no agent can approve them.
 - Tokens come from `prbot`: one hour, one repository, never printed or saved.
 - The guard hook and the `cross-review` skill already stop agents from posting or pushing as Kenny.
 
@@ -202,9 +245,11 @@ Only worth it if 5 minutes is too slow.
 
 The risk is the public endpoint itself: it is a door into a machine that runs coding agents. Keeping the receiver to signature checking plus a nudge keeps that door narrow.
 
-### Phase C: approvals from either side (after step 4)
+### Phase C: approvals, visibility and veto (after step 4)
 
-Step 4 starts orchestrator runs, and Tier 2 plans need Kenny's approval. The runtime emits `approval.requested` with the plan hash. Approvals can then come from either place:
+Plan approval is done by the approver agent (step 4), not by Kenny, so this phase is about seeing those approvals and being able to veto them. Rejections and blocked plans already reach OpenClaw as `attention.required`; approvals will follow as `github.activity` once that type exists. Kenny's veto works from either side: `bot:stop` on GitHub, or rejecting in OpenClaw, which the bot mirrors to the issue as `bot:stop`.
+
+The earlier version of this phase had Kenny approving plans with `/approve <hash>` comments. It is kept below for reference, in case a repository ever needs a person in the loop:
 
 - **From GitHub.** The worker bot posts the plan with the first 8 characters of its hash and asks for `/approve <hash>` or `/reject <hash>`. When intake sees that comment from `kennylhilljr` (checked by author, never from anyone else), it copies the binding fields from the pending `approval.requested` event, adds `decision` and `decided_by: "kennylhilljr via GitHub"`, and writes the file into the decision inbox the same way the plugin does (temp file with mode 0600, fsync, rename). A hash that doesn't match the pending request is answered with a comment and not written; if the plan changed, the old approval cannot bind to the new one. A 👍 reaction is not enough on its own, because it carries no hash.
 - **From OpenClaw.** Kenny decides in OpenClaw as today. On the next pass the bot sees `approval.resolved` in the event log and posts "Approved in OpenClaw by Kenny" (or rejected) on the issue, so the GitHub thread stays complete.
@@ -230,7 +275,7 @@ A new repository, `issue-worker-bots`, holds the intake watcher, the analysis pr
 1. Generalize `prbot` bot names; register `claude-dev-gh` and `codex-dev-gh`.
 2. Intake watcher with the opener and label rules, posting only the "picked up" comment. Run it for a few days.
 3. Analysis step that posts questions or a plan, with no coding yet. Check plan quality on real issues.
-4. Clarity gate and approval, then orchestrator runs and draft PRs on one low-risk repository.
+4. Clarity, policy and red-check gates, agentic clarification and plan approval, then orchestrator runs and draft PRs on one low-risk repository.
 5. Review hand-off and the repair round.
 6. Turn on more repositories, then measure escalation rates and adjust the model table.
 
@@ -238,7 +283,7 @@ A new repository, `issue-worker-bots`, holds the intake watcher, the analysis pr
 
 1. App names: `claude-dev-gh` and `codex-dev-gh`, or something else?
 2. Trigger: issues opened by you and the `bot:work` label, or the label only?
-3. Should Tier 1 plans also wait for your 👍, at least at first?
+3. Which paths count as deploy or release configuration in each repository, for the policy gate?
 4. All 21 repositories, or start with a list?
 5. Once the workers push, should the review bots go back to contents read-only?
 6. For webhooks, if ever: reuse `openclaw-ops-assist`, or a new `openclaw-gh-events` App?
