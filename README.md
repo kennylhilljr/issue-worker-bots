@@ -14,7 +14,7 @@ Design stage. [`DESIGN.md`](DESIGN.md) describes the whole pipeline: which issue
 | Build step | State |
 | --- | --- |
 | 1. Worker Apps registered (`claude-dev-gh`, `codex-dev-gh`) | Done. Installed on all of Kenny's repositories with contents, issues and pull requests read and write. |
-| 2. Intake watcher | Built and dry-run against all repositories. Not installed yet. |
+| 2. Intake watcher | Live: launchd runs it every 5 minutes. Trusts Kenny and `openclaw-ops-assist[bot]`; the 6 issues open at install were skipped. |
 | 3. Analysis step | Not started |
 | 4. Clarity gate, approval, orchestrator runs, draft PRs | Not started |
 | 5. Review hand-off and repair round | Not started |
