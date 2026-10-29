@@ -115,7 +115,8 @@ def pick_up(repo, issue, agent, reason):
     bot = WORKERS[agent]
     slug = prbot.bot_config(bot)["slug"]
     body = (f"{MARKER}\nPicked up by `{slug}` ({reason}). Queued for analysis.\n\n"
-            f"Analysis and coding aren't running yet, so nothing else will happen on this issue for now. "
+            f"Analysis runs within a few minutes and posts a plan, questions, or a no-code answer here. "
+            f"Coding isn't running yet. "
             f"Add `bot:skip` to opt out, or `agent:claude` / `agent:codex` to choose the worker.")
     name, color, desc = QUEUED
     run_gh_as(bot, repo, ["label", "create", name, "-R", repo, "--color", color, "--description", desc, "--force"])

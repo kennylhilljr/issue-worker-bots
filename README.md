@@ -15,14 +15,14 @@ Design stage. [`DESIGN.md`](DESIGN.md) describes the whole pipeline: which issue
 | --- | --- |
 | 1. Worker Apps registered (`claude-dev-gh`, `codex-dev-gh`) | Done. Installed on all of Kenny's repositories with contents, issues and pull requests read and write. |
 | 2. Intake watcher | Live: launchd runs it every 5 minutes. Trusts Kenny and `openclaw-ops-assist[bot]`; the 6 issues open at install were skipped. |
-| 3. Analysis step | Built; dry-run on a real issue with Opus. The running job does intake only until switched to `tick`. |
+| 3. Analysis step | Live: launchd runs `tick` (intake, then one analysis) every 5 minutes. |
 | 4. Clarity gate, approval, orchestrator runs, draft PRs | Not started |
 | 5. Review hand-off and repair round | Not started |
 | 6. More repositories and model tuning | Not started |
 
 ## Intake (step 2)
 
-`iwb intake` makes one pass over open issues on every repository the worker bots are installed on. An issue is picked up when it was opened by Kenny or by an account in `trusted_openers`, or when Kenny himself added the `bot:work` label. Issues labeled `bot:skip`, issues assigned to a person, and pull requests are left alone. The chosen worker bot adds `bot:queued` and posts one comment; nothing else happens until step 3.
+`iwb intake` makes one pass over open issues on every repository the worker bots are installed on. An issue is picked up when it was opened by Kenny or by an account in `trusted_openers`, or when Kenny himself added the `bot:work` label. Issues labeled `bot:skip`, issues assigned to a person, and pull requests are left alone. The chosen worker bot adds `bot:queued` and posts one comment; analysis follows within a few minutes.
 
 The worker is chosen by an `agent:claude` or `agent:codex` label, otherwise the two alternate. Each issue is picked up once: a hidden marker in the bot's comment prevents a second pick-up even if the state file is lost. A pass picks up at most 5 issues.
 
