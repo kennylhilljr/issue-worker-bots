@@ -118,7 +118,7 @@ On approval, the approver records it the way the orchestrator already expects: `
 
 Why this is safe without a person in the loop:
 
-- The bots never use the orchestrator's merge, its only destructive step. Work stays in worktrees and reaches GitHub only as a draft PR on a `bot/` branch.
+- The bots never merge into a default branch. `drive` does merge units, but only locally, into the `bot/` branch of `iwb`'s own clone; the orchestrator pushes nothing. Work reaches GitHub only as a draft PR on a `bot/` branch, pushed by `iwb` as the worker bot.
 - Every PR gets a second cross-family review, of the code this time.
 - Kenny merges. Nothing reaches a default branch without him.
 - Kenny can stop anything at any time: `bot:stop` on an issue or PR stops it at the next pass, and `"paused": true` in `config.json` stops every worker.
@@ -129,14 +129,19 @@ Coding (`iwb code`, step 4b) picks up a plan that step 4a approved, as long as t
 
 The worker labels the issue `bot:in-progress` and starts an orchestrator run with the approved plan:
 
-- **Where.** A fresh clone of the target repository that `iwb` owns, under `~/.local/state/issue-worker-bots/repos/`, never one of Kenny's checkouts. The branch `bot/<issue-number>-<slug>` is created at the default branch's tip and is the run's target branch. The orchestrator's state and worktrees live under the same directory, so these runs never contend with Kenny's own orchestrator runs.
+- **Where.** A fresh clone of the target repository that `iwb` owns, under `~/.local/state/issue-worker-bots/repos/`, never one of Kenny's checkouts. The branch `bot/<issue-number>-<slug>-<attempt>` is created at the default branch's tip and is the run's target branch. `<attempt>` is a short hash of the run id (`iwb.<owner>.<repo>.<n>.<UTC time>`), so a retry never collides with an earlier run or branch. The orchestrator's state and worktrees live under the same directory, so these runs never contend with Kenny's own orchestrator runs.
 - **Approval record.** The approval is recorded the way the orchestrator expects, with the approving review bot as operator: `ecc review-plan --json --approve --operator <review bot> --session iwb.<owner>.<repo>.<n> -- create-run --run-id <id> --plan <file> <config flags>`, then `ecc create-run ... --yes --review-id <id>`. The record is bound to the hash of that exact command plan, expires after an hour and is used once. `drive` is gated the same way and gets its own record right before it runs.
 - **Merge approval.** If the repository has no `.orchestration/team.json`, `iwb` writes one with `"merge_approval": "agents"` into its clone, kept out of git. Without it the orchestrator would wait for a person to approve each merge into the `bot/` branch; the plan approver already stands in for that, and Kenny still merges the PR.
-- **Runners.** The run gets an orchestrator config with the runner certifications and model catalog (`ecc_config` in `config.json` overrides them). Without certifications no runner can be assigned, so `iwb` checks for them before labeling anything.
+- **Runners.** The run gets an orchestrator config with the runner certifications and model catalog (`ecc_config` in `config.json` overrides them). Without certifications no runner can be assigned, so before labeling anything `iwb` reads them the way the orchestrator does and checks that `claude` and `codex` (`ecc_runners` in `config.json`) are certified and that no certified runner expires within the 6-hour run timeout. Certifications expire weekly; a run started just before would lose runners half way. If they fall short, the issue is skipped with a log line and tried again an hour later, with no label or comment.
+- **Orchestrator version.** `iwb` runs the orchestrator checkout next to it, or `ecc_path` in `config.json` (for example a worktree kept at `origin/main`). Before a run it fetches that checkout and skips the issue, the same quiet way, unless `HEAD` is `origin/main`. Kenny's working checkout is often on a feature branch.
 - **Run.** The orchestrator routes each unit to the model for its tier, runs it in a worktree, runs the acceptance commands, escalates one tier on a real failure, and fast-forwards the `bot/` branch as units pass. The bots never call `ecc merge`, and nothing in the orchestrator pushes.
-- **Check and commit.** `iwb` compares the result with the default branch. Any changed file outside the plan's scope or on a protected path blocks the issue, and nothing is pushed. Otherwise the result becomes one commit authored and committed by the worker bot (`prbot git <worker> -- commit-tree`), pushed with `prbot git` to the `bot/` branch only. A push to any other branch is refused in code.
+- **Check and commit.** `iwb` compares the result with the default branch. Any changed file outside the plan's scope or on a protected path blocks the issue, and nothing is pushed. A rename counts as both its old and its new path. Otherwise the result becomes one commit authored and committed by the worker bot (`prbot git <worker> -- commit-tree`), pushed with `prbot git` to the `bot/` branch only. A push to any other branch is refused in code.
 
-A run that stops (`drive` exits non-zero: budget, no progress, needs an owner) blocks the issue with the orchestrator's reason. A pass that dies mid-run leaves `bot:in-progress` behind, and the next pass blocks the issue as interrupted rather than starting again.
+A run that stops (`drive` exits non-zero: budget, no progress, needs an owner) blocks the issue with the orchestrator's reason, cut to 200 characters with anything shaped like a token removed. A pass that dies mid-run leaves `bot:in-progress` behind, and the next pass blocks the issue as interrupted rather than starting again.
+
+`drive` runs in its own process group. Every 30 seconds `iwb` checks `"paused"` in `config.json` and reads the issue's labels for `bot:stop`. On either, it stops the whole group (SIGTERM, then SIGKILL after 30 seconds), posts one short comment as the worker bot, and leaves the issue as it was: no `bot:blocked`, nothing pushed. Coding starts again from the approved plan once the stop is undone. Reaching the 6-hour timeout stops the group the same way but blocks the issue.
+
+The pushed branch is saved in `state.json` as soon as the push succeeds, and the PR URL as soon as the PR exists. If `gh pr create` or `gh pr ready` fails, the next try an hour later continues from that branch and PR without running or pushing again. When a later attempt opens its PR, the PRs of earlier attempts on the issue are closed with a link to the new one.
 
 ### 6. Pull request and review
 
@@ -195,7 +200,8 @@ Two cautions:
 | Issues being coded at once | 2 | Approved plans wait |
 | Coding runs per pass | 1 | The next approved plan waits for the next pass |
 | Analysis attempts per issue | 2 | Questions posted on the issue |
-| Cost or time per issue | Orchestrator unit budgets | Run stops, PR or issue labeled `bot:blocked` with the reason |
+| Cost per issue | `drive --max-cost-usd`, from `max_cost_usd_per_issue` in `config.json` (default $5) | Run stops, issue labeled `bot:blocked` with the reason |
+| Time per issue | `drive --max-hours` from the units' minutes; 6 hours hard timeout | Run stops, issue labeled `bot:blocked` with the reason |
 | Repair rounds after review | 1 | PR waits for Kenny |
 | Units per plan | 8 | Analysis is asked to split the issue into smaller issues |
 
@@ -209,6 +215,9 @@ Two cautions:
 - Analysis runs read-only. Coding runs only in repositories listed in `coding_repos`, inside orchestrator worktrees of `iwb`'s own clone, never on `main` or a checkout Kenny uses. Before anything is pushed, the run's actual changes are checked against the plan's scope and the protected paths.
 - Workers never merge, never push to the default branch, and never change repository settings, secrets or workflows. Changes to `.github/workflows`, secrets, credentials and deploy configuration are refused by the policy gate; no agent can approve them.
 - Tokens come from `prbot`: one hour, one repository, never printed or saved.
+- The orchestrator and the runner CLIs get a scrubbed environment: the base names the orchestrator's runners use (`PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `TMPDIR`, `TERM`, uv's cache settings) plus `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the XDG folders, which the CLIs use to find their own logins. No `GH_TOKEN`, `GITHUB_TOKEN`, `PRBOT_*` or other tokens; `drive_env` in `config.json` can add a name, never one of those. The run pushes nothing, so it needs no GitHub credentials.
+- `drive` does not run under `sandbox-exec`. It was tried on 2026-10-30 with a profile that allowed writes only to the issue's checkout, the orchestrator's state and worktrees, the CLIs' config and cache folders, and temp. Claude Code worked under it. Codex did not: its own `workspace-write` sandbox rejected every write, even inside the allowed checkout, and the same command with the same scrubbed environment worked without the outer profile. The orchestrator routes units to both CLIs, so the outer sandbox would break Codex units. Writes are limited instead by each CLI's own sandbox (Codex `workspace-write`, Claude Code `acceptEdits` with an allowlist of edit tools) and by the scope check before anything is pushed.
+- `state.json` is written atomically (a temporary file in the same folder, then a rename). Each pass re-reads it just before saving and writes back only the entries it changed, so a long coding run never overwrites what another pass recorded meanwhile.
 - The guard hook and the `cross-review` skill already stop agents from posting or pushing as Kenny.
 
 ## Bridge to OpenClaw
