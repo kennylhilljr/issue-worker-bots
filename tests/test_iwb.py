@@ -610,8 +610,8 @@ class Code(unittest.TestCase):
         p = iwb.prbot
         self.saved = {k: getattr(p, k) for k in ("gh_read", "bot_config", "openclaw_attention")}
         self.saved_iwb = {k: getattr(iwb, k) for k in (
-            "STATE", "CONFIG", "WORK_DIR", "post", "run_gh_as", "checkout", "changed_files", "commit_as",
-            "push_branch", "create_pr", "ready_pr", "ECC_DEFAULTS", "orchestrator_drift")}
+            "STATE", "CONFIG", "WORK_DIR", "post", "run_gh_as", "checkout", "trusted_copy", "changed_files",
+            "commit_as", "push_branch", "create_pr", "ready_pr", "ECC_DEFAULTS", "orchestrator_drift")}
         iwb.STATE = Path(self.tmp.name, "state.json")
         iwb.CONFIG = Path(self.tmp.name, "config.json")
         iwb.WORK_DIR = Path(self.tmp.name, "work")
@@ -631,6 +631,7 @@ class Code(unittest.TestCase):
         self.changed = ["src/parser.py"]
         self.pushed, self.commits, self.prs = [], [], []
         iwb.checkout = lambda repo, bot, branch: (str(Path(self.tmp.name, "clone")), "main", "base0")
+        iwb.trusted_copy = lambda d, branch, base: str(Path(self.tmp.name, "trusted"))
         iwb.changed_files = lambda d, base, branch: self.changed
         iwb.commit_as = lambda bot, repo, d, base, branch, msg: self.commits.append((bot, msg)) or "sha1"
         iwb.push_branch = lambda bot, repo, d, sha, branch, default: self.pushed.append((bot, sha, branch))
@@ -786,12 +787,15 @@ class Code(unittest.TestCase):
         self.assertEqual(self.ecc_calls, [])                            # retried after an hour, not every pass
 
     def test_push_refuses_anything_but_a_bot_branch(self):
-        saved = iwb.prbot_git
-        self.addCleanup(lambda: setattr(iwb, "prbot_git", saved))
-        iwb.prbot_git = lambda *a: self.fail("nothing may run")
-        for branch in ("main", "feature/x"):
-            with self.subTest(branch=branch), self.assertRaisesRegex(iwb.WorkError, "refusing to push"):
-                self.saved_iwb["push_branch"]("claude-dev", "kennylhilljr/demo", "/tmp/x", "sha", branch, "main")
+        saved = (iwb.git_trusted, iwb.prbot.installation_token)
+        self.addCleanup(lambda: (setattr(iwb, "git_trusted", saved[0]),
+                                 setattr(iwb.prbot, "installation_token", saved[1])))
+        iwb.git_trusted = iwb.prbot.installation_token = lambda *a, **k: self.fail("nothing may run")
+        for repo, branch in (("kennylhilljr/demo", "main"), ("kennylhilljr/demo", "feature/x"),
+                             ("kennylhilljr/demo", "bot/../main"), ("kennylhilljr/demo", "bot/x y"),
+                             ("kennylhilljr/..", "bot/1-x"), ("a/b/c", "bot/1-x"), ("evil.com:x/y", "bot/1-x")):
+            with self.subTest(repo=repo, branch=branch), self.assertRaisesRegex(iwb.WorkError, "refusing to push"):
+                self.saved_iwb["push_branch"]("claude-dev", repo, "/tmp/x", "sha", branch, "main")
 
     def test_stop_pause_limit_and_interrupted_runs(self):
         self.issue["labels"] = ["bot:approved", "bot:stop"]
@@ -822,18 +826,19 @@ class Code(unittest.TestCase):
 
     def test_protected_paths(self):
         ecc = "kennylhilljr/ecc-customization"
-        globs = iwb.protected_globs(ecc)
+        rules = iwb.path_rules(ecc)
         for p in (".github/workflows/ci.yml", ".env", "a/.env.local", "x/y.pem", "id.key", "secrets/t",
                   "a/secrets/b", "bootstrap.sh", "stack.conf", "machine/brew/Brewfile"):
-            self.assertTrue(iwb.protected(p, globs), p)
-        for p in ("src/secretsauce.py", "docs/env.md", "skills/README.md"):
-            self.assertFalse(iwb.protected(p, globs), p)
-        self.assertFalse(iwb.protected("bootstrap.sh", iwb.protected_globs("kennylhilljr/demo")))
+            self.assertTrue(iwb.protected(p, rules), p)
+        for p in ("src/secretsauce.py", "docs/env.md", "skills/README.md", "a/bootstrap.sh"):
+            self.assertFalse(iwb.protected(p, rules), p)
+        self.assertFalse(iwb.protected("bootstrap.sh", iwb.path_rules("kennylhilljr/demo")))
         iwb.CONFIG.write_text(json.dumps({"policy": {ecc: ["docs/**"]}}))       # a list replaces the seed
-        self.assertFalse(iwb.protected("bootstrap.sh", iwb.protected_globs(ecc)))
-        self.assertTrue(iwb.protected("docs/a/b.md", iwb.protected_globs(ecc)))
-        iwb.CONFIG.write_text(json.dumps({"policy": {ecc: {"deny_paths": ["x"]}}}))   # the gate's dict form
-        self.assertTrue(iwb.protected("bootstrap.sh", iwb.protected_globs(ecc)))
+        self.assertFalse(iwb.protected("bootstrap.sh", iwb.path_rules(ecc)))
+        self.assertTrue(iwb.protected("docs/a/b.md", iwb.path_rules(ecc)))
+        iwb.CONFIG.write_text(json.dumps({"policy": {ecc: {"deny_paths": ["^x/"]}}}))   # so does the dict form
+        self.assertFalse(iwb.protected("bootstrap.sh", iwb.path_rules(ecc)))
+        self.assertTrue(iwb.protected("x/y", iwb.path_rules(ecc)))
 
     def test_expiring_certifications_wait_without_posting(self):
         # regression: certifications expire weekly (cert-latest.json, 2026-11-01 13:00Z); a run started shortly before
@@ -919,6 +924,30 @@ class Code(unittest.TestCase):
                 self.assertEqual((e["work"]["status"], e["work"]["pr"]), ("pr-open", e["branches"][0]["pr"]))
                 self.assertEqual(self.ready[-1], e["work"]["pr"])
                 self.assertEqual(self.labels()[-1], "bot:pr-open")
+
+    def test_failed_pr_open_note_is_retried_and_the_pr_is_not_made_again(self):
+        # regression (Codex review of #5, P2): status became pr-open before the issue note was posted, so a GitHub
+        # error on that note left the issue labeled bot:in-progress forever, since pr-open entries are skipped
+        saved_post = iwb.post
+
+        def flaky(bot, repo, n, body, label):
+            if label == "bot:pr-open" and not getattr(self, "failed_once", False):
+                self.failed_once = True
+                raise RuntimeError("gh issue edit failed: HTTP 502")
+            return saved_post(bot, repo, n, body, label)
+        iwb.post = flaky
+        self.run_pass()
+        w = self.state()["work"]
+        self.assertEqual((w["status"], w["pr"]), ("pushed", "https://github.com/kennylhilljr/demo/pull/9"))
+        self.assertEqual(self.labels(), ["bot:in-progress"])
+        self.assertIsNone(iwb.needs_analysis(self.state(), [], {OWNER}, "d"))    # not re-planned meanwhile
+        state = json.loads(iwb.STATE.read_text())
+        state[self.KEY]["work_failed_at"] = 0                               # the hour has passed
+        iwb.STATE.write_text(json.dumps(state))
+        self.run_pass()
+        self.assertEqual(self.state()["work"]["status"], "pr-open")
+        self.assertEqual(self.labels(), ["bot:in-progress", "bot:pr-open"])
+        self.assertEqual((len(self.prs), len(self.pushed)), (1, 1))         # the PR and the push happen once
 
     def test_a_new_attempt_gets_its_own_branch_and_closes_the_old_pr(self):
         state = json.loads(iwb.STATE.read_text())
@@ -1086,6 +1115,201 @@ class StateFile(unittest.TestCase):
         iwb.STATE.write_text(json.dumps({"a#1": {"x": 1}, "b#2": {"x": 20}, "c#3": {}}))   # another pass
         iwb.save_state(state, since)
         self.assertEqual(json.loads(iwb.STATE.read_text()), {"a#1": {"x": 10}, "b#2": {"x": 20}, "c#3": {}})
+
+    def use_tmp_state(self, data):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        saved = iwb.STATE
+        self.addCleanup(lambda: setattr(iwb, "STATE", saved))
+        iwb.STATE = Path(tmp.name, "state.json")
+        iwb.STATE.write_text(json.dumps(data))
+
+    def test_another_pass_changing_other_fields_of_the_same_entry_survives(self):
+        # regression (Codex review of #5, P2): a coding pass wrote back its whole stale copy of the entry it coded,
+        # so an analysis or approval recorded on that issue during the run was lost
+        self.use_tmp_state({"a#1": {"agent": "claude", "work": {"status": "approved"}, "approval": {"v": 1}}})
+        state, since = iwb.load_state()
+        state["a#1"]["work"] = {"status": "pr-open"}
+        state["a#1"].pop("approval")
+        disk = json.loads(iwb.STATE.read_text())
+        disk["a#1"]["handled_at"] = 5                                       # another pass, meanwhile
+        iwb.STATE.write_text(json.dumps(disk))
+        iwb.save_state(state, since)
+        self.assertEqual(json.loads(iwb.STATE.read_text())["a#1"],
+                         {"agent": "claude", "work": {"status": "pr-open"}, "handled_at": 5})
+
+    def test_save_waits_for_the_state_lock(self):
+        # regression (Codex review of #5, P2): two passes saving at once could each read the file before the other
+        # wrote it; every save now holds one lock from read to rename
+        import fcntl, threading
+        self.use_tmp_state({"a#1": {"x": 1}})
+        state, since = iwb.load_state()
+        state["a#1"]["x"] = 2
+        held = open(iwb.state_lock_path(), "w")
+        fcntl.flock(held, fcntl.LOCK_EX)
+        t = threading.Thread(target=iwb.save_state, args=(state, since))
+        t.start()
+        time.sleep(0.3)
+        self.assertTrue(t.is_alive())
+        self.assertEqual(json.loads(iwb.STATE.read_text()), {"a#1": {"x": 1}})
+        fcntl.flock(held, fcntl.LOCK_UN)
+        held.close()
+        t.join(5)
+        self.assertEqual(json.loads(iwb.STATE.read_text()), {"a#1": {"x": 2}})
+
+
+class Policy(unittest.TestCase):
+    """One parser for config.json "policy", read the same way by the plan gate (4a) and the check after the run (4b)."""
+    REPO = "kennylhilljr/demo"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        saved = iwb.CONFIG
+        self.addCleanup(lambda: setattr(iwb, "CONFIG", saved))
+        iwb.CONFIG = Path(tmp.name, "config.json")
+
+    def both_gates(self, path):
+        """(refused by the plan gate, refused after the run)"""
+        gate = bool(iwb.policy_violations([code_unit(files=[path])], self.REPO))
+        post = any("protected path" in p for p in iwb.scope_problems([path], [code_unit(files=[path])], self.REPO))
+        return gate, post
+
+    def test_custom_protected_path_is_enforced_by_both_gates(self):
+        # regression (Codex review of #5, P2): the README's list form crashed or was ignored by the plan gate, and the
+        # check after the run ignored the gate's {deny_paths} form, so the two gates enforced different policies
+        for policy in (["deploy/**"], {"deny_paths": [r"^deploy/"]}):
+            with self.subTest(policy=policy):
+                iwb.CONFIG.write_text(json.dumps({"policy": {self.REPO: policy}}))
+                self.assertEqual(self.both_gates("deploy/prod.yml"), (True, True))
+                self.assertEqual(self.both_gates("src/app.py"), (False, False))
+                self.assertEqual(self.both_gates(".github/workflows/ci.yml"), (True, True))   # built in, always
+                self.assertEqual(self.both_gates("config/credentials.json"), (True, True))
+
+    def test_allow_paths_never_opens_a_built_in_path(self):
+        iwb.CONFIG.write_text(json.dumps({"policy": {self.REPO: {"deny_paths": [r"^deploy/"],
+                                                                 "allow_paths": [r"^deploy/docs/", r"\.env"]}}}))
+        self.assertEqual(self.both_gates("deploy/docs/a.md"), (False, False))
+        self.assertEqual(self.both_gates("app/.env"), (True, True))
+
+    def test_malformed_policy_refuses_every_path(self):
+        for policy in ("deploy/**", {"deny_paths": ["("]}, 7):
+            with self.subTest(policy=policy):
+                iwb.CONFIG.write_text(json.dumps({"policy": {self.REPO: policy}}))
+                self.assertEqual(self.both_gates("src/app.py"), (True, True))
+
+
+class TrustedPush(unittest.TestCase):
+    """The push after a run, with real git: a local bare repository stands in for GitHub."""
+
+    def git(self, *a, cwd=None):
+        import subprocess
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def setUp(self):
+        import os
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        t = self.t = Path(tmp.name).resolve()
+        self.github, self.evil, self.marks = t / "github.git", t / "evil.git", t / "marks"
+        self.marks.mkdir()
+        self.git("init", "-q", "--bare", "-b", "main", str(self.github))
+        self.git("init", "-q", "--bare", "-b", "main", str(self.evil))
+        seed = t / "seed"
+        self.git("clone", "-q", str(self.github), str(seed))
+        Path(seed, "src").mkdir()
+        Path(seed, "src", "parser.py").write_text("x = 1\n")
+        Path(seed, "bootstrap.sh").write_text("echo hi\n")
+        self.git("add", "-A", cwd=seed)
+        self.git("commit", "-qm", "init", cwd=seed)
+        self.git("push", "-q", "origin", "HEAD:main", cwd=seed)
+        self.d = t / "clone"                               # iwb's clone, where the agents worked
+        self.git("clone", "-q", str(self.github), str(self.d))
+        self.base = self.git("rev-parse", "HEAD", cwd=self.d)
+        self.git("checkout", "-qb", "bot/1-x", cwd=self.d)
+        Path(self.d, "src", "parser.py").write_text("x = 2\n")
+        self.git("commit", "-qam", "unit", cwd=self.d)
+        self.git("checkout", "-q", "main", cwd=self.d)
+        # what a unit could leave behind in the shared .git and in the home folder, which drive can write
+        hooks = t / "evil-hooks"
+        hooks.mkdir()
+        for name in ("pre-push", "reference-transaction", "post-commit", "pre-commit", "post-checkout",
+                     "pre-auto-gc", "push-to-checkout"):
+            Path(hooks, name).write_text(f"#!/bin/sh\ntouch {self.marks}/{name}\n")
+            Path(hooks, name).chmod(0o755)
+            Path(self.d, ".git", "hooks", name).write_text(f"#!/bin/sh\ntouch {self.marks}/local-{name}\n")
+            Path(self.d, ".git", "hooks", name).chmod(0o755)
+        fsmon = t / "fsmonitor.sh"
+        fsmon.write_text(f"#!/bin/sh\ntouch {self.marks}/fsmonitor\n")
+        fsmon.chmod(0o755)
+        Path(t, "inc.cfg").write_text(f"[core]\n\thooksPath = {hooks}\n")
+        for k, v in (("core.hooksPath", str(hooks)), ("core.fsmonitor", str(fsmon)),
+                     ("credential.helper", f"!touch {self.marks}/credential; true"),
+                     (f"url.{self.evil}.insteadOf", "https://github.com/"), ("remote.origin.url", str(self.evil)),
+                     ("include.path", str(t / "inc.cfg"))):
+            self.git("config", k, v, cwd=self.d)
+        home = t / "home"
+        home.mkdir()
+        Path(home, ".gitconfig").write_text(f"[core]\n\thooksPath = {hooks}\n[url \"{self.evil}\"]\n"
+                                            f"\tinsteadOf = https://github.com/\n")
+        saved_env = {k: os.environ.get(k) for k in ("HOME", "XDG_CONFIG_HOME")}
+        self.addCleanup(lambda: [os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+                                 for k, v in saved_env.items()])
+        os.environ["HOME"] = str(home)
+        os.environ.pop("XDG_CONFIG_HOME", None)
+        p = iwb.prbot
+        saved = {k: getattr(p, k) for k in ("installation_token", "bot_identity", "git_env")}
+        self.addCleanup(lambda: [setattr(p, k, v) for k, v in saved.items()])
+        real_env, github = saved["git_env"], self.github
+        self.tokens = []
+        p.installation_token = lambda bot, repo, permissions=None: self.tokens.append(permissions) or "tok"
+        p.bot_identity = lambda bot: ("claude-dev-gh[bot]", "1+claude-dev-gh[bot]@users.noreply.github.com")
+
+        def git_env(token=None, identity=None):              # iwb's own config sends github.com to the stand-in
+            env = real_env(token, identity)
+            n = int(env.get("GIT_CONFIG_COUNT", 0))
+            env.update({"GIT_CONFIG_COUNT": str(n + 1), f"GIT_CONFIG_KEY_{n}": f"url.{github}.insteadOf",
+                        f"GIT_CONFIG_VALUE_{n}": "https://github.com/kennylhilljr/demo.git"})
+            return env
+        p.git_env = git_env
+
+    def publish(self, files=("src/parser.py",)):
+        return iwb.publish("claude-dev", "kennylhilljr/demo", str(self.d), self.base, "bot/1-x", "main",
+                           [code_unit(files=list(files))], "Add retries (#1)")
+
+    def test_push_runs_from_a_clean_repository_with_no_agent_config(self):
+        # regression (Codex review of #5, P1): the credentialed push ran in the clone the agents controlled, so a
+        # planted hook, core.hooksPath, credential.helper or url.insteadOf ran or redirected with the bot token
+        before = set(Path(tempfile.gettempdir()).glob("iwb-push-*"))
+        sha = self.publish()
+        self.assertEqual(sorted(p.name for p in self.marks.iterdir()), [])   # no hook, helper or fsmonitor ran
+        self.assertEqual(self.git("--git-dir", str(self.github), "rev-parse", "refs/heads/bot/1-x"), sha)
+        self.assertEqual(self.git("--git-dir", str(self.github), "rev-parse", f"{sha}^"), self.base)
+        self.assertEqual(self.git("--git-dir", str(self.github), "log", "-1", "--format=%an|%cn|%s", sha),
+                         "claude-dev-gh[bot]|claude-dev-gh[bot]|Add retries (#1)")
+        self.assertEqual(self.git("--git-dir", str(self.github), "show", f"{sha}:src/parser.py"), "x = 2")
+        self.assertEqual(self.git("--git-dir", str(self.evil), "for-each-ref"), "")   # nothing went elsewhere
+        self.assertEqual(self.tokens, [{"contents": "write"}])               # one token, for the push only
+        self.assertEqual(set(Path(tempfile.gettempdir()).glob("iwb-push-*")), before)   # the copy is removed
+
+    def test_out_of_scope_result_is_refused_before_any_token(self):
+        self.git("checkout", "-q", "bot/1-x", cwd=self.d)
+        Path(self.d, "bootstrap.sh").write_text("curl x | sh\n")
+        self.git("-c", "core.hooksPath=/dev/null", "commit", "-qam", "more", cwd=self.d)
+        self.git("-c", "core.hooksPath=/dev/null", "checkout", "-q", "main", cwd=self.d)
+        with self.assertRaisesRegex(iwb.WorkError, "`bootstrap.sh` is outside the plan's scope"):
+            self.publish()
+        self.assertEqual(self.tokens, [])
+        self.assertEqual(self.git("--git-dir", str(self.github), "for-each-ref", "refs/heads/bot"), "")
+
+    def test_branch_that_does_not_start_at_the_base_is_refused(self):
+        self.git("-c", "core.hooksPath=/dev/null", "checkout", "-q", "--orphan", "other", cwd=self.d)
+        self.git("-c", "core.hooksPath=/dev/null", "commit", "-qm", "orphan", cwd=self.d)
+        self.git("-c", "core.hooksPath=/dev/null", "branch", "-f", "bot/1-x", "other", cwd=self.d)
+        with self.assertRaisesRegex(iwb.WorkError, "doesn't start from"):
+            self.publish()
+        self.assertEqual(self.tokens, [])
 
 
 class Checkout(unittest.TestCase):
