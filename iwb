@@ -683,27 +683,29 @@ def path_rules(repo):
     (4b): (built in, the repository's own, allowed), each a list of (pattern, regex). config.json "policy" for the
     repository is a list of globs (DESIGN.md decision 3) or {"deny_paths": [regex], "allow_paths": [regex]}; either
     replaces the seed list. allow_paths exempts a path from the repository's own rules only, never the built-in
-    ones. A malformed entry protects every path until it is fixed."""
+    ones. A malformed entry (another key, a pattern that isn't a non-empty string, a bad regex) protects every path
+    until it is fixed."""
     built_in = [(g, glob_rx(g)) for g in ALWAYS_BLOCKED] + [(rx, re.compile(rx)) for rx in DENY_PATHS]
     pol = read_config().get("policy", {}).get(repo, SEED_POLICY.get(repo, []))
+    patterns = lambda xs: isinstance(xs, list) and all(isinstance(x, str) and x for x in xs)
     try:
-        if isinstance(pol, list) and all(isinstance(g, str) for g in pol):
+        if patterns(pol):
             return built_in, [(g, glob_rx(g)) for g in pol], []
-        if isinstance(pol, dict) and all(isinstance(pol.get(k, []), list) for k in ("deny_paths", "allow_paths")):
+        if isinstance(pol, dict) and set(pol) <= {"deny_paths", "allow_paths"} and \
+                all(patterns(v) for v in pol.values()):
             return (built_in, [(rx, re.compile(rx)) for rx in pol.get("deny_paths", [])],
                     [(rx, re.compile(rx)) for rx in pol.get("allow_paths", [])])
-    except (re.error, TypeError):
+    except re.error:
         pass
     return built_in, [(f"config.json policy for {repo} is malformed", re.compile(""))], []
 
 
 def protected(path, rules):
-    """The rule that protects `path`, or None."""
+    """Whether a rule protects `path`."""
     built_in, own, allow = rules
-    hit = next((p for p, rx in built_in if rx.search(path)), None)
-    if hit is None and not any(rx.search(path) for _, rx in allow):
-        hit = next((p for p, rx in own if rx.search(path)), None)
-    return hit
+    if any(rx.search(path) for _, rx in built_in):
+        return True
+    return not any(rx.search(path) for _, rx in allow) and any(rx.search(path) for _, rx in own)
 
 
 def policy_violations(units, repo):
@@ -1322,9 +1324,9 @@ def trusted_copy(d, branch, base):
 def changed_files(d, base, ref):
     """Every path the run touched. --no-renames reports a rename as a delete and an add, so the scope and
     protected-path checks see the old path too (a rename otherwise lists only the new one). -z keeps unusual
-    names unquoted."""
+    names unquoted. Only the empty piece after the last NUL is dropped: a file named " " is still a change."""
     out = git_trusted(d, "diff-tree", "-r", "--no-renames", "--name-only", "-z", base, ref)
-    return [f for f in out.split("\0") if f.strip()]
+    return [f for f in out.split("\0") if f]
 
 
 def scope_problems(files, units, repo):

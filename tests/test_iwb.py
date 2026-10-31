@@ -839,6 +839,9 @@ class Code(unittest.TestCase):
         iwb.CONFIG.write_text(json.dumps({"policy": {ecc: {"deny_paths": ["^x/"]}}}))   # so does the dict form
         self.assertFalse(iwb.protected("bootstrap.sh", iwb.path_rules(ecc)))
         self.assertTrue(iwb.protected("x/y", iwb.path_rules(ecc)))
+        # regression (Codex review of #9): the matched pattern was returned, and an empty one read as false
+        self.assertIs(iwb.protected("x/y", ([], [("", iwb.re.compile(""))], [])), True)
+        self.assertIs(iwb.protected("src/a.py", iwb.path_rules(ecc)), False)
 
     def test_expiring_certifications_wait_without_posting(self):
         # regression: certifications expire weekly (cert-latest.json, 2026-11-01 13:00Z); a run started shortly before
@@ -1193,7 +1196,11 @@ class Policy(unittest.TestCase):
         self.assertEqual(self.both_gates("app/.env"), (True, True))
 
     def test_malformed_policy_refuses_every_path(self):
-        for policy in ("deploy/**", {"deny_paths": ["("]}, 7):
+        # regression (Codex review of #9): an unknown key such as "deny_path" left no rules, and an empty pattern
+        # matched every path but read as false, so both protected nothing
+        for policy in ("deploy/**", {"deny_paths": ["("]}, 7, {"deny_path": ["^deploy/"]},
+                       {"deny_paths": ["^deploy/"], "extra": []}, {"deny_paths": [""]}, {"deny_paths": [3]},
+                       {"allow_paths": [""]}, [""], ["deploy/**", 3]):
             with self.subTest(policy=policy):
                 iwb.CONFIG.write_text(json.dumps({"policy": {self.REPO: policy}}))
                 self.assertEqual(self.both_gates("src/app.py"), (True, True))
@@ -1302,6 +1309,18 @@ class TrustedPush(unittest.TestCase):
             self.publish()
         self.assertEqual(self.tokens, [])
         self.assertEqual(self.git("--git-dir", str(self.github), "for-each-ref", "refs/heads/bot"), "")
+
+    def test_whitespace_only_filename_is_checked_against_the_scope(self):
+        # regression (Codex review of #9): f.strip() dropped a file named " " from changed_files, so it was pushed
+        # unchecked
+        self.git("-c", "core.hooksPath=/dev/null", "checkout", "-q", "bot/1-x", cwd=self.d)
+        Path(self.d, " ").write_text("x\n")
+        self.git("-c", "core.hooksPath=/dev/null", "add", "-A", cwd=self.d)
+        self.git("-c", "core.hooksPath=/dev/null", "commit", "-qm", "more", cwd=self.d)
+        self.git("-c", "core.hooksPath=/dev/null", "checkout", "-q", "main", cwd=self.d)
+        with self.assertRaisesRegex(iwb.WorkError, "` ` is outside the plan's scope"):
+            self.publish()
+        self.assertEqual(self.tokens, [])
 
     def test_branch_that_does_not_start_at_the_base_is_refused(self):
         self.git("-c", "core.hooksPath=/dev/null", "checkout", "-q", "--orphan", "other", cwd=self.d)
