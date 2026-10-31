@@ -154,7 +154,7 @@ Settings in `~/.config/issue-worker-bots/config.json`; nothing is coded until bo
 | --- | --- | --- |
 | `coding_live` | false | `tick` runs `iwb code`. |
 | `coding_repos` | none | Repositories where approved plans are coded. Elsewhere the worker posts one note and the plan waits. |
-| `policy` | the seed list above for `ecc-customization` | Protected globs per repository, read the same way by the plan gate and the check after the run, on top of `.github/workflows/**`, `**/.env*`, `**/*.pem`, `**/*.key`, `**/secrets/**`, credentials and SSH key names. The older `{"deny_paths": [regex], "allow_paths": [regex]}` form also works; `allow_paths` never opens a built-in path. Either form replaces the seed list. A malformed entry protects every path. |
+| `policy` | the seed list above for `ecc-customization` | Protected globs per repository, read the same way by the plan gate and the check after the run, on top of `.github/workflows/**`, `**/.env*`, `**/*.pem`, `**/*.key`, `**/secrets/**`, credentials and SSH key names. The older `{"deny_paths": [regex], "allow_paths": [regex]}` form also works; `allow_paths` never opens a built-in path. Either form replaces the seed list. A malformed entry (another key, an empty pattern, a bad regex) protects every path. |
 | `ecc_config` | certifications and catalog from the orchestrator runtime | Orchestrator config keys for the run (for example `repo_checks`). Coding waits, without posting, while the certifications file is missing. |
 
 The orchestrator is `../openclaw-ecc-orchestrator/bin/ecc` (override with `IWB_ECC`). Its state, worktrees and `iwb`'s clones live in `~/.local/state/issue-worker-bots/` (override with `IWB_WORK`), apart from Kenny's own orchestrator runs.
