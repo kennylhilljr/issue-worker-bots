@@ -611,13 +611,14 @@ class Code(unittest.TestCase):
         self.saved = {k: getattr(p, k) for k in ("gh_read", "bot_config", "openclaw_attention")}
         self.saved_iwb = {k: getattr(iwb, k) for k in (
             "STATE", "CONFIG", "WORK_DIR", "post", "run_gh_as", "checkout", "changed_files", "commit_as",
-            "push_branch", "open_pr", "ECC_DEFAULTS")}
+            "push_branch", "create_pr", "ready_pr", "ECC_DEFAULTS", "orchestrator_drift")}
         iwb.STATE = Path(self.tmp.name, "state.json")
         iwb.CONFIG = Path(self.tmp.name, "config.json")
         iwb.WORK_DIR = Path(self.tmp.name, "work")
         iwb.CONFIG.write_text(json.dumps(self.PILOT))
         iwb.ECC_DEFAULTS = {"certifications": str(Path(self.tmp.name, "cert-latest.json"))}
-        Path(iwb.ECC_DEFAULTS["certifications"]).write_text('{"results": []}')
+        self.certify()
+        iwb.orchestrator_drift = lambda: None
         self.issue = {"state": "open", "title": "Add retries", "labels": ["bot:approved"]}
         p.gh_read = lambda args: json.dumps(self.issue)
         p.bot_config = lambda bot: {"slug": {"claude": "claude-pr-gh", "codex": "codex-pr-gh"}.get(bot, bot + "-gh")}
@@ -626,15 +627,17 @@ class Code(unittest.TestCase):
         self.posts, self.gh_calls = [], []
         iwb.post = lambda bot, repo, n, body, label: self.posts.append((bot, label, body)) or f"https://x/c{len(self.posts)}"
         iwb.run_gh_as = lambda bot, repo, args: self.gh_calls.append((bot, args)) or "https://x/note"
-        self.ecc_calls, self.ecc_results = [], {}
+        self.ecc_calls, self.ecc_results, self.ecc_opts, self.during_drive = [], {}, [], None
         self.changed = ["src/parser.py"]
         self.pushed, self.commits, self.prs = [], [], []
         iwb.checkout = lambda repo, bot, branch: (str(Path(self.tmp.name, "clone")), "main", "base0")
         iwb.changed_files = lambda d, base, branch: self.changed
         iwb.commit_as = lambda bot, repo, d, base, branch, msg: self.commits.append((bot, msg)) or "sha1"
         iwb.push_branch = lambda bot, repo, d, sha, branch, default: self.pushed.append((bot, sha, branch))
-        iwb.open_pr = lambda bot, repo, branch, default, title, body, agent: self.prs.append(
-            (bot, branch, agent, body)) or "https://github.com/kennylhilljr/demo/pull/9"
+        self.pr_fail = []                                               # "create" or "ready" to fail once
+        iwb.create_pr = self.fake_create_pr
+        iwb.ready_pr = self.fake_ready_pr
+        self.ready = []
         self.approve_plan([coding_unit()])
 
     def tearDown(self):
@@ -643,6 +646,24 @@ class Code(unittest.TestCase):
         for k, v in self.saved_iwb.items():
             setattr(iwb, k, v)
         self.tmp.cleanup()
+
+    def certify(self, expires="2099-01-01T00:00:00Z", runners=("claude", "codex", "groq")):
+        """A cert-latest.json as bin/recertify-weekly writes it."""
+        Path(iwb.ECC_DEFAULTS["certifications"]).write_text(json.dumps({"results": [
+            {"record": {"runner": r, "status": "certified", "expires_at": expires}} for r in runners]}))
+
+    def fake_create_pr(self, bot, repo, branch, default, title, body, agent):
+        if "create" in self.pr_fail:
+            self.pr_fail.remove("create")
+            raise RuntimeError("gh pr create failed: HTTP 502")
+        self.prs.append((bot, branch, agent, body))
+        return f"https://github.com/kennylhilljr/demo/pull/{8 + len(self.prs)}"
+
+    def fake_ready_pr(self, bot, repo, url):
+        if "ready" in self.pr_fail:
+            self.pr_fail.remove("ready")
+            raise RuntimeError("gh pr ready failed: HTTP 502")
+        self.ready.append(url)
 
     def approve_plan(self, units, key=None, agent="claude"):
         """What step 4a leaves behind after an approval."""
@@ -655,8 +676,11 @@ class Code(unittest.TestCase):
                                    "approver": "codex-pr-gh", "at": 1000.0, "comment": "https://x/approval"}}
         iwb.STATE.write_text(json.dumps(state))
 
-    def fake_ecc(self, args, timeout=900):
+    def fake_ecc(self, args, timeout=900, **kw):
         self.ecc_calls.append(args)
+        self.ecc_opts.append(kw)
+        if args[0] == "drive" and self.during_drive:
+            self.during_drive()
         op = args[0] if args[0] != "review-plan" else "review-plan " + args[args.index("--") + 1]
         code, env = self.ecc_results.get(op, (0, {"ok": True, "data": {}}))
         if op.startswith("review-plan") and code == 0:
@@ -685,11 +709,12 @@ class Code(unittest.TestCase):
                                                  "--session", "iwb.kennylhilljr.demo.1"])
         create = self.ecc_calls[1]
         self.assertEqual(create[-4:], ["--yes", "--review-id", "rev-1", "--json"])
-        self.assertEqual(create[create.index("--target-branch") + 1], "bot/1-add-retries")
-        self.assertEqual(create[create.index("--run-id") + 1], "iwb.demo.1.1000")
+        branch = create[create.index("--target-branch") + 1]
+        self.assertRegex(branch, r"^bot/1-add-retries-[0-9a-f]{6}$")
+        self.assertRegex(create[create.index("--run-id") + 1], r"^iwb\.kennylhilljr\.demo\.1\.\d{14}$")
         self.assertEqual(self.ecc_calls[3][-3:-1], ["--review-id", "rev-3"])    # drive has its own approval
         self.assertEqual(json.loads(Path(create[create.index("--config") + 1]).read_text()), iwb.ECC_DEFAULTS)
-        self.assertEqual(self.pushed, [("claude-dev", "sha1", "bot/1-add-retries")])
+        self.assertEqual(self.pushed, [("claude-dev", "sha1", branch)])
         self.assertEqual(self.commits[0][0], "claude-dev")
         bot, branch, agent, body = self.prs[0]
         self.assertEqual((bot, agent), ("claude-dev", "claude"))
@@ -810,6 +835,155 @@ class Code(unittest.TestCase):
         iwb.CONFIG.write_text(json.dumps({"policy": {ecc: {"deny_paths": ["x"]}}}))   # the gate's dict form
         self.assertTrue(iwb.protected("bootstrap.sh", iwb.protected_globs(ecc)))
 
+    def test_expiring_certifications_wait_without_posting(self):
+        # regression: certifications expire weekly (cert-latest.json, 2026-11-01 13:00Z); a run started shortly before
+        # would lose its runners half way, after the issue was labeled bot:in-progress
+        soon = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 2 * 3600))   # inside the 6h timeout
+        for certs in ({"expires": soon}, {"runners": ("claude", "groq")}):
+            with self.subTest(**{k: str(v) for k, v in certs.items()}):
+                self.certify(**certs)
+                state = json.loads(iwb.STATE.read_text())
+                state[self.KEY].pop("work_failed_at", None)
+                iwb.STATE.write_text(json.dumps(state))
+                log = self.run_pass()
+                self.assertIn("won't last the run", log)
+                self.assertEqual((self.posts, self.ecc_calls, self.gh_calls), ([], [], []))
+                self.assertIn("work_failed_at", self.state())                  # the hourly retry marker
+                self.assertNotIn("blocked", self.state())
+        self.run_pass()
+        self.assertEqual(self.ecc_calls, [])                                   # not retried within the hour
+        self.assertIn("codex is not certified", iwb.cert_problem(iwb.ECC_DEFAULTS["certifications"], 3600))
+
+    def test_orchestrator_not_at_origin_main_waits_without_posting(self):
+        iwb.orchestrator_drift = lambda: "the orchestrator at /x is at abc, not origin/main (def)"
+        log = self.run_pass()
+        self.assertIn("not origin/main", log)
+        self.assertEqual((self.posts, self.ecc_calls, self.gh_calls), ([], [], []))
+        self.assertIn("work_failed_at", self.state())
+
+    def test_bot_stop_during_the_run_leaves_the_issue_resumable(self):
+        def stop():
+            raise iwb.Stopped("`bot:stop` was added")
+        self.during_drive = stop
+        self.run_pass()
+        self.assertEqual(self.labels(), ["bot:in-progress"])                 # no bot:blocked for a stop
+        notes = [a for bot, a in self.gh_calls if a[:2] == ["issue", "comment"]]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(self.gh_calls[0][0], "claude-dev")                  # one note, as the worker bot
+        self.assertIn("Coding stopped because `bot:stop` was added", notes[0][-1])
+        self.assertEqual((self.state()["work"]["status"], self.state().get("blocked")), ("stopped", None))
+        self.assertEqual((self.pushed, self.events), ([], []))
+        self.issue["labels"] = ["bot:approved", "bot:stop"]
+        self.during_drive = None
+        self.run_pass()
+        self.assertEqual(len(self.ecc_calls), 4)                             # nothing while bot:stop stays
+        self.issue["labels"] = ["bot:approved"]                              # Kenny removed it
+        self.run_pass()
+        self.assertEqual(self.labels()[-1], "bot:pr-open")
+
+    def test_drive_watch_asks_github_and_config(self):
+        self.run_pass()
+        drive = [kw for a, kw in zip(self.ecc_calls, self.ecc_opts) if a[0] == "drive"][0]
+        self.assertIsNone(drive["watch"]())
+        self.issue["labels"] = ["bot:stop"]
+        self.assertEqual(drive["watch"](), "`bot:stop` was added")
+        iwb.CONFIG.write_text(json.dumps({**self.PILOT, "paused": True}))
+        self.assertEqual(drive["watch"](), "the bots were paused")
+
+    def test_pr_failure_after_push_continues_from_the_branch(self):
+        # regression: a failed `gh pr ready` blocked the issue, and a retry pushed a second branch next to the draft
+        for fail in ("create", "ready"):
+            with self.subTest(fail=fail):
+                key = f"kennylhilljr/demo#{3 if fail == 'create' else 5}"
+                self.approve_plan([coding_unit()], key=key)
+                state = json.loads(iwb.STATE.read_text())
+                state.pop(self.KEY, None)
+                iwb.STATE.write_text(json.dumps(state))
+                self.pushed.clear()
+                self.pr_fail = [fail]
+                self.run_pass()
+                e = self.state(key)
+                self.assertEqual((e["work"]["status"], e.get("blocked")), ("pushed", None))
+                self.assertEqual(len(self.pushed), 1)
+                self.assertEqual(e["branches"][0]["branch"], self.pushed[0][2])
+                self.assertEqual(bool(e["branches"][0].get("pr")), fail == "ready")   # the URL is saved at once
+                self.run_pass()
+                self.assertEqual(self.state(key)["work"]["status"], "pushed")       # waits an hour
+                e["work_failed_at"] = 0
+                state = json.loads(iwb.STATE.read_text())
+                state[key] = e
+                iwb.STATE.write_text(json.dumps(state))
+                self.run_pass()
+                e = self.state(key)
+                self.assertEqual(len(self.pushed), 1)                                  # never pushed again
+                self.assertEqual((e["work"]["status"], e["work"]["pr"]), ("pr-open", e["branches"][0]["pr"]))
+                self.assertEqual(self.ready[-1], e["work"]["pr"])
+                self.assertEqual(self.labels()[-1], "bot:pr-open")
+
+    def test_a_new_attempt_gets_its_own_branch_and_closes_the_old_pr(self):
+        state = json.loads(iwb.STATE.read_text())
+        state[self.KEY]["branches"] = [{"branch": "bot/1-add-retries-aaaaaa", "plan_digest": "older", "sha": "s0",
+                                        "pr": "https://github.com/kennylhilljr/demo/pull/3", "ready": False}]
+        iwb.STATE.write_text(json.dumps(state))
+        self.run_pass()
+        e = self.state()
+        self.assertNotEqual(e["work"]["branch"], "bot/1-add-retries-aaaaaa")
+        self.assertEqual(len(e["branches"]), 2)
+        close = [a for _, a in self.gh_calls if a[:2] == ["pr", "close"]]
+        self.assertEqual(close[0][2], "https://github.com/kennylhilljr/demo/pull/3")
+        self.assertIn(e["work"]["pr"], close[0][-1])
+        self.assertTrue(e["branches"][0]["closed"])
+
+    def test_a_concurrent_change_to_another_issue_survives_the_save(self):
+        # regression: cmd_code wrote back the whole state it read before a run of up to 6 hours
+        other = "kennylhilljr/other#7"
+
+        def meanwhile():
+            disk = json.loads(iwb.STATE.read_text())
+            disk[other] = {"agent": "codex", "picked_up_at": 2}
+            disk["_last_agent"] = "codex"
+            iwb.STATE.write_text(json.dumps(disk))
+        self.during_drive = meanwhile
+        self.run_pass()
+        state = json.loads(iwb.STATE.read_text())
+        self.assertEqual(state[other], {"agent": "codex", "picked_up_at": 2})
+        self.assertEqual(state["_last_agent"], "codex")
+        self.assertEqual(state[self.KEY]["work"]["status"], "pr-open")
+        self.assertEqual([p.name for p in iwb.STATE.parent.glob(".state.*")], [])   # no temp file left behind
+
+    def test_drive_gets_a_scrubbed_environment_and_a_cost_cap(self):
+        secrets = {"GH_TOKEN": "ghs_x", "GITHUB_TOKEN": "ghp_y", "PRBOT_ACTIVE": "claude-dev",
+                   "ANTHROPIC_API_KEY": "sk-z", "AWS_SECRET_ACCESS_KEY": "a", "CODEX_HOME": "/tmp/codex-home"}
+        saved = {k: iwb.os.environ.get(k) for k in secrets}
+        self.addCleanup(lambda: [iwb.os.environ.pop(k, None) if v is None else iwb.os.environ.__setitem__(k, v)
+                                 for k, v in saved.items()])
+        iwb.os.environ.update(secrets)
+        iwb.CONFIG.write_text(json.dumps({**self.PILOT, "drive_env": ["GITHUB_TOKEN", "GEMINI_API_KEY"]}))
+        self.run_pass()
+        self.assertEqual(len(self.ecc_opts), 4)
+        for kw in self.ecc_opts:
+            env = kw["env"]
+            self.assertFalse(set(secrets) - {"CODEX_HOME"} & set(env), env)
+            self.assertEqual(env["CODEX_HOME"], "/tmp/codex-home")
+            self.assertIn("USER", env)
+        drive = [a for a in self.ecc_calls if a[0] == "drive"][0]
+        self.assertEqual(drive[drive.index("--max-cost-usd") + 1], "5")
+        self.approve_plan([coding_unit()], key="kennylhilljr/demo#2")
+        iwb.CONFIG.write_text(json.dumps({**self.PILOT, "max_cost_usd_per_issue": 2.5}))
+        self.run_pass()
+        drive = [a for a in self.ecc_calls if a[0] == "drive"][-1]
+        self.assertEqual(drive[drive.index("--max-cost-usd") + 1], "2.5")
+
+    def test_block_comment_output_is_short_and_redacted(self):
+        token = "ghs_" + "A1b2C3d4E5" * 4
+        self.ecc_results["drive"] = (1, {"ok": False, "checks": [{"name": "gate", "ok": False,
+                                                                  "detail": f"GH_TOKEN={token} " + "x" * 900}]})
+        self.run_pass()
+        body = self.posts[-1][2]
+        self.assertNotIn(token, body)
+        self.assertNotIn(token, json.dumps(self.state()))
+        self.assertLess(len(body.split("Coding stopped: ", 1)[1].split("\n")[0]), 220)
+
     def test_run_ecc_reads_the_json_envelope(self):
         script = Path(self.tmp.name, "ecc")
         script.write_text("#!/bin/sh\necho 'drive: FAILED' >&2\n"
@@ -823,6 +997,95 @@ class Code(unittest.TestCase):
         finally:
             iwb.ECC = saved
         self.assertEqual((code, env["data"]["stop"], err), (3, "no_progress", "drive: FAILED"))
+
+
+class DriveProcess(unittest.TestCase):
+    """run_ecc against a real script standing in for the orchestrator, which starts a child like a runner CLI."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        saved = {k: getattr(iwb, k) for k in ("ECC", "POLL", "KILL_GRACE", "CONFIG")}
+        self.addCleanup(lambda: [setattr(iwb, k, v) for k, v in saved.items()])
+        iwb.CONFIG = Path(self.tmp.name, "config.json")
+        iwb.POLL, iwb.KILL_GRACE = 0.2, 2
+        self.pidfile = Path(self.tmp.name, "child.pid")
+        iwb.ECC = Path(self.tmp.name, "ecc")
+        iwb.ECC.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {self.pidfile}\nwait\n")
+        iwb.ECC.chmod(0o755)
+
+    def child_alive(self):
+        for _ in range(50):
+            if self.pidfile.exists() and self.pidfile.read_text().strip():
+                break
+            time.sleep(0.1)
+        try:
+            iwb.os.kill(int(self.pidfile.read_text()), 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    def test_bot_stop_kills_the_whole_process_group(self):
+        asked = []
+        watch = lambda: asked.append(1) or ("`bot:stop` was added" if len(asked) >= 2 else None)
+        with self.assertRaisesRegex(iwb.Stopped, "bot:stop"):
+            iwb.run_ecc(["drive"], timeout=60, watch=watch)
+        self.assertGreaterEqual(len(asked), 2)
+        self.assertFalse(self.child_alive())                 # the runner the orchestrator started is gone too
+
+    def test_timeout_kills_the_group_and_is_a_work_error(self):
+        with self.assertRaisesRegex(iwb.WorkError, "timed out"):
+            iwb.run_ecc(["drive"], timeout=1, watch=lambda: None)
+        self.assertFalse(self.child_alive())
+
+
+class OrchestratorDrift(unittest.TestCase):
+    def test_only_origin_main_passes(self):
+        import subprocess
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        git = lambda *a, cwd=None: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd,
+                                                  check=True, capture_output=True, text=True).stdout.strip()
+        src, orch = Path(tmp.name, "origin"), Path(tmp.name, "orch")
+        src.mkdir()
+        git("init", "-q", "-b", "main", cwd=src)
+        Path(src, "bin").mkdir()
+        Path(src, "bin", "ecc").write_text("x\n")
+        git("add", "-A", cwd=src)
+        git("commit", "-qm", "init", cwd=src)
+        git("clone", "-q", str(src), str(orch))
+        saved = (iwb.ECC, iwb.CONFIG)
+        self.addCleanup(lambda: (setattr(iwb, "ECC", saved[0]), setattr(iwb, "CONFIG", saved[1])))
+        iwb.ECC, iwb.CONFIG = orch / "bin" / "ecc", Path(tmp.name, "config.json")
+        self.assertIsNone(iwb.orchestrator_drift())
+        git("checkout", "-qb", "feature", cwd=orch)
+        Path(orch, "f").write_text("y\n")
+        git("add", "-A", cwd=orch)
+        git("commit", "-qm", "wip", cwd=orch)
+        self.assertIn("not origin/main", iwb.orchestrator_drift())
+        Path(src, "g").write_text("z\n")                     # origin moved on; a dedicated worktree can follow it
+        git("add", "-A", cwd=src)
+        git("commit", "-qm", "next", cwd=src)
+        wt = Path(tmp.name, "wt")
+        git("fetch", "-q", "origin", cwd=orch)
+        git("worktree", "add", "-q", "--detach", str(wt), "origin/main", cwd=orch)
+        iwb.CONFIG.write_text(json.dumps({"ecc_path": str(wt / "bin" / "ecc")}))
+        self.assertIsNone(iwb.orchestrator_drift())
+
+
+class StateFile(unittest.TestCase):
+    def test_intake_save_keeps_changes_made_meanwhile(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        saved = iwb.STATE
+        self.addCleanup(lambda: setattr(iwb, "STATE", saved))
+        iwb.STATE = Path(tmp.name, "state.json")
+        iwb.STATE.write_text(json.dumps({"a#1": {"x": 1}, "b#2": {"x": 2}}))
+        state, since = iwb.load_state()
+        state["a#1"]["x"] = 10
+        iwb.STATE.write_text(json.dumps({"a#1": {"x": 1}, "b#2": {"x": 20}, "c#3": {}}))   # another pass
+        iwb.save_state(state, since)
+        self.assertEqual(json.loads(iwb.STATE.read_text()), {"a#1": {"x": 10}, "b#2": {"x": 20}, "c#3": {}})
 
 
 class Checkout(unittest.TestCase):
@@ -864,3 +1127,25 @@ class Checkout(unittest.TestCase):
         self.assertEqual(sorted(files), ["a.py", "b.py"])
         self.assertEqual(iwb.scope_problems(files, [coding_unit(files=["a.py"])], "kennylhilljr/demo"),
                          ["`b.py` is outside the plan's scope"])
+
+    def test_renaming_a_protected_file_into_scope_is_refused(self):
+        # regression: `git diff --name-only` listed only the new name of a rename, so moving .env into a file the
+        # plan may change passed the scope and protected-path checks
+        import subprocess
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = tmp.name
+        git = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=d, check=True,
+                                        capture_output=True, text=True).stdout.strip()
+        git("init", "-q", "-b", "main")
+        Path(d, ".env").write_text("API_KEY=1\n")
+        git("add", "-A")
+        git("commit", "-qm", "init")
+        base = git("rev-parse", "HEAD")
+        git("checkout", "-qb", "bot/1-x")
+        git("mv", ".env", "src_config.py")
+        git("commit", "-qm", "move")
+        files = iwb.changed_files(d, base, "bot/1-x")
+        self.assertEqual(sorted(files), [".env", "src_config.py"])
+        problems = iwb.scope_problems(files, [coding_unit(files=["src_config.py"])], "kennylhilljr/demo")
+        self.assertIn("`.env` is a protected path", problems)
