@@ -175,6 +175,8 @@ class Analyze(unittest.TestCase):
         self.tmp.cleanup()
 
     def fake_gh(self, args):
+        if args[1] == "graphql":
+            return json.dumps({"at": getattr(self, "edited_at", None)})
         if "/comments" in args[1]:
             return "\n".join(json.dumps(c) for c in self.comments)
         return json.dumps(self.issue)
@@ -334,6 +336,28 @@ class Analyze(unittest.TestCase):
         self.comments.append({"user": OWNER, "body": "more feedback", "at": self.later(4)})
         self.run_pass()
         self.assertEqual(len(self.prompts), 2)               # bot:stop: nothing more happens
+
+    def test_edit_before_digests_existed_is_noticed(self):
+        # regression (ecc-customization#12): analyses from before issue digests were stored have no digest, so an
+        # edit with the answers appended at bot:needs-info never brought the bot back
+        self.edited_at = None
+        self.answers = [answer({"decision": "questions", "summary": "?", "questions": ["Which bucket?"]})]
+        self.run_pass()
+        state = json.loads(iwb.STATE.read_text())
+        a = state[self.KEY]["analysis"]
+        del a["digest"]
+        iwb.STATE.write_text(json.dumps(state))
+        self.run_pass()                                      # never edited: the digest is filled in, no new run
+        self.assertEqual((len(self.prompts), self.state()["analysis"]["digest"]), (1, iwb.issue_digest(self.issue)))
+        state = json.loads(iwb.STATE.read_text())
+        del state[self.KEY]["analysis"]["digest"]
+        iwb.STATE.write_text(json.dumps(state))
+        self.issue["body"] += "\n\nAnswers: the uploads bucket."
+        self.edited_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(a["at"] + 60))
+        self.answers = [answer({"decision": "plan", "summary": "answered", "units": [unit()]})]
+        out = self.run_pass()
+        self.assertIn("(issue edited)", out)
+        self.assertEqual(len(self.prompts), 2)
 
     def test_edit_handover_reopen_and_pause(self):
         self.plan_first()
@@ -1016,6 +1040,24 @@ class Code(unittest.TestCase):
         self.assertNotIn(token, json.dumps(self.state()))
         self.assertLess(len(body.split("Coding stopped: ", 1)[1].split("\n")[0]), 220)
 
+    def test_drive_path_puts_the_newest_runner_cli_first(self):
+        # regression (ecc-customization#14): launchd's PATH found Claude Code 2.1.112 in ~/.local/bin before 2.1.281,
+        # the old one rejected --permission-prompts and the architect turn failed, so the drive stopped (no_architect)
+        dirs = []
+        for name, version in (("old", "2.1.112"), ("new", "2.1.281"), ("other", "")):
+            d = Path(self.tmp.name, name)
+            d.mkdir()
+            if version:
+                (d / "claude").write_text(f"#!/bin/sh\necho '{version} (Claude Code)'\n")
+                (d / "claude").chmod(0o755)
+            dirs.append(str(d))
+        saved = iwb.os.environ.get("PATH")
+        self.addCleanup(lambda: iwb.os.environ.__setitem__("PATH", saved))
+        iwb.os.environ["PATH"] = iwb.os.pathsep.join(dirs + ["/usr/bin", "/bin"])
+        path = iwb.drive_env()["PATH"].split(iwb.os.pathsep)
+        self.assertEqual(path[0], dirs[1])
+        self.assertEqual(sorted(path), sorted(dirs + ["/usr/bin", "/bin"]))      # nothing added or lost
+
     def test_run_ecc_reads_the_json_envelope(self):
         script = Path(self.tmp.name, "ecc")
         script.write_text("#!/bin/sh\necho 'drive: FAILED' >&2\n"
@@ -1359,7 +1401,11 @@ class Checkout(unittest.TestCase):
         d, default, base = iwb.checkout("kennylhilljr/demo", "claude-dev", "bot/1-x")
         self.assertEqual((default, base), ("main", git("rev-parse", "HEAD")))
         self.assertEqual(git("rev-parse", "--abbrev-ref", "HEAD", cwd=d), "main")   # the bot branch isn't checked out
-        self.assertEqual(json.loads(Path(d, ".orchestration/team.json").read_text()), {"merge_approval": "agents"})
+        team = json.loads(Path(d, ".orchestration/team.json").read_text())
+        self.assertEqual(team["merge_approval"], "agents")
+        # regression (ecc-customization#14): the architect's milestone-start plan check stopped the drive with
+        # no_architect; the plan was already red-checked and approved by the other worker family
+        self.assertNotIn("milestone_start", team["roles"]["architect"]["when"])
         self.assertEqual(git("status", "--porcelain", cwd=d), "")                  # and team.json stays out of git
         git("checkout", "-q", "bot/1-x", cwd=d)          # what the orchestrator's merge queue does
         Path(d, "a.py").write_text("y\n")

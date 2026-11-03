@@ -432,9 +432,18 @@ def issue_digest(issue):
     return hashlib.sha256(f"{issue['title']}\n{issue['body'] or ''}".encode()).hexdigest()[:16]
 
 
-def needs_analysis(entry, comments, trusted, digest):
+def last_edited(repo, number):
+    """When the issue body was last edited (epoch), or None if never. REST has no such field; GraphQL does."""
+    owner, name = repo.split("/")
+    q = (f'query {{ repository(owner: "{owner}", name: "{name}") {{ issue(number: {int(number)}) {{ lastEditedAt }} }} }}')
+    at = gh_json(["api", "graphql", "-f", f"query={q}", "--jq", "{at: .data.repository.issue.lastEditedAt}"])[0]["at"]
+    return iso_epoch(at) if at else None
+
+
+def needs_analysis(entry, comments, trusted, digest, edited_at=None):
     """Why this picked-up issue should be analyzed now, or None. A trusted comment after any bot answer
-    (plan included) or an edit to the title or body brings the bot back."""
+    (plan included) or an edit to the title or body brings the bot back. An analysis stored before digests were
+    (no "digest") is compared by `edited_at`, the body's last edit, and then gets the current digest."""
     if "agent" not in entry or entry.get("closed") or entry.get("blocked"):
         return None
     if (entry.get("work") or {}).get("status") in ("in-progress", "pushed", "pr-open"):
@@ -444,6 +453,10 @@ def needs_analysis(entry, comments, trusted, digest):
         return entry.pop("reason", "new")
     if a.get("digest") and a["digest"] != digest:
         return "issue edited"
+    if not a.get("digest"):
+        if edited_at and edited_at > a["at"]:
+            return "issue edited"
+        a["digest"] = digest
     cutoff = max(a["at"], entry.get("handled_at", 0))
     if entry.pop("replan", False):
         return "replan requested"
@@ -550,7 +563,14 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
                 entry["handled_at"] = iso_epoch(new[-1]["at"])
                 log(f"{key}: answered '{cmd}' {url}")
                 continue
-        why = needs_analysis(entry, comments, trusted, digest)
+        edited_at = None
+        if a and not a.get("digest"):
+            try:
+                edited_at = last_edited(repo, number)
+            except (SystemExit, ValueError, IndexError, KeyError):
+                log(f"{key}: could not read when the issue was edited; will retry")
+                continue
+        why = needs_analysis(entry, comments, trusted, digest, edited_at)
         if not why:
             continue
         if runs >= limit:
@@ -1054,6 +1074,7 @@ SECRET_ENV = re.compile(r"^(GH_|GITHUB_|PRBOT_)|TOKEN|SECRET|PASSWORD|CREDENTIAL
 ALWAYS_BLOCKED = (".github/workflows/**", "**/.env*", "**/*.pem", "**/*.key", "**/secrets/**")
 SEED_POLICY = {"kennylhilljr/ecc-customization": ["bootstrap.sh", "stack.conf", "machine/**"]}
 W_MARKER = "<!-- iwb:work -->"
+TEAM = {"merge_approval": "agents", "roles": {"architect": {"when": ["contract_units", "milestone_end"]}}}
 ECC = Path(os.environ.get("IWB_ECC", ROOT.parent / "openclaw-ecc-orchestrator" / "bin" / "ecc"))
 WORK_DIR = Path(os.environ.get("IWB_WORK", Path.home() / ".local" / "state" / "issue-worker-bots"))
 ECC_DEFAULTS = {   # the orchestrator assigns no runner without certifications, so drive needs these
@@ -1191,7 +1212,32 @@ def drive_env():
     env.setdefault("LOGNAME", user)
     env.setdefault("LANG", "en_US.UTF-8")
     env.setdefault("TMPDIR", tempfile.gettempdir())
+    if env.get("PATH"):
+        env["PATH"] = newest_first(env["PATH"], REQUIRED_RUNNERS)
     return env
+
+
+def cli_version(exe):
+    """The version tuple a runner CLI reports (`2.1.281 (Claude Code)`, `codex-cli 0.158.0`), or () if none."""
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    m = re.search(r"(\d+(?:\.\d+)+)", out)
+    return tuple(int(n) for n in m.group(1).split(".")) if m else ()
+
+
+def newest_first(path, tools):
+    """PATH with the directory of each tool's newest copy moved to the front. launchd's PATH (install-intake.sh)
+    can list an old copy first, for example Claude Code 2.1.112 in ~/.local/bin ahead of 2.1.281, and the
+    orchestrator's runner flags need the version it certified."""
+    dirs = path.split(os.pathsep)
+    for tool in tools:
+        found = [d for d in dirs if d and os.access(os.path.join(d, tool), os.X_OK)]
+        if len(found) > 1:
+            best = max(found, key=lambda d: cli_version(os.path.join(d, tool)))   # first one wins a tie
+            dirs = [best] + [d for d in dirs if d != best]
+    return os.pathsep.join(dirs)
 
 
 def cert_expiry(rec):
@@ -1270,9 +1316,11 @@ def checkout(repo, bot, branch):
     team = d / ".orchestration" / "team.json"
     if not team.exists():
         # the plan approver stands in for Kenny: the orchestrator's agents approve merges into the bot branch of
-        # this clone. Kenny still merges the PR. Kept out of git so it never reaches the PR.
+        # this clone. Kenny still merges the PR. Kept out of git so it never reaches the PR. The plan was already
+        # red-checked and approved by the other worker family, so the architect's milestone-start plan check is
+        # skipped: it repeated that review, and when no architect answered it stopped the drive (no_architect).
         team.parent.mkdir(exist_ok=True)
-        team.write_text(json.dumps({"merge_approval": "agents"}) + "\n")
+        team.write_text(json.dumps(TEAM) + "\n")
         with open(d / ".git" / "info" / "exclude", "a") as f:
             f.write("\n/.orchestration/team.json\n")
     return str(d), default, base
