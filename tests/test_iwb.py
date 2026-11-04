@@ -1893,6 +1893,20 @@ class Queue(unittest.TestCase):
         self.assertEqual(list(elsewhere.iterdir()), [])
         self.assertEqual(self.calls, [])
 
+    def test_sweeps_are_recognized_by_content_and_only_claimed_ones_are_deleted(self):
+        a = self.sweep(self.REPO, name="sweep-20261103T150000000Z-3fa9c1.json")
+        b = self.sweep(None, name="sweep-20261103T150001000Z-0b7d22.json")
+        late = []
+
+        def analyze(only=None, **kw):
+            if only is None and not late:                             # a new sweep arrives during the pass
+                late.append(self.sweep(self.REPO, name="sweep-20261103T150002000Z-9c4e10.json"))
+        iwb.cmd_analyze = analyze
+        self.assertEqual(self.drain()[0], 0)
+        self.assertEqual(self.passes, [("intake", None)])            # one pass for both, covering all repositories
+        self.assertFalse(a.exists() or b.exists())
+        self.assertEqual(self.left(), [late[0].name])                 # not claimed by this run: kept for the next
+
     def test_the_hourly_requeue_skips_a_symlinked_deferred_folder(self):
         elsewhere = Path(self.tmp.name, "elsewhere")
         elsewhere.mkdir()
@@ -2143,6 +2157,83 @@ class QueueRealSteps(Queue):
         self.code_drain()
         self.assertIn(("code", [f"{self.REPO}#3"]), self.calls)
 
+    def test_a_stale_plan_stays_uncoded_on_the_hourly_and_manual_paths(self):
+        # regression (Codex review of #12, P1): the code queue sent a stale plan back, but the hourly coding pass
+        # (with the analysis limit used elsewhere) or a manual `iwb code` still implemented the old plan
+        iwb.CONFIG.write_text(json.dumps({"coding_live": True, "coding_repos": [self.REPO]}))
+        self.save({5: self.approved(5)})
+        self.code_event(5)
+        self.comments[5] = [{"user": OWNER, "body": "Wait, the API changed.", "at": "2026-11-03T14:00:00Z"}]
+        self.assertEqual(self.code_drain()[0], 0)
+        entry = json.loads(iwb.STATE.read_text())[self.KEY]
+        self.assertEqual(entry["stale_plan"]["reason"], "reply after plan")
+        coded = []
+        saved = iwb.code_plan
+        self.addCleanup(lambda: setattr(iwb, "code_plan", saved))
+        iwb.code_plan = lambda key, *a, **kw: coded.append(key)
+        iwb.cmd_code = Queue.real_code
+        self.backstop()                                               # analysis did nothing (the fake), then coding
+        with redirect_stdout(io.StringIO()):
+            iwb.main(["code"])                                        # a manual run
+        self.assertEqual(coded, [])
+        self.assertIn("stale_plan", json.loads(iwb.STATE.read_text())[self.KEY])
+
+    def test_approval_refuses_a_stale_plan(self):
+        iwb.cmd_approve = Queue.real_approve
+        iwb.CONFIG.write_text(json.dumps({"approval_live": True}))
+        plan = Path(self.tmp.name, "plan.json")
+        plan.write_text(json.dumps({"units": [unit()]}))
+        self.state({"agent": "claude", "analysis": {"decision": "plan", "at": 1}, "plan_file": str(plan),
+                    "stale_plan": {"at": 2, "reason": "issue edited"}})
+        iwb.clone = lambda repo, bot: self.fail_test("approval must not start on a stale plan")
+        self.event(5)
+        self.assertEqual(self.drain()[0], 0)
+        self.assertNotIn("approval_failed_at", json.loads(iwb.STATE.read_text())[self.KEY])
+
+    def test_a_new_analysis_clears_the_stale_marker(self):
+        iwb.cmd_analyze = Queue.real_analyze
+        saved = iwb.post
+        self.addCleanup(lambda: setattr(iwb, "post", saved))
+        iwb.post = lambda *a, **kw: "https://x/c"
+        iwb.run_model = lambda *a, **kw: answer({"decision": "no_change", "summary": "already done"})
+        self.save({5: self.approved(5, stale_plan={"at": 2, "reason": "issue edited"})})
+        self.event(5)
+        code, out = self.drain()
+        self.assertEqual(code, 0)
+        self.assertIn("(plan out of date)", out)
+        entry = json.loads(iwb.STATE.read_text())[self.KEY]
+        self.assertNotIn("stale_plan", entry)
+        self.assertEqual(entry["analysis"]["decision"], "no_change")
+
+    def test_a_missing_or_malformed_plan_file_fails_only_that_issue(self):
+        # regression (Codex review of #12, P2): a deleted plan file crashed the code queue before it could settle,
+        # so launchd restarted it on the same hand-off forever
+        iwb.CONFIG.write_text(json.dumps({"coding_live": True, "approval_live": True}))
+        gone, bad = self.approved(5), self.approved(6)
+        Path(gone["plan_file"]).unlink()
+        Path(bad["plan_file"]).write_text("{not json")
+        self.save({5: gone, 6: bad, 7: self.approved(7)})
+        for n in (5, 6, 7):
+            self.code_event(n)
+        code, _ = self.code_drain()
+        self.assertEqual((code, self.left(self.cq), self.attempts(self.cdeferred)), (1, [], [1, 1]))
+        self.assertEqual([c for c in self.calls if c[0] == "code"], [("code", [f"{self.REPO}#7"])])
+        for n in (5, 6):                                              # the issue queue's hand-off and approval too
+            self.event(n)
+        iwb.cmd_approve = Queue.real_approve
+        code, _ = self.drain()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.attempts(self.deferred), [1, 1])
+        iwb.cmd_code = Queue.real_code
+        self.save({5: gone, 6: bad})                                  # only the broken ones: no GitHub calls
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(iwb.main(["code"]), 0)                  # a manual run doesn't crash either
+        self.assertEqual(out.getvalue().count("could not read the plan file"), 2)
+
+    def fail_test(self, msg):
+        raise AssertionError(msg)
+
     def test_a_coding_failure_is_deferred_in_the_code_queue_and_requeued(self):
         iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
         def code(only=None, **kw):
@@ -2220,6 +2311,23 @@ class CorruptState(unittest.TestCase):
             iwb.save_state(state, since)
         self.assertEqual(json.loads(iwb.STATE.read_text()), {"a#1": {"x": 1}})
         self.assertEqual(len(self.aside()), 1)
+
+    def test_a_file_fixed_before_the_lock_is_not_moved_aside(self):
+        # regression (Codex review of #12, P2): a pass that read a corrupt file could move aside a good one that
+        # another pass wrote under the lock in the meantime
+        import threading
+        iwb.STATE.write_text("{torn")
+        result = []
+        with iwb.state_lock():
+            t = threading.Thread(target=lambda: result.append(iwb.load_state()[0]))
+            with redirect_stdout(io.StringIO()):
+                t.start()
+                time.sleep(0.3)
+                self.assertTrue(t.is_alive())                         # waiting for the lock before deciding
+                iwb.STATE.write_text(json.dumps({"a#1": {"x": 1}}))   # the other pass's good write
+        t.join(5)
+        self.assertEqual(result, [{"a#1": {"x": 1}}])
+        self.assertEqual(self.aside(), [])
 
     def test_write_atomic_leaves_no_temporary_file(self):
         target = iwb.STATE.parent / "plans" / "x.json"

@@ -10,9 +10,10 @@
       per-pass limit, which the next run (a minute later) takes first: a handled issue's files are deleted; one
       that failed or waits has its files moved to DIR-deferred (the next plain tick moves them back; 24 counted
       attempts send them to DIR-rejected); other files, symlinks and events that can never be handled go to
-      DIR-rejected, folders and symlinks as whole entries (a link is never followed). A sweep event (sweep.json,
-      kind "sweep") runs the full intake, analysis and approval pass for its repository, or for all of them when
-      its repo is null, after the queued issues; it is deleted once the pass ran and deferred if it failed. DIR must
+      DIR-rejected, folders and symlinks as whole entries (a link is never followed). Sweep events (any file with
+      kind "sweep") together run one full intake, analysis and approval pass for their repositories, or for all
+      of them when one has repo null, after the queued issues; the files claimed are deleted once the pass ran, deferred if it
+      failed, and a sweep that arrives during the pass waits for the next run. DIR must
       be the default folder or sit in a folder holding a .github-events-queue file, and DIR-deferred and
       DIR-rejected must be absent or real folders, else exit 2. Exits 1 if an issue failed. Both forms of tick
       skip with a log line while the other one holds the lock. Plain tick reads the queue folder from
@@ -21,7 +22,8 @@
       Step 4b for the issues handed off in DIR (default ~/.local/state/github-events/iwb-code), with the same
       deferred and rejected folders. A coding lock held by another pass defers the event without counting it.
       Before coding, the issue and its trusted comments are read again; if the issue changed since the approved
-      plan was analyzed, an event goes back to the issue queue and nothing is coded.
+      plan was analyzed, the state entry is marked stale_plan (no approval or coding anywhere until a new
+      analysis), an event goes back to the issue queue, and nothing is coded.
   iwb code [--dry-run]
       Step 4b: for one plan that step 4a approved, in a repository listed in config.json "coding_repos": an
       orchestrator run in iwb's own clone, one commit by the worker bot on bot/<n>-<slug>-<attempt>, and a draft PR marked
@@ -88,18 +90,49 @@ def mark(key, outcome, msg=None):
         log(f"{key}: {msg}")
 
 
-def read_state_file():
-    """The state file's contents. A file that isn't a JSON object is moved aside to state.json.corrupt-<UTC time>
-    and the pass starts empty; the picked-up marker comments keep intake from picking issues up twice."""
+def parse_state_file():
+    """(contents, None), or (None, why it is unusable)."""
     if not STATE.exists():
-        return {}
+        return {}, None
     try:
         data = json.loads(STATE.read_text())
-        if isinstance(data, dict):
-            return data
-        why = f"not a JSON object ({type(data).__name__})"
     except ValueError as e:
-        why = f"not valid JSON ({e})"
+        return None, f"not valid JSON ({e})"
+    if not isinstance(data, dict):
+        return None, f"not a JSON object ({type(data).__name__})"
+    return data, None
+
+
+class state_lock:
+    """Hold state.lock: every pass takes it from reading the state file to replacing it."""
+    def __enter__(self):
+        import fcntl
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(state_lock_path(), "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        self.f.close()
+
+
+def read_state_file(locked=False):
+    """The state file's contents. A file that isn't a JSON object is moved aside to state.json.corrupt-<UTC time>
+    and the pass starts empty, but only after reading it again while holding state.lock: another pass may have just
+    replaced it with a good one. Pass locked=True when the caller already holds the lock. The picked-up marker
+    comments keep intake from picking issues up twice after a reset."""
+    data, why = parse_state_file()
+    if why is None:
+        return data
+    if locked:
+        return quarantine_state(why)
+    with state_lock():
+        data, why = parse_state_file()
+        return data if why is None else quarantine_state(why)
+
+
+def quarantine_state(why):
+    """Move the unusable state file aside. Call only while holding state.lock."""
     base = f"{STATE.name}.corrupt-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
     dest, n = STATE.parent / base, 1
     while dest.exists():
@@ -107,7 +140,7 @@ def read_state_file():
     try:
         os.replace(STATE, dest)
     except FileNotFoundError:
-        pass                                  # another pass moved it first
+        pass
     log(f"state: {STATE} was {why}; moved to {dest}, starting empty")
     return {}
 
@@ -158,11 +191,8 @@ def save_state(state, since):
     """Write what this pass changed since `since` onto the file as it is now, atomically, under a lock every pass
     takes from read to rename. A pass can run for hours; saving its whole stale copy would undo what another pass
     wrote meanwhile."""
-    import fcntl
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    with open(state_lock_path(), "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        disk = merge_changes(read_state_file(), since, state)
+    with state_lock():
+        disk = merge_changes(read_state_file(locked=True), since, state)
         fd, tmp = tempfile.mkstemp(dir=STATE.parent, prefix=".state.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
@@ -549,6 +579,8 @@ def needs_analysis(entry, comments, trusted, digest, edited_at=None):
     a = entry.get("analysis")
     if a is None:
         return entry.pop("reason", "new")
+    if entry.get("stale_plan"):
+        return "plan out of date"         # the code queue found a newer comment or edit; only a new analysis clears it
     if a.get("digest") and a["digest"] != digest:
         return "issue edited"
     if not a.get("digest"):
@@ -726,6 +758,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo=None):
             plan_file = PLANS_DIR / f"{repo.replace('/', '__')}__{number}.json"
             write_atomic(plan_file, json.dumps({"units": answer["units"]}, indent=1) + "\n")
             entry["plan_file"] = str(plan_file)
+        entry.pop("stale_plan", None)        # a fresh analysis replaces the out-of-date plan
         entry["analysis"] = {"decision": answer["decision"], "at": time.time(), "model": model, "comment": url,
                              "digest": digest}
         tell_openclaw(repo, number, issue["title"], slug, model, answer, url)
@@ -1050,11 +1083,17 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo=None):
             continue
         if a.get("decision") != "plan" or entry.get("blocked") or entry.get("closed") or not entry.get("plan_file"):
             continue
+        if entry.get("stale_plan"):
+            continue                                   # out of date: no approval until a new analysis
         if time.time() - entry.get("approval_failed_at", 0) < RETRY_AFTER:
             mark(key, "waiting")
             continue                                   # a model failure (limit, outage) retries after an hour
-        units = json.loads(Path(entry["plan_file"]).read_text())["units"]
-        digest = plan_digest(units)
+        try:
+            units = json.loads(Path(entry["plan_file"]).read_text())["units"]
+            digest = plan_digest(units)
+        except PLAN_ERRORS as e:
+            mark(key, "failed", f"could not read the plan file {entry['plan_file']}: {e!r}")
+            continue
         done = entry.get("approval") or {}
         if done.get("plan_digest") == digest or done.get("source_digest") == digest:
             continue                                   # this exact plan was already judged
@@ -1693,10 +1732,14 @@ def work_lock(name="work.lock"):
     return f
 
 
+PLAN_ERRORS = (OSError, ValueError, KeyError, TypeError)   # a plan file that is missing, unreadable or malformed
+
+
 def approved_plan(entry):
-    """(approval record, units) when main's step 4a approved the plan file as it is now, else (None, None)."""
+    """(approval record, units) when main's step 4a approved the plan file as it is now, else (None, None). Raises
+    one of PLAN_ERRORS when an approved plan's file is missing or malformed: that needs attention, not silence."""
     ap = entry.get("approval") or {}
-    if ap.get("verdict") != "approve" or not entry.get("plan_file") or not Path(entry["plan_file"]).exists():
+    if ap.get("verdict") != "approve" or not entry.get("plan_file"):
         return None, None
     units = json.loads(Path(entry["plan_file"]).read_text())["units"]
     return (ap, units) if ap.get("plan_digest") == plan_digest(units) else (None, None)
@@ -1704,8 +1747,9 @@ def approved_plan(entry):
 
 def needs_coding(entry):
     """Whether step 4b has anything to do for this state entry: a plan step 4a approved as it is now, not yet turned
-    into a PR or blocked. cmd_code decides the rest; this keeps other issues out of coding waits and hand-offs."""
-    if not isinstance(entry, dict) or entry.get("blocked") or entry.get("closed") \
+    into a PR or blocked. cmd_code decides the rest; this keeps other issues out of coding waits and hand-offs.
+    Raises one of PLAN_ERRORS when the plan file can't be read; callers treat that as a failure of that issue."""
+    if not isinstance(entry, dict) or entry.get("blocked") or entry.get("closed") or entry.get("stale_plan") \
             or (entry.get("analysis") or {}).get("decision") != "plan":
         return False
     ap, _ = approved_plan(entry)
@@ -1728,8 +1772,11 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
         if only:                          # only issues that have coding to do wait for the lock
             state = read_state_file()
             for key in only:
-                if needs_coding(state.get(key)):
-                    mark(key, "waiting")
+                try:
+                    if needs_coding(state.get(key)):
+                        mark(key, "waiting")
+                except PLAN_ERRORS as e:
+                    mark(key, "failed", f"could not read the plan file: {e!r}")
         return 0
     state, since = load_state()
     coding = set(conf.get("coding_repos", []))
@@ -1740,7 +1787,14 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
                 continue
             if entry.get("blocked") or entry.get("closed") or (entry.get("analysis") or {}).get("decision") != "plan":
                 continue
-            ap, units = approved_plan(entry)
+            if entry.get("stale_plan"):
+                log(f"{key}: the approved plan is out of date; not coding until a new analysis")
+                continue
+            try:
+                ap, units = approved_plan(entry)
+            except PLAN_ERRORS as e:
+                mark(key, "failed", f"could not read the plan file {entry.get('plan_file')}: {e!r}")
+                continue
             if not ap:
                 continue
             w = entry.get("work") or {}
@@ -2088,7 +2142,13 @@ def hand_off_ready(q, keys, handed):
     code queue. `keys` maps a state key to the (file name, event) to send."""
     state = read_state_file()
     for key, (name, ev) in keys.items():
-        if key in OUTCOME or key in handed or not needs_coding(state.get(key)):
+        if key in OUTCOME or key in handed:
+            continue
+        try:
+            if not needs_coding(state.get(key)):
+                continue
+        except PLAN_ERRORS as e:
+            mark(key, "failed", f"could not read the plan file: {e!r}")
             continue
         try:
             target = hand_off_to_coding(sibling(q, "code"), name, ev)
@@ -2212,6 +2272,17 @@ def intake_queue_for(code_q):
     return code_q.parent / code_q.name[:-len("-code")] if code_q.name.endswith("-code") else QUEUE_DIR
 
 
+def mark_plan_stale(key, why):
+    """Record on the issue's state entry, under state.lock, that its approved plan is out of date. Approval and
+    coding refuse such an entry on every path, and analysis treats it as needing a new analysis, which clears it."""
+    state, since = load_state()
+    entry = state.get(key)
+    if not isinstance(entry, dict):
+        return
+    entry["stale_plan"] = {"at": time.time(), "reason": why}
+    save_state(state, since)
+
+
 def plan_is_stale(key, entry):
     """Why an approved plan must not be coded now, or None. Reads the issue and its comments again: an edit to the
     title or body, or a trusted comment after the analysis, means it needs analysis first (needs_analysis)."""
@@ -2257,13 +2328,23 @@ def cmd_code_drain(queue_dir):
         return 0
     state = read_state_file()
     for key in groups:
-        if needs_coding(state.get(key)):
+        try:
+            ready = needs_coding(state.get(key))
+        except PLAN_ERRORS as e:
+            mark(key, "failed", f"could not read the plan file: {e!r}")
+            continue
+        if ready:
             try:
                 why = plan_is_stale(key, state[key])
             except (Exception, SystemExit) as e:
                 mark(key, "deferred", f"could not read the issue again before coding: {e!r}")
                 continue
             if why:
+                try:                      # first record it, so no path codes or approves the old plan any more
+                    mark_plan_stale(key, why)
+                except (Exception, SystemExit) as e:
+                    mark(key, "failed", f"plan is out of date ({why}) but could not record that: {e!r}")
+                    continue
                 try:
                     intake_q = intake_queue_for(q)
                     problem = queue_dir_problem(intake_q, QUEUE_DEFAULT)
