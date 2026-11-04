@@ -1478,9 +1478,9 @@ class Queue(unittest.TestCase):
             if (step, key) in self.failing:
                 raise self.failing[step, key]
             if (step, key) in self.wait:
-                iwb.later(key, "could not read the issue; will retry")
+                iwb.mark(key, "deferred", "could not read the issue; will retry")
             if (step, key) in self.hold:
-                iwb.held(key, "waits for the next pass (limit 1)")
+                iwb.mark(key, "held", "waits for the next pass (limit 1)")
         return 0
 
     def event(self, number, event="opened", repo=None, kind="issue", raw=None, name=None):
@@ -1577,13 +1577,13 @@ class Queue(unittest.TestCase):
         self.assertEqual((code, self.left(), self.left(self.deferred)), (0, [held.name], []))
         self.assertEqual(held.read_text(), before)                     # no attempts field added
         self.assertNotIn("attempts", json.loads(held.read_text()))
-        self.assertIn(f"left in the queue for the next run: {self.REPO}#5", out)
+        self.assertIn(f"held: {self.REPO}#5", out)
 
     def test_a_burst_drains_one_analysis_per_run(self):
         def analyze(only=None, limit=None, **kw):
             (key,) = only
             if limit <= 0:
-                iwb.held(key, "analysis waits for the next pass (limit 1)")
+                iwb.mark(key, "held", "analysis waits for the next pass (limit 1)")
             else:
                 iwb.SPENT["analyze"] += 1
                 analyzed.append(key)
@@ -1602,16 +1602,16 @@ class Queue(unittest.TestCase):
         self.hold.add(("intake", f"{self.REPO}#5"))                   # can't happen with a fresh budget; guarded
         code, out = self.drain()
         self.assertEqual((code, self.left()), (0, []))
-        self.assertEqual(self.attempts(self.deferred), [1])
+        self.assertEqual(self.attempts(self.deferred), [None])        # capacity, not a failed attempt
         self.assertIn("every issue was held by a limit", out)
 
-    def test_a_retry_delay_wait_is_deferred(self):
+    def test_a_retry_delay_wait_is_deferred_without_counting(self):
         iwb.cmd_analyze = Queue.real_analyze
         iwb.STATE.write_text(json.dumps({f"{self.REPO}#5": {"agent": "claude", "analysis_failed_at": time.time()}}))
         self.event(5)
         code, _ = self.drain()
         self.assertEqual((code, self.left()), (0, []))
-        self.assertEqual(self.attempts(self.deferred), [1])
+        self.assertEqual(self.attempts(self.deferred), [None])
 
     def test_rejected_after_too_many_attempts(self):
         f = self.event(5)
@@ -1776,3 +1776,136 @@ class Queue(unittest.TestCase):
 
 Queue.real_intake = staticmethod(iwb.cmd_intake)
 Queue.real_analyze = staticmethod(iwb.cmd_analyze)
+Queue.real_approve = staticmethod(iwb.cmd_approve)
+Queue.real_code = staticmethod(iwb.cmd_code)
+
+
+class QueueRealSteps(Queue):
+    """The queue against the real step handlers, with GitHub, clones and models faked: a failure the handler catches
+    itself must still count as a failure, and capacity waits must never count as attempts."""
+    KEY = "kennylhilljr/demo#5"
+
+    def setUp(self):
+        super().setUp()
+        p = iwb.prbot
+        saved = {k: getattr(p, k) for k in ("gh_read", "bot_config")}
+        saved_iwb = {k: getattr(iwb, k) for k in ("clone", "run_model")}
+        self.addCleanup(lambda: [setattr(p, k, v) for k, v in saved.items()]
+                        + [setattr(iwb, k, v) for k, v in saved_iwb.items()])
+        p.gh_read = self.gh
+        p.bot_config = lambda bot: {"slug": f"{bot}-gh"}
+        iwb.clone = self.clone
+        iwb.run_model = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("usage limit reached"))
+
+    def gh(self, args):
+        if args[1].endswith("/comments?per_page=100"):
+            return ""
+        return json.dumps({"title": "t", "body": "b", "state": "open", "user": OWNER, "labels": [], "url": "u"})
+
+    def clone(self, repo, bot):
+        d = Path(tempfile.mkdtemp(dir=self.tmp.name))
+        return str(d), "main", "abcdef1234"
+
+    def state(self, entry):
+        iwb.STATE.write_text(json.dumps({self.KEY: entry}))
+
+    def test_a_model_failure_caught_by_analysis_fails_the_event(self):
+        iwb.cmd_analyze = Queue.real_analyze
+        self.state({"agent": "claude"})
+        self.event(5)
+        code, out = self.drain()
+        self.assertEqual((code, self.left()), (1, []))
+        self.assertEqual(self.attempts(self.deferred), [1])
+        self.assertIn("analysis_failed_at", json.loads(iwb.STATE.read_text())[self.KEY])
+        self.assertIn(f"failed: {self.KEY}", out)
+
+    def test_an_approval_failure_caught_by_approval_fails_the_event(self):
+        iwb.cmd_approve = Queue.real_approve
+        iwb.CONFIG.write_text(json.dumps({"approval_live": True}))
+        plan = Path(self.tmp.name, "plan.json")
+        plan.write_text(json.dumps({"units": [unit()]}))
+        self.state({"agent": "claude", "analysis": {"decision": "plan", "at": 1}, "plan_file": str(plan)})
+        iwb.clone = lambda repo, bot: (_ for _ in ()).throw(RuntimeError("clone failed"))
+        self.event(5)
+        code, _ = self.drain()
+        self.assertEqual((code, self.attempts(self.deferred)), (1, [1]))
+        self.assertIn("approval_failed_at", json.loads(iwb.STATE.read_text())[self.KEY])
+
+    def test_a_busy_coding_lock_defers_without_counting_across_hourly_passes(self):
+        iwb.cmd_code = Queue.real_code
+        iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
+        held = iwb.work_lock()                                        # another `iwb code` is running
+        self.addCleanup(held.close)
+        self.event(5)
+        for _ in range(3):
+            code, out = self.drain()
+            self.assertEqual((code, self.left()), (0, []))
+            self.assertEqual(self.attempts(self.deferred), [None])
+            self.assertIn(f"waiting: {self.KEY}", out)
+            self.backstop()                                           # the hourly tick puts it back
+            self.assertEqual(len(self.left()), 1)
+        held.close()
+        self.assertEqual(self.drain()[0], 0)                          # lock free: handled and deleted
+        self.assertEqual((self.left(), self.left(self.deferred)), ([], []))
+
+    def test_limit_held_events_never_count_attempts(self):
+        # regression (Codex review of #12, P1): a backlog beyond the per-pass limits was deferred with an attempt
+        # each hour and rejected after 24 hours without ever being analyzed
+        def analyze(only=None, limit=None, **kw):
+            (key,) = only
+            if limit <= 0:
+                iwb.mark(key, "held", "analysis waits for the next pass (limit 1)")
+            else:
+                iwb.SPENT["analyze"] += 1
+        iwb.cmd_analyze = analyze
+        for n in range(1, 6):
+            self.event(n)
+        while self.left():
+            self.assertEqual(self.drain()[0], 0)
+            for f in self.q.iterdir():
+                self.assertNotIn("attempts", json.loads(f.read_text()))
+        self.assertEqual((self.left(self.deferred), self.left(self.rejected)), ([], []))
+
+
+for _name in [n for n in vars(Queue) if n.startswith("test_")]:
+    setattr(QueueRealSteps, _name, None)      # reuse Queue's fixtures without running its tests twice
+
+
+class CorruptState(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        saved = iwb.STATE
+        self.addCleanup(lambda: setattr(iwb, "STATE", saved))
+        iwb.STATE = Path(tmp.name, "state.json")
+
+    def aside(self):
+        return [f.name for f in iwb.STATE.parent.iterdir() if f.name.startswith("state.json.corrupt-")]
+
+    def test_malformed_or_non_object_state_is_moved_aside_and_the_pass_starts_empty(self):
+        for bad in ("{not json", "[1, 2]", ""):
+            iwb.STATE.write_text(bad)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                state, since = iwb.load_state()
+            self.assertEqual((state, since), ({}, {}))
+            self.assertFalse(iwb.STATE.exists())
+            self.assertIn("starting empty", out.getvalue())
+        self.assertEqual(len(self.aside()), 3)                         # same second: each gets its own name
+        self.assertRegex(self.aside()[0], r"^state\.json\.corrupt-\d{8}T\d{6}Z")
+
+    def test_save_onto_a_corrupt_file_moves_it_aside_first(self):
+        state, since = iwb.load_state()
+        state["a#1"] = {"x": 1}
+        iwb.STATE.write_text("{torn")                                 # corrupted while the pass ran
+        with redirect_stdout(io.StringIO()):
+            iwb.save_state(state, since)
+        self.assertEqual(json.loads(iwb.STATE.read_text()), {"a#1": {"x": 1}})
+        self.assertEqual(len(self.aside()), 1)
+
+    def test_write_atomic_leaves_no_temporary_file(self):
+        target = iwb.STATE.parent / "plans" / "x.json"
+        iwb.write_atomic(target, "{}\n")
+        iwb.write_atomic(target, '{"units": []}\n')
+        self.assertEqual(target.read_text(), '{"units": []}\n')
+        self.assertEqual([f.name for f in target.parent.iterdir()], ["x.json"])

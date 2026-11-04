@@ -59,28 +59,66 @@ def log(msg):
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
 
 
-# What this process left for a later pass, and the runs each step spent. PENDING: issues it could not read or post
-# to, or that wait out a delay; `tick --from-queue` moves their queue files to the deferred folder. HELD: issues
-# that only hit a per-pass limit; their queue files stay where they are for the next run. SPENT shares the limits
-# across the issues of one queue run.
-PENDING = set()
-HELD = set()
+# Per-issue outcome of the steps this process ran, for `tick --from-queue`; an issue with no entry was handled.
+#   held     only a per-pass limit stopped it: its queue files stay for the next run
+#   waiting  capacity or a delay (coding lock busy, other issues being coded, the hour after a model failure): its
+#            files go to the deferred folder without counting an attempt
+#   deferred a GitHub read failed: deferred, counting an attempt
+#   failed   the step itself failed (model, post, push): deferred, counting an attempt, and the run exits 1
+# The worst outcome a step reports for an issue wins. SPENT shares the per-pass limits across one queue run.
+OUTCOME = {}
+OUTCOME_RANK = {"held": 1, "waiting": 2, "deferred": 3, "failed": 4}
 SPENT = {"intake": 0, "analyze": 0, "approve": 0, "code": 0}
 
 
-def later(key, msg):
-    PENDING.add(key)
-    log(f"{key}: {msg}")
+def mark(key, outcome, msg=None):
+    if OUTCOME_RANK[outcome] > OUTCOME_RANK.get(OUTCOME.get(key), 0):
+        OUTCOME[key] = outcome
+    if msg:
+        log(f"{key}: {msg}")
 
 
-def held(key, msg):
-    HELD.add(key)
-    log(f"{key}: {msg}")
+def read_state_file():
+    """The state file's contents. A file that isn't a JSON object is moved aside to state.json.corrupt-<UTC time>
+    and the pass starts empty; the picked-up marker comments keep intake from picking issues up twice."""
+    if not STATE.exists():
+        return {}
+    try:
+        data = json.loads(STATE.read_text())
+        if isinstance(data, dict):
+            return data
+        why = f"not a JSON object ({type(data).__name__})"
+    except ValueError as e:
+        why = f"not valid JSON ({e})"
+    base = f"{STATE.name}.corrupt-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+    dest, n = STATE.parent / base, 1
+    while dest.exists():
+        dest, n = STATE.parent / f"{base}.{n}", n + 1
+    try:
+        os.replace(STATE, dest)
+    except FileNotFoundError:
+        pass                                  # another pass moved it first
+    log(f"state: {STATE} was {why}; moved to {dest}, starting empty")
+    return {}
+
+
+def write_atomic(path, text):
+    """Write a file through a temporary file in the same folder and a rename, so a reader never sees half of it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def load_state():
     """(state, snapshot): the state to change, and a deep copy as loaded for save_state to diff against."""
-    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    state = read_state_file()
     return state, copy.deepcopy(state)
 
 
@@ -114,7 +152,7 @@ def save_state(state, since):
     STATE.parent.mkdir(parents=True, exist_ok=True)
     with open(state_lock_path(), "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        disk = merge_changes(json.loads(STATE.read_text()) if STATE.exists() else {}, since, state)
+        disk = merge_changes(read_state_file(), since, state)
         fd, tmp = tempfile.mkstemp(dir=STATE.parent, prefix=".state.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
@@ -239,7 +277,9 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None):
             issues = open_issues(repo) if only is None else queued_issues(repo, only)
         except SystemExit:
             log(f"{repo}: could not list issues; skipping this pass")
-            PENDING.update(k for k in (only or ()) if k.rsplit("#", 1)[0] == repo)
+            for k in (only or ()):
+                if k.rsplit("#", 1)[0] == repo:
+                    mark(k, "deferred")
             continue
         for issue in issues:
             key = f"{repo}#{issue['number']}"
@@ -257,14 +297,14 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None):
                     state[key] = {"picked_up_at": time.time(), "note": "found an earlier pick-up comment"}
                     continue
             except SystemExit:
-                later(key, "could not read the issue; will retry")
+                mark(key, "deferred", "could not read the issue; will retry")
                 continue
             agent = choose_agent(issue, state)
             if WORKERS[agent] not in bots or repo not in installed[WORKERS[agent]]:
                 log(f"{key}: qualifies ({reason}), but {WORKERS[agent]}-gh is not registered or installed here")
                 continue
             if picked >= limit:
-                held(key, f"qualifies ({reason}); waits for the next pass (limit {limit})")
+                mark(key, "held", f"qualifies ({reason}); waits for the next pass (limit {limit})")
                 continue
             picked += 1
             SPENT["intake"] += 1
@@ -275,7 +315,7 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None):
             try:
                 url = pick_up(repo, issue, agent, reason)
             except RuntimeError as e:
-                later(key, f"pick-up failed, will retry: {e}")
+                mark(key, "failed", f"pick-up failed, will retry: {e}")
                 continue
             state[key] = {"agent": agent, "picked_up_at": time.time(), "comment": url}
             state["_last_agent"] = agent
@@ -554,13 +594,13 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None):
         if "agent" not in entry or paused or only is not None and key not in only:
             continue
         if time.time() - entry.get("analysis_failed_at", 0) < RETRY_AFTER:
-            PENDING.add(key)                  # waiting out a model failure; a queued event retries later
+            mark(key, "waiting")              # the hour after a model failure; a queued event retries later
             continue
         repo, number = key.rsplit("#", 1)
         try:
             issue, comments, text = issue_text(repo, number, trusted, bot_logins, approver_logins)
         except SystemExit:
-            later(key, "could not read the issue; will retry")
+            mark(key, "deferred", "could not read the issue; will retry")
             continue
         if issue["state"] != "open":
             entry["closed"] = True
@@ -604,7 +644,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None):
                         run_gh_as(bot, repo, ["issue", "edit", str(number), "-R", repo, "--add-label", "bot:stop"])
                     url = run_gh_as(bot, repo, ["issue", "comment", str(number), "-R", repo, "--body", body])
                 except RuntimeError as e:
-                    later(key, f"could not answer '{cmd}', will retry: {e}")
+                    mark(key, "failed", f"could not answer '{cmd}', will retry: {e}")
                     continue
                 entry["handled_at"] = iso_epoch(new[-1]["at"])
                 log(f"{key}: answered '{cmd}' {url}")
@@ -614,13 +654,13 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None):
             try:
                 edited_at = last_edited(repo, number)
             except (SystemExit, ValueError, IndexError, KeyError):
-                later(key, "could not read when the issue was edited; will retry")
+                mark(key, "deferred", "could not read when the issue was edited; will retry")
                 continue
         why = needs_analysis(entry, comments, trusted, digest, edited_at)
         if not why:
             continue
         if runs >= limit:
-            held(key, f"analysis ({why}) waits for the next pass (limit {limit})")
+            mark(key, "held", f"analysis ({why}) waits for the next pass (limit {limit})")
             continue
         runs += 1
         SPENT["analyze"] += 1
@@ -635,7 +675,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None):
             answer = parse_answer(run_model(agent, prompt, text, f"{work}/repo"))
         except (RuntimeError, subprocess.SubprocessError, SystemExit) as e:
             entry["analysis_failed_at"] = time.time()
-            log(f"{key}: analysis could not run; retrying in {RETRY_AFTER // 60} minutes: {e}")
+            mark(key, "failed", f"analysis could not run; retrying in {RETRY_AFTER // 60} minutes: {e}")
             continue
         except ValueError as e:
             entry["attempts"] = entry.get("attempts", 0) + 1
@@ -648,6 +688,8 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None):
                 entry["blocked"] = True
                 prbot.openclaw_attention(f"blocked: {repo}#{number}",
                                          {"url": url, "title": issue["title"], "worker": slug, "problem": str(e)})
+            else:
+                mark(key, "deferred")         # the next pass asks the model again
             continue
         finally:
             if work:
@@ -668,7 +710,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None):
         if answer["decision"] == "plan":
             PLANS_DIR.mkdir(parents=True, exist_ok=True)
             plan_file = PLANS_DIR / f"{repo.replace('/', '__')}__{number}.json"
-            plan_file.write_text(json.dumps({"units": answer["units"]}, indent=1) + "\n")
+            write_atomic(plan_file, json.dumps({"units": answer["units"]}, indent=1) + "\n")
             entry["plan_file"] = str(plan_file)
         entry["analysis"] = {"decision": answer["decision"], "at": time.time(), "model": model, "comment": url,
                              "digest": digest}
@@ -995,7 +1037,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None):
         if a.get("decision") != "plan" or entry.get("blocked") or entry.get("closed") or not entry.get("plan_file"):
             continue
         if time.time() - entry.get("approval_failed_at", 0) < RETRY_AFTER:
-            PENDING.add(key)
+            mark(key, "waiting")
             continue                                   # a model failure (limit, outage) retries after an hour
         units = json.loads(Path(entry["plan_file"]).read_text())["units"]
         digest = plan_digest(units)
@@ -1031,7 +1073,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None):
             if level == "full":
                 model = {**model, "effort": "high"}
             if runs >= limit:
-                held(key, f"approval waits for the next pass (limit {limit})")
+                mark(key, "held", f"approval waits for the next pass (limit {limit})")
                 continue
         work = None
         try:
@@ -1068,7 +1110,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None):
             v = parse_verdict(run_model(approver_agent, prompt, stdin, f"{work}/repo", model=model))
         except (RuntimeError, subprocess.SubprocessError, SystemExit, ValueError) as e:
             entry["approval_failed_at"] = time.time()
-            log(f"{key}: approval could not finish; will retry: {e}")
+            mark(key, "failed", f"approval could not finish; will retry: {e}")
             continue
         finally:
             if work:
@@ -1083,7 +1125,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None):
             continue
         if v["verdict"] == "approve":
             units = apply_verdict(units, v)
-            Path(entry["plan_file"]).write_text(json.dumps({"units": units}, indent=1) + "\n")
+            write_atomic(entry["plan_file"], json.dumps({"units": units}, indent=1) + "\n")
             url = post(reviewer, repo, number, body, "bot:approved")
             entry["approval"] = {"verdict": "approve", "level": level, "plan_digest": plan_digest(units), "source_digest": digest,
                                  "approver": f"{slug}", "model": model["model"], "at": time.time(), "comment": url}
@@ -1600,7 +1642,7 @@ def finish_pr(key, entry, issue, state, since):
             rec["ready"] = True
     except RuntimeError as e:
         entry["work_failed_at"] = time.time()
-        log(f"{key}: pull request for `{w['branch']}` not finished; retrying in {RETRY_AFTER // 60} minutes: {e}")
+        mark(key, "failed", f"pull request for `{w['branch']}` not finished; retrying in {RETRY_AFTER // 60} minutes: {e}")
         return
     for old in entry["branches"]:
         if old is not rec and old.get("pr") and not old.get("closed"):
@@ -1617,7 +1659,7 @@ def finish_pr(key, entry, issue, state, since):
                             f"{rec['pr']}", "bot:pr-open")
     except RuntimeError as e:       # still "pushed": the next try skips the steps above that are done
         entry["work_failed_at"] = time.time()
-        log(f"{key}: could not label the issue bot:pr-open; retrying in {RETRY_AFTER // 60} minutes: {e}")
+        mark(key, "failed", f"could not label the issue bot:pr-open; retrying in {RETRY_AFTER // 60} minutes: {e}")
         return
     w.update(status="pr-open", done_at=time.time())
 
@@ -1656,6 +1698,8 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
     lock = work_lock()
     if lock is None:
         log("another coding pass is running; skipping")
+        for key in only or ():
+            mark(key, "waiting")
         return 0
     state, since = load_state()
     coding = set(conf.get("coding_repos", []))
@@ -1680,7 +1724,7 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
                 step = "interrupted"
             elif time.time() - entry.get("work_failed_at", 0) < RETRY_AFTER:
                 step = None                 # the last try failed for a reason outside the plan (outage, setup)
-                PENDING.add(key)
+                mark(key, "waiting")
             elif current and w.get("status") == "pushed":
                 step = "pr"                 # pushed, but the PR wasn't finished: continue from the branch
             else:
@@ -1691,16 +1735,16 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
                 busy = sum(1 for e in state.values() if isinstance(e, dict) and not e.get("blocked")
                            and (e.get("work") or {}).get("status") == "in-progress")
                 if runs >= limit:
-                    held(key, f"coding waits for the next pass (limit {limit})")
+                    mark(key, "held", f"coding waits for the next pass (limit {limit})")
                     continue
                 if busy >= IN_PROGRESS_LIMIT:     # other issues are being coded; that can take hours
-                    later(key, f"coding waits until fewer than {IN_PROGRESS_LIMIT} issues are being coded")
+                    mark(key, "waiting", f"coding waits until fewer than {IN_PROGRESS_LIMIT} issues are being coded")
                     continue
             try:
                 issue = gh_json(["api", f"repos/{repo}/issues/{number}", "--jq",
                                  "{state, title, labels: [.labels[].name]}"])[0]
             except SystemExit:
-                later(key, "could not read the issue; will retry")
+                mark(key, "deferred", "could not read the issue; will retry")
                 continue
             if issue["state"] != "open" or "bot:stop" in issue["labels"]:
                 continue
@@ -1715,7 +1759,7 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
                                           f"waits here. It is coded once the repository is in `coding_repos`."])
                     entry["coding_note"] = ap["plan_digest"]
                 except RuntimeError as e:
-                    later(key, f"could not post the coding note, will retry: {e}")
+                    mark(key, "failed", f"could not post the coding note, will retry: {e}")
                 continue
             try:
                 if step == "interrupted":
@@ -1732,7 +1776,7 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
                 code_plan(key, entry, issue, state, since, ecc)
             except (RuntimeError, subprocess.SubprocessError, SystemExit, OSError) as e:
                 entry["work_failed_at"] = time.time()
-                log(f"{key}: {step} could not run; retrying in {RETRY_AFTER // 60} minutes: {e}")
+                mark(key, "failed", f"{step} could not run; retrying in {RETRY_AFTER // 60} minutes: {e}")
     finally:
         if not dry_run:
             save_state(state, since)
@@ -1797,12 +1841,15 @@ def move_out(f, dest, why):
     log(f"queue: {f.name}: {why}; moved to {target}")
 
 
-def defer(f, ev, deferred, rejected, why):
-    """Move an event file to the deferred folder with its "attempts" count raised by one, written atomically; after
-    QUEUE_MAX_ATTEMPTS it goes to the rejected folder instead."""
-    n = ev.get("attempts")
-    ev = {**ev, "attempts": (n if type(n) is int and n >= 0 else 0) + 1}
-    dest = rejected if ev["attempts"] >= QUEUE_MAX_ATTEMPTS else deferred
+def defer(f, ev, deferred, rejected, why, count=True):
+    """Move an event file to the deferred folder, written atomically. With `count` its "attempts" count goes up by
+    one, and at QUEUE_MAX_ATTEMPTS it goes to the rejected folder instead; capacity waits pass count=False."""
+    dest = deferred
+    if count:
+        n = ev.get("attempts")
+        ev = {**ev, "attempts": (n if type(n) is int and n >= 0 else 0) + 1}
+        if ev["attempts"] >= QUEUE_MAX_ATTEMPTS:
+            dest = rejected
     dest.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dest, prefix=".", suffix=".tmp")
     try:
@@ -1816,8 +1863,10 @@ def defer(f, ev, deferred, rejected, why):
     f.unlink(missing_ok=True)
     if dest == rejected:
         log(f"queue: {f.name}: {why}, attempt {ev['attempts']} of {QUEUE_MAX_ATTEMPTS}; gave up, moved to {target}")
-    else:
+    elif count:
         log(f"queue: {f.name}: {why}, attempt {ev['attempts']}; moved to {target} until the hourly tick")
+    else:
+        log(f"queue: {f.name}: {why}, not counted as an attempt; moved to {target} until the hourly tick")
 
 
 def requeue_deferred(queue):
@@ -1861,11 +1910,10 @@ def cmd_drain(queue_dir):
     if lock is None:      # the other job is running and holds the lock; launchd starts this one again shortly
         log(f"queue: another tick is running; {len(entries)} entr{'ies' if len(entries) != 1 else 'y'} wait")
         return 0
-    PENDING.clear()
-    HELD.clear()
+    OUTCOME.clear()
     SPENT.update(dict.fromkeys(SPENT, 0))   # a fresh budget, so the first issue of every run is never limit-held
     deferred, rejected = sibling(q, "deferred"), sibling(q, "rejected")
-    groups, failed, events = {}, set(), []
+    groups, events = {}, []
     try:
         for f in entries:
             if not is_event_file(f):
@@ -1904,41 +1952,35 @@ def cmd_drain(queue_dir):
                 if read_config().get("approval_live"):
                     cmd_approve(limit=APPROVE_LIMIT - SPENT["approve"], only={key})
             except (Exception, SystemExit) as e:
-                failed.add(key)
-                log(f"{key}: queued event failed: {e!r}")
+                mark(key, "failed", f"queued event failed: {e!r}")
     finally:
         lock.close()
     if read_config().get("coding_live"):
         for key in groups:
-            if key in failed:
+            if OUTCOME.get(key) == "failed":
                 continue
             try:
                 cmd_code(limit=CODE_LIMIT - SPENT["code"], only={key})
             except (Exception, SystemExit) as e:
-                failed.add(key)
-                log(f"{key}: queued event failed while coding: {e!r}")
-    if groups and set(groups) <= HELD - failed - PENDING:
+                mark(key, "failed", f"queued event failed while coding: {e!r}")
+    if groups and all(OUTCOME.get(k) == "held" for k in groups):
         # Can't happen with a fresh budget, but a run that only holds files back would leave the queue as it was
         # and launchd would start it again forever; defer instead.
         log("queue: every issue was held by a limit; deferring them")
-        PENDING.update(groups)
+        OUTCOME.update(dict.fromkeys(groups, "waiting"))
+    why = {"failed": "failed", "deferred": "will retry later", "waiting": "waits for capacity or a retry delay"}
     for key, fs in groups.items():
+        outcome = OUTCOME.get(key)
         for f, ev in fs:
-            if key in failed:
-                defer(f, ev, deferred, rejected, "failed")
-            elif key in PENDING:
-                defer(f, ev, deferred, rejected, "will retry later")
-            elif key in HELD:
-                pass                      # only a per-pass limit: stays in the queue for the next run, a minute on
-            else:
+            if outcome is None:
                 f.unlink(missing_ok=True)
-    later_keys = sorted(set(groups) & (failed | PENDING))
-    held_keys = sorted(set(groups) & HELD - failed - PENDING)
-    done = len(groups) - len(later_keys) - len(held_keys)
+            elif outcome != "held":       # held: only a per-pass limit, stays in the queue for the next run
+                defer(f, ev, deferred, rejected, why[outcome], count=outcome != "waiting")
+    by = {o: sorted(k for k in groups if OUTCOME.get(k) == o) for o in ("failed", "deferred", "waiting", "held")}
+    done = sum(1 for k in groups if k not in OUTCOME)
     log(f"queue pass done: {done} issue{'s' if done != 1 else ''} handled"
-        + (f"; deferred: {', '.join(later_keys)}" if later_keys else "")
-        + (f"; left in the queue for the next run: {', '.join(held_keys)}" if held_keys else ""))
-    return 1 if failed else 0
+        + "".join(f"; {o}: {', '.join(ks)}" for o, ks in by.items() if ks))
+    return 1 if by["failed"] else 0
 
 
 def main(argv):

@@ -12,7 +12,7 @@ OpenClaw's github-event-router writes one JSON file per GitHub issue event into 
 | Folder | Contents |
 | --- | --- |
 | `~/.local/state/github-events/iwb/` | Watched by the queue job. New events, and the untouched events of issues that only hit a per-pass limit. |
-| `~/.local/state/github-events/iwb-deferred/` | Events of issues that failed, hit a failed GitHub read or post, or are waiting out the hour after a model failure, with an `attempts` count. The hourly job moves them back into the queue after its scan. |
+| `~/.local/state/github-events/iwb-deferred/` | Events of issues whose step failed or whose GitHub read failed, with an `attempts` count, and events waiting for capacity or a delay (a busy coding lock, the hour after a model failure), which don't count an attempt. The hourly job moves them back into the queue after its scan. |
 | `~/.local/state/github-events/iwb-rejected/` | Events that can never be handled, entries that aren't regular `.json` files (such as `.DS_Store`), and events deferred 24 times. |
 
 Handled events are deleted. A failing issue is retried once an hour and rejected after about a day. A burst of events larger than the per-pass limits (one analysis per run) drains one run at a time: the issues a run couldn't reach stay in the queue, and launchd starts the next run after `ThrottleInterval`, about a minute later. Each run starts with a fresh budget, so it always gets through at least one issue. Nothing empties `iwb-rejected/`: check it now and then, and delete what you have read. If the queue job finds the hourly job holding `tick.lock`, it leaves the queue as it is and exits 0, and launchd starts it again a minute later. Both jobs log to `~/Library/Logs/issue-intake.log`.

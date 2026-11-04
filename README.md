@@ -111,7 +111,7 @@ Then install the launchd job, which runs `iwb tick` every 5 minutes:
 ./install-intake.sh
 ```
 
-Log: `~/Library/Logs/issue-intake.log`. State: `~/.config/issue-worker-bots/state.json`. Saved plans: `~/.config/issue-worker-bots/plans/`. To remove the job, run `./install-intake.sh --uninstall`.
+Log: `~/Library/Logs/issue-intake.log`. State: `~/.config/issue-worker-bots/state.json`. Saved plans: `~/.config/issue-worker-bots/plans/`. State and plans are written through a temporary file and a rename; a state file that isn't a JSON object is moved aside to `state.json.corrupt-<UTC time>` with a log line, and the pass starts empty. To remove the job, run `./install-intake.sh --uninstall`.
 
 ### Event-driven intake (proposed)
 
@@ -120,7 +120,7 @@ OpenClaw's github-event-router can drop one JSON file per GitHub issue event int
 | Folder | What goes there |
 | --- | --- |
 | `~/.local/state/github-events/iwb/` | New events from the router, and the untouched files of issues that only hit a per-pass limit (one analysis per run, for example). Those are taken first on the next run. |
-| `~/.local/state/github-events/iwb-deferred/` | Files of an issue whose handling failed (the run exits 1), or that hit a failed GitHub read or post or is waiting out the hour after a model failure (exit 0). Each move adds 1 to an `attempts` field in the file. The hourly `tick` moves them back into the queue after its scan. |
+| `~/.local/state/github-events/iwb-deferred/` | Files of an issue whose step failed, even when the step caught the error itself (a model, post or push failure; the run exits 1), or whose GitHub read failed (exit 0). Each such move adds 1 to an `attempts` field in the file. Issues waiting for capacity or a delay (another `iwb code` holding `work.lock`, two issues already being coded, the hour after a model failure) also go here, but without counting an attempt. The hourly `tick` moves them all back into the queue after its scan. |
 | `~/.local/state/github-events/iwb-rejected/` | Anything that can never be handled: bad JSON, no valid repo or issue number, a pull request, a repository the bots aren't installed on, any entry that isn't a regular `.json` file (`.DS_Store`, folders, symlinks), and files deferred 24 times. Nothing reads or clears this folder; look through it and empty it by hand now and then. |
 
 Handled issues' files are deleted. An empty or missing queue folder exits 0 without a log line. A burst of new issues larger than the per-pass limits drains one run at a time, about a minute apart: each run starts with a fresh budget, so its first issue always goes through, and the issues it couldn't reach stay in the queue for the next run. Plain `tick` reads the queue folder from `IWB_QUEUE_DIR`, with the path above as the default.
