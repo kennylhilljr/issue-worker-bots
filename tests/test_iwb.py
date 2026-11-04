@@ -647,7 +647,8 @@ class Code(unittest.TestCase):
         self.issue = {"state": "open", "title": "Add retries", "labels": ["bot:approved"], "body": "", "user": OWNER}
         self.comments = []                  # trusted comments, read again right before coding starts
         p.gh_read = lambda args: "\n".join(json.dumps(c) for c in self.comments) \
-            if args[1].endswith("/comments?per_page=100") else json.dumps(self.issue)
+            if args[1].endswith("/comments?per_page=100") else json.dumps({"at": None}) if args[1] == "graphql" \
+            else json.dumps(self.issue)
         p.load_config = lambda: {"claude-dev": {"owner": OWNER, "slug": "claude-dev-gh"},
                                  "codex-dev": {"owner": OWNER, "slug": "codex-dev-gh"}}
         p.bot_config = lambda bot: {"slug": {"claude": "claude-pr-gh", "codex": "codex-pr-gh"}.get(bot, bot + "-gh")}
@@ -1504,12 +1505,15 @@ class Queue(unittest.TestCase):
         self.wait = set()      # (step, key) that leave the issue for a later pass after an error
         self.hold = set()      # (step, key) held back only by a per-pass limit
         for step in ("intake", "analyze", "approve", "code"):
-            setattr(iwb, f"cmd_{step}", lambda *a, _s=step, only=None, **kw: self.fake_step(_s, only, kw.get("repo_filter")))
+            setattr(iwb, f"cmd_{step}", lambda *a, _s=step, only=None, **kw: self.fake_step(_s, only, kw.get("repo_filter"), kw.get("listed")))
         self.passes = []       # (step, repo) for repository-wide passes (only=None): plain tick and sweeps
         self.n = 0
 
-    def fake_step(self, step, only, repo=None):
+    def fake_step(self, step, only, repo=None, listed=None):
         self.calls.append((step, sorted(only) if only is not None else None))
+        if listed is not None:                                         # a repository-wide intake lists the repos
+            for r in ([repo] if repo else iwb.prbot.installed_repos("claude-dev")):
+                listed[r] = True
         if only is None:
             self.passes.append((step, repo))
             if (step, "pass") in self.failing:
@@ -2081,11 +2085,14 @@ class QueueRealSteps(Queue):
                         + [setattr(iwb, k, v) for k, v in saved_iwb.items()])
         p.gh_read = self.gh
         self.comments = {}
+        self.edited_at = None
         p.bot_config = lambda bot: {"slug": f"{bot}-gh"}
         iwb.clone = self.clone
         iwb.run_model = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("usage limit reached"))
 
     def gh(self, args):
+        if args[1] == "graphql":                                      # last_edited, for analyses without a digest
+            return json.dumps({"at": self.edited_at})
         if args[1].endswith("/comments?per_page=100"):
             n = int(args[1].split("/issues/")[1].split("/")[0])
             return "\n".join(json.dumps(c) for c in self.comments.get(n, []))
@@ -2160,16 +2167,24 @@ class QueueRealSteps(Queue):
             self.backstop()                                           # the hourly tick puts it back
             self.assertEqual(len(self.left(self.cq)), 1)
 
+    def real_coding(self):
+        """The real cmd_code, with the coding run itself (code_plan) faked; self.coded lists the issues it ran."""
+        iwb.CONFIG.write_text(json.dumps({"coding_live": True, "coding_repos": [self.REPO]}))
+        iwb.cmd_code = Queue.real_code
+        self.coded = []
+        saved = iwb.code_plan
+        self.addCleanup(lambda: setattr(iwb, "code_plan", saved))
+        iwb.code_plan = lambda key, *a, **kw: self.coded.append(key)
+
     def test_a_stale_plan_goes_back_to_the_issue_queue_instead_of_being_coded(self):
         # regression (Codex review of #12, P1): a comment that arrived after the hand-off was written did not stop
         # the code queue from implementing the older approved plan
-        iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
+        self.real_coding()
         self.save({5: self.approved(5)})
         handoff = self.code_event(5)
         self.comments[5] = [{"user": OWNER, "body": "Wait, the API changed.", "at": "2026-11-03T14:00:00Z"}]
         code, out = self.code_drain()
-        self.assertEqual(code, 0)
-        self.assertNotIn("code", [s for s, _ in self.calls])          # not coded
+        self.assertEqual((code, self.coded), (0, []))                 # not coded
         self.assertFalse(handoff.exists())
         (back,) = self.q.iterdir()
         ev = json.loads(back.read_text())
@@ -2179,25 +2194,75 @@ class QueueRealSteps(Queue):
         self.assertIn("out of date (reply after plan)", out)
 
     def test_a_current_plan_is_coded_and_an_edited_issue_is_not(self):
-        iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
+        self.real_coding()
         self.save({5: self.approved(5)})
         self.code_event(5)
         self.assertEqual(self.code_drain()[0], 0)
-        self.assertIn(("code", [self.KEY]), self.calls)
-        self.calls.clear()
+        self.assertEqual(self.coded, [self.KEY])
+        self.coded.clear()
         self.save({5: self.approved(5, analysis={"decision": "plan", "at": 1, "digest": "an-older-body"})})
         self.code_event(5)
         self.code_drain()
-        self.assertEqual(self.calls, [])
+        self.assertEqual(self.coded, [])
         self.assertEqual(len(self.left()), 1)
 
+    def test_a_legacy_analysis_notices_an_edit_before_coding(self):
+        # regression (Codex review of #12, P2): an analysis stored before digests existed missed an edit to the
+        # title or body, because the re-read did not ask when the body was last edited
+        self.real_coding()
+        legacy = self.approved(5)
+        legacy["analysis"].pop("digest")
+        self.save({5: legacy})
+        self.edited_at = "2026-11-03T14:00:00Z"                      # after the analysis (at 1)
+        self.code_event(5)
+        code, out = self.code_drain()
+        self.assertEqual((code, self.coded), (0, []))
+        self.assertIn("out of date (issue edited)", out)
+        self.edited_at = None                                         # never edited: coded as before
+        self.save({5: legacy})
+        self.code_event(5)
+        self.code_drain()
+        self.assertEqual(self.coded, [self.KEY])
+
     def test_a_failed_re_read_before_coding_is_deferred(self):
-        iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
+        self.real_coding()
         self.save({5: self.approved(5)})
         self.code_event(5)
-        iwb.prbot.gh_read = lambda args: (_ for _ in ()).throw(SystemExit(1))
+        reads = []
+
+        def gh(args):
+            reads.append(args[1])
+            if "/comments" in args[1]:
+                raise SystemExit(1)                                   # the re-read under work.lock fails
+            return self.gh(args)
+        iwb.prbot.gh_read = gh
         self.assertEqual(self.code_drain()[0], 0)
-        self.assertEqual((self.calls, self.attempts(self.cdeferred)), ([], [1]))
+        self.assertEqual((self.coded, self.attempts(self.cdeferred)), ([], [1]))
+
+    def test_an_interrupted_run_on_an_edited_issue_is_blocked_not_resumed(self):
+        # the review's scenario: coding was interrupted, then the issue was edited. The interrupted step never runs
+        # the coder: it blocks the issue, and removing bot:blocked clears the analysis for a fresh one.
+        self.real_coding()
+        entry = self.approved(5)
+        entry["work"] = {"status": "in-progress", "plan_digest": entry["approval"]["plan_digest"], "run_id": "r1"}
+        self.save({5: entry})
+        self.comments[5] = [{"user": OWNER, "body": "Different approach, please.", "at": "2026-11-03T14:00:00Z"}]
+        posts = []
+        saved = iwb.post
+        self.addCleanup(lambda: setattr(iwb, "post", saved))
+        iwb.post = lambda bot, repo, n, body, label: posts.append(label) or "https://x/c"
+        iwb.prbot.openclaw_attention = lambda *a, **kw: True
+        self.code_event(5)
+        self.assertEqual(self.code_drain()[0], 0)
+        with redirect_stdout(io.StringIO()):
+            iwb.main(["code"])                                        # and a manual run afterwards
+        self.assertEqual((self.coded, posts), ([], ["bot:blocked"]))
+        self.assertTrue(json.loads(iwb.STATE.read_text())[self.KEY]["blocked"])
+        with redirect_stdout(io.StringIO()):                          # Kenny removes bot:blocked (no label on the
+            Queue.real_analyze()                                      # issue): the old plan and run are cleared
+        entry = json.loads(iwb.STATE.read_text())[self.KEY]
+        self.assertEqual([k for k in ("blocked", "analysis", "work") if k in entry], [])
+        self.assertIn("analysis_failed_at", entry)                    # a fresh analysis was attempted (model fake)
 
     def test_hand_offs_carry_the_installed_repository_name(self):
         # regression (Codex review of #12, P2): a hand-off kept the event's casing, so the code queue found no
@@ -2214,22 +2279,17 @@ class QueueRealSteps(Queue):
     def test_a_stale_plan_stays_uncoded_on_the_hourly_and_manual_paths(self):
         # regression (Codex review of #12, P1): the code queue sent a stale plan back, but the hourly coding pass
         # (with the analysis limit used elsewhere) or a manual `iwb code` still implemented the old plan
-        iwb.CONFIG.write_text(json.dumps({"coding_live": True, "coding_repos": [self.REPO]}))
+        self.real_coding()
         self.save({5: self.approved(5)})
         self.code_event(5)
         self.comments[5] = [{"user": OWNER, "body": "Wait, the API changed.", "at": "2026-11-03T14:00:00Z"}]
         self.assertEqual(self.code_drain()[0], 0)
         entry = json.loads(iwb.STATE.read_text())[self.KEY]
         self.assertEqual(entry["stale_plan"]["reason"], "reply after plan")
-        coded = []
-        saved = iwb.code_plan
-        self.addCleanup(lambda: setattr(iwb, "code_plan", saved))
-        iwb.code_plan = lambda key, *a, **kw: coded.append(key)
-        iwb.cmd_code = Queue.real_code
         self.backstop()                                               # analysis did nothing (the fake), then coding
         with redirect_stdout(io.StringIO()):
             iwb.main(["code"])                                        # a manual run
-        self.assertEqual(coded, [])
+        self.assertEqual(self.coded, [])
         self.assertIn("stale_plan", json.loads(iwb.STATE.read_text())[self.KEY])
 
     def test_approval_refuses_a_stale_plan(self):
@@ -2262,7 +2322,8 @@ class QueueRealSteps(Queue):
     def test_a_missing_or_malformed_plan_file_fails_only_that_issue(self):
         # regression (Codex review of #12, P2): a deleted plan file crashed the code queue before it could settle,
         # so launchd restarted it on the same hand-off forever
-        iwb.CONFIG.write_text(json.dumps({"coding_live": True, "approval_live": True}))
+        self.real_coding()
+        iwb.CONFIG.write_text(json.dumps({"coding_live": True, "approval_live": True, "coding_repos": [self.REPO]}))
         gone, bad = self.approved(5), self.approved(6)
         Path(gone["plan_file"]).unlink()
         Path(bad["plan_file"]).write_text("{not json")
@@ -2271,14 +2332,13 @@ class QueueRealSteps(Queue):
             self.code_event(n)
         code, _ = self.code_drain()
         self.assertEqual((code, self.left(self.cq), self.attempts(self.cdeferred)), (1, [], [1, 1]))
-        self.assertEqual([c for c in self.calls if c[0] == "code"], [("code", [f"{self.REPO}#7"])])
+        self.assertEqual(self.coded, [f"{self.REPO}#7"])
         for n in (5, 6):                                              # the issue queue's hand-off and approval too
             self.event(n)
         iwb.cmd_approve = Queue.real_approve
         code, _ = self.drain()
         self.assertEqual(code, 1)
         self.assertEqual(self.attempts(self.deferred), [1, 1])
-        iwb.cmd_code = Queue.real_code
         self.save({5: gone, 6: bad})                                  # only the broken ones: no GitHub calls
         out = io.StringIO()
         with redirect_stdout(out):
@@ -2287,6 +2347,19 @@ class QueueRealSteps(Queue):
 
     def fail_test(self, msg):
         raise AssertionError(msg)
+
+    def test_a_sweep_that_cannot_list_fails_even_after_a_queued_read_failed(self):
+        # regression (Codex review of #12, P2): the queued event's failed read left a repository-level mark, which
+        # hid the sweep's own listing failure, so the sweep was deleted as if it had run
+        iwb.cmd_intake = Queue.real_intake
+        iwb.prbot.gh_read = lambda args: (_ for _ in ()).throw(SystemExit(1))   # GitHub unreachable
+        self.event(1)
+        self.sweep(self.REPO)
+        code, out = self.drain()
+        self.assertEqual((code, self.left()), (1, []))
+        self.assertIn("sweep.json", self.left(self.deferred))
+        self.assertEqual(self.attempts(self.deferred), [1, 1])        # the queued event and the sweep
+        self.assertIn(f"sweep could not list {self.REPO}", out)
 
     def two_repos(self, entry):
         other = "kennylhilljr/other"

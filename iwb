@@ -296,8 +296,9 @@ def queued_issues(repo, only):
     return found
 
 
-def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None, repo_filter=None):
-    """`only`: a set of "owner/repo#n" keys to look at instead of every open issue (tick --from-queue)."""
+def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None, repo_filter=None, listed=None):
+    """`only`: a set of "owner/repo#n" keys to look at instead of every open issue (tick --from-queue).
+    `listed`: a dict this pass fills with repository -> whether its issues could be read (a sweep's own record)."""
     state, since = load_state()
     if read_config().get("paused") and not baseline:
         log("paused in config.json; nothing picked up")
@@ -320,11 +321,14 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None, repo_filte
             issues = open_issues(repo) if only is None else queued_issues(repo, only)
         except SystemExit:
             log(f"{repo}: could not list issues; skipping this pass")
-            mark(repo, "deferred")            # a repository-wide failure: a sweep that covered it failed
+            if listed is not None:
+                listed[repo] = False
             for k in (only or ()):
                 if k.rsplit("#", 1)[0] == repo:
                     mark(k, "deferred")
             continue
+        if listed is not None:
+            listed[repo] = True
         for issue in issues:
             key = f"{repo}#{issue['number']}"
             if key in state:
@@ -1837,6 +1841,9 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
             if dry_run:
                 log(f"{key}: would {step}")
                 continue
+            # Only "code" runs the coder and pushes. "interrupted" never resumes: it blocks the issue, and removing
+            # bot:blocked clears the analysis, so the plan is analyzed again. "pr" opens the PR for a branch already
+            # pushed; from then on feedback goes to the PR.
             if step == "code" and not plan_still_current(key, entry, QUEUE_DIR):
                 continue                    # read again under work.lock: a newer comment or edit sends it back
             if step == "note":
@@ -2170,17 +2177,20 @@ def sweep_pass(q, scope, groups, handed):
     tick, and never change the outcome of this run's queued events."""
     before = {k: OUTCOME.get(k) for k in groups}
     seen = set(OUTCOME)
-    ok = True
+    ok, listed = True, {}                 # listed: this sweep's own record of which repositories it could read
     try:
         for r in scope or [None]:
-            cmd_intake(limit=LIMIT - SPENT["intake"], repo_filter=r)
+            cmd_intake(limit=LIMIT - SPENT["intake"], repo_filter=r, listed=listed)
             cmd_analyze(limit=ANALYZE_LIMIT - SPENT["analyze"], repo_filter=r)
             if read_config().get("approval_live"):
                 cmd_approve(limit=APPROVE_LIMIT - SPENT["approve"], repo_filter=r)
     except (Exception, SystemExit) as e:
         ok = False
         log(f"queue: sweep failed: {e!r}")
-    unlisted = [k for k in OUTCOME if "#" not in k and k not in seen and (scope is None or k in scope)]
+    unlisted = [r for r in (scope or []) if not listed.get(r)] + [r for r, good in listed.items() if not good]
+    if not listed and ok:
+        unlisted = ["every repository"]   # nothing could be listed at all (no worker bot, nothing installed)
+    unlisted = sorted(set(unlisted))
     if unlisted:
         ok = False
         log(f"queue: sweep could not list {', '.join(sorted(unlisted))}")
@@ -2275,11 +2285,6 @@ def cmd_drain(queue_dir):
     return 1 if sweeps and not swept else rc
 
 
-def intake_queue_for(code_q):
-    """The issue queue that goes with a code queue: <name> for <name>-code."""
-    return code_q.parent / code_q.name[:-len("-code")] if code_q.name.endswith("-code") else QUEUE_DIR
-
-
 def mark_plan_stale(key, why):
     """Record on the issue's state entry, under state.lock, that its approved plan is out of date. Approval and
     coding refuse such an entry on every path, and analysis treats it as needing a new analysis, which clears it."""
@@ -2331,13 +2336,16 @@ def plan_is_stale(key, entry):
     issue, comments, _ = issue_text(repo, number, trusted, bot_logins, approver_logins)
     if issue["state"] != "open":
         return None                       # cmd_code leaves closed issues alone
-    return needs_analysis(copy.deepcopy(entry), comments, trusted, issue_digest(issue))
+    a = entry.get("analysis") or {}
+    edited_at = last_edited(repo, number) if a and not a.get("digest") else None   # as cmd_analyze does
+    return needs_analysis(copy.deepcopy(entry), comments, trusted, issue_digest(issue), edited_at)
 
 
 def cmd_code_drain(queue_dir):
     """`code --from-queue DIR`: step 4b for each issue handed off in DIR by the issue queue. Same folders and
-    outcomes: DIR-deferred, DIR-rejected; a coding lock held elsewhere is an uncounted wait. Before coding, the
-    issue is read again; if it changed since its plan was analyzed, an event goes back to the issue queue instead."""
+    outcomes: DIR-deferred, DIR-rejected; a coding lock held elsewhere is an uncounted wait. cmd_code reads the
+    issue again under work.lock before coding; if it changed since its plan was analyzed, the plan is marked
+    stale_plan, an event goes back to the issue queue (IWB_QUEUE_DIR), and the hand-off counts as handled."""
     q = Path(queue_dir).expanduser()
     problem = drain_problem(q, CODE_QUEUE_DEFAULT)
     if problem:
@@ -2362,16 +2370,8 @@ def cmd_code_drain(queue_dir):
             for f, _ in fs:
                 f.unlink(missing_ok=True)
         return 0
-    state = read_state_file()
     for key in groups:
-        try:
-            ready = needs_coding(state.get(key))
-        except PLAN_ERRORS as e:
-            mark(key, "failed", f"could not read the plan file: {e!r}")
-            continue
-        if ready and not plan_still_current(key, state[key], intake_queue_for(q)):
-            continue                      # sent back as stale (handled, so the hand-off is deleted), or marked
-        try:
+        try:                              # cmd_code reads the issue again under work.lock before coding it
             cmd_code(limit=CODE_LIMIT - SPENT["code"], only={key})
         except (Exception, SystemExit) as e:
             mark(key, "failed", f"coding hand-off failed: {e!r}")
