@@ -113,6 +113,14 @@ Then install the launchd job, which runs `iwb tick` every 5 minutes:
 
 Log: `~/Library/Logs/issue-intake.log`. State: `~/.config/issue-worker-bots/state.json`. Saved plans: `~/.config/issue-worker-bots/plans/`. To remove the job, run `./install-intake.sh --uninstall`.
 
+### Event-driven intake (proposed)
+
+OpenClaw's github-event-router can drop one JSON file per GitHub issue event into `~/.local/state/github-events/iwb/`. `iwb tick --from-queue <folder>` runs the steps of `tick` for just the issues named there, reading each issue fresh from GitHub, and deletes an issue's files once it was handled. An issue whose handling fails, or that waits for a later pass (a failed read, the one-analysis-per-pass limit), keeps its files; the run exits 1 if any issue failed. Files that can never be handled (bad JSON, no repo or number, a pull request, a repository the bots aren't installed on) are logged and deleted. Dotfiles and anything not ending in `.json` are ignored, and an empty or missing folder exits 0 without a log line.
+
+[`launchd/`](launchd/README.md) holds the proposed jobs: a queue job that launchd starts whenever the folder has files, and the full-scan `tick` slowed to once an hour as a backstop. They are not installed by `install-intake.sh`; the steps and the rollback are in `launchd/README.md`.
+
+Both forms of `tick` take `~/.local/state/issue-worker-bots/tick.lock` (non-blocking) for intake, analysis and approval, so the two jobs never run those steps at once. A run that finds the lock held logs a line and exits 0; queue files stay for the next run. Coding takes its own `work.lock` after `tick.lock` is released, so an hours-long coding run doesn't hold up queued events.
+
 ## How an issue is handled
 
 ### Intake
@@ -182,6 +190,7 @@ Plans ready, questions posted and blocked issues appear in OpenClaw as `attentio
 | Command | What it does |
 | --- | --- |
 | `iwb tick` | What launchd runs: intake, then one analysis, then step 4a when `approval_live` is set and step 4b when `coding_live` is set. |
+| `iwb tick --from-queue DIR` | The same steps for only the issues named by event files in `DIR`, each once per run; deletes an issue's files after it was handled. Exits 1 if an issue failed. |
 | `iwb code [--dry-run]` | Codes one approved plan and opens its PR. `--dry-run` prints what it would do. |
 | `iwb intake [--dry-run] [--baseline] [--limit N]` | One pass over open issues; picks up at most N (default 5). `--dry-run` prints and saves nothing; `--baseline` marks the open issues as seen without commenting. |
 | `iwb analyze [--dry-run] [--limit N]` | Analyzes up to N picked-up issues (default 1) and posts a no-code answer, questions or a plan. |
@@ -194,6 +203,7 @@ Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bo
 | --- | --- |
 | `iwb` | The CLI. Standard library only; uses `prbot` for sign-in and tokens. |
 | `install-intake.sh` | Installs the launchd job that runs `iwb tick` every 5 minutes. |
+| `launchd/` | Proposed plists for event-driven intake (queue job plus hourly backstop) and how to install or roll them back. |
 | `bots/` | App specs for `prbot register --spec`, including each App's permissions. |
 | `logos/` | Bot logos: SVG sources and 512 px PNGs uploaded to GitHub. |
 | `docs/assets/` | The README header (SVG source and WebP). |

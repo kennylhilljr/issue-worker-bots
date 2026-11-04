@@ -2,6 +2,12 @@
 """iwb: issue worker bots. Step 2 of DESIGN.md: intake only.
 
   iwb tick                  what launchd runs: intake, then analyze, then approve and code when switched on
+  iwb tick --from-queue DIR
+      The same steps for just the issues named by event files in DIR (one JSON file per GitHub event, written by
+      OpenClaw's github-event-router). Each issue is handled once per run however many files it has; its files are
+      deleted once it was handled, and kept when it failed or waits for a later pass. Files that can never be handled
+      (bad JSON, no repo or number, a pull request, a repository the bots aren't installed on) are logged and
+      deleted. Exits 1 if an issue failed. Both forms of tick skip with a log line while the other one holds the lock.
   iwb code [--dry-run]
       Step 4b: for one plan that step 4a approved, in a repository listed in config.json "coding_repos": an
       orchestrator run in iwb's own clone, one commit by the worker bot on bot/<n>-<slug>-<attempt>, and a draft PR marked
@@ -47,6 +53,17 @@ prbot = load_prbot()
 
 def log(msg):
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
+
+
+# What this process left for a later pass: issues it could not read or post to, or that hit a per-pass limit, and
+# the runs each step spent. `tick --from-queue` keeps those issues' queue files and shares the limits across issues.
+PENDING = set()
+SPENT = {"intake": 0, "analyze": 0, "approve": 0, "code": 0}
+
+
+def later(key, msg):
+    PENDING.add(key)
+    log(f"{key}: {msg}")
 
 
 def load_state():
@@ -178,7 +195,18 @@ def pick_up(repo, issue, agent, reason):
     return run_gh_as(bot, repo, ["issue", "comment", str(issue["number"]), "-R", repo, "--body", body])
 
 
-def cmd_intake(dry_run=False, baseline=False, limit=LIMIT):
+def queued_issues(repo, only):
+    """The open issues (not pull requests) among `only` ("owner/repo#n" keys) in this repository, read one by one."""
+    found = []
+    for key in sorted(k for k in only if k.rsplit("#", 1)[0] == repo):
+        i = gh_json(["api", f"repos/{repo}/issues/{key.rsplit('#', 1)[1]}"])[0]
+        if i.get("state") == "open" and not i.get("pull_request"):
+            found.append(i)
+    return found
+
+
+def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None):
+    """`only`: a set of "owner/repo#n" keys to look at instead of every open issue (tick --from-queue)."""
     state, since = load_state()
     if read_config().get("paused") and not baseline:
         log("paused in config.json; nothing picked up")
@@ -191,11 +219,15 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT):
     bot_logins = {cfg[b]["slug"] + "[bot]" for b in bots}
     installed = {b: prbot.installed_repos(b) for b in bots}
     picked = 0
-    for repo in sorted(set().union(*installed.values())):
+    repos = set().union(*installed.values())
+    if only is not None:
+        repos &= {k.rsplit("#", 1)[0] for k in only}
+    for repo in sorted(repos):
         try:
-            issues = open_issues(repo)
+            issues = open_issues(repo) if only is None else queued_issues(repo, only)
         except SystemExit:
             log(f"{repo}: could not list issues; skipping this pass")
+            PENDING.update(k for k in (only or ()) if k.rsplit("#", 1)[0] == repo)
             continue
         for issue in issues:
             key = f"{repo}#{issue['number']}"
@@ -213,16 +245,17 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT):
                     state[key] = {"picked_up_at": time.time(), "note": "found an earlier pick-up comment"}
                     continue
             except SystemExit:
-                log(f"{key}: could not read the issue; will retry")
+                later(key, "could not read the issue; will retry")
                 continue
             agent = choose_agent(issue, state)
             if WORKERS[agent] not in bots or repo not in installed[WORKERS[agent]]:
                 log(f"{key}: qualifies ({reason}), but {WORKERS[agent]}-gh is not registered or installed here")
                 continue
             if picked >= limit:
-                log(f"{key}: qualifies ({reason}); waits for the next pass (limit {limit})")
+                later(key, f"qualifies ({reason}); waits for the next pass (limit {limit})")
                 continue
             picked += 1
+            SPENT["intake"] += 1
             if dry_run:
                 state["_last_agent"] = agent   # not saved; keeps the alternation honest in the preview
                 log(f"{key}: would be picked up by {WORKERS[agent]}-gh ({reason}): {issue['title'][:70]}")
@@ -230,7 +263,7 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT):
             try:
                 url = pick_up(repo, issue, agent, reason)
             except RuntimeError as e:
-                log(f"{key}: pick-up failed, will retry: {e}")
+                later(key, f"pick-up failed, will retry: {e}")
                 continue
             state[key] = {"agent": agent, "picked_up_at": time.time(), "comment": url}
             state["_last_agent"] = agent
@@ -495,7 +528,7 @@ def command_reply(cmd, entry, slug):
     return "There's no code change planned here. Describe the change you want and I'll plan it."
 
 
-def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
+def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None):
     state, since = load_state()
     paused = read_config().get("paused", False)
     cfg = prbot.load_config()
@@ -506,7 +539,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
     approver_logins = {cfg[b]["slug"] + "[bot]" for b in ("claude", "codex") if b in cfg}   # the review bots
     runs = 0
     for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
-        if "agent" not in entry or paused:
+        if "agent" not in entry or paused or only is not None and key not in only:
             continue
         if time.time() - entry.get("analysis_failed_at", 0) < RETRY_AFTER:
             continue
@@ -514,7 +547,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
         try:
             issue, comments, text = issue_text(repo, number, trusted, bot_logins, approver_logins)
         except SystemExit:
-            log(f"{key}: could not read the issue; will retry")
+            later(key, "could not read the issue; will retry")
             continue
         if issue["state"] != "open":
             entry["closed"] = True
@@ -558,7 +591,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
                         run_gh_as(bot, repo, ["issue", "edit", str(number), "-R", repo, "--add-label", "bot:stop"])
                     url = run_gh_as(bot, repo, ["issue", "comment", str(number), "-R", repo, "--body", body])
                 except RuntimeError as e:
-                    log(f"{key}: could not answer '{cmd}', will retry: {e}")
+                    later(key, f"could not answer '{cmd}', will retry: {e}")
                     continue
                 entry["handled_at"] = iso_epoch(new[-1]["at"])
                 log(f"{key}: answered '{cmd}' {url}")
@@ -568,15 +601,16 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
             try:
                 edited_at = last_edited(repo, number)
             except (SystemExit, ValueError, IndexError, KeyError):
-                log(f"{key}: could not read when the issue was edited; will retry")
+                later(key, "could not read when the issue was edited; will retry")
                 continue
         why = needs_analysis(entry, comments, trusted, digest, edited_at)
         if not why:
             continue
         if runs >= limit:
-            log(f"{key}: analysis ({why}) waits for the next pass (limit {limit})")
+            later(key, f"analysis ({why}) waits for the next pass (limit {limit})")
             continue
         runs += 1
+        SPENT["analyze"] += 1
         agent, bot = entry["agent"], WORKERS[entry["agent"]]
         model = analysis_model(agent)["model"]
         log(f"{key}: analyzing with {model} ({why})")
@@ -931,7 +965,7 @@ def send_back(entry, key, repo, number, worker, issue, digest, problems):
         log(f"{key}: blocked after a revision {url}")
 
 
-def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
+def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None):
     """Step 4a for planned issues: policy gate, red check, then approval by the other agent's review bot."""
     state, since = load_state()
     if read_config().get("paused"):
@@ -943,6 +977,8 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
     runs = 0
     for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
         a = entry.get("analysis") or {}
+        if only is not None and key not in only:
+            continue
         if a.get("decision") != "plan" or entry.get("blocked") or entry.get("closed") or not entry.get("plan_file"):
             continue
         if time.time() - entry.get("approval_failed_at", 0) < RETRY_AFTER:
@@ -981,7 +1017,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
             if level == "full":
                 model = {**model, "effort": "high"}
             if runs >= limit:
-                log(f"{key}: approval waits for the next pass (limit {limit})")
+                later(key, f"approval waits for the next pass (limit {limit})")
                 continue
         work = None
         try:
@@ -1008,6 +1044,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
                 log(f"{key}: approved by rule, no model {url}")
                 continue
             runs += 1                          # only a model review counts against the per-pass limit
+            SPENT["approve"] += 1
             log(f"{key}: red check and {level} approval by {slug} with {model['model']} ({model['effort']} effort)")
             red = red_check(units, f"{work}/repo")
             _, _, text = issue_text(repo, number, trusted, bot_logins)   # the same issue text the planner saw
@@ -1571,11 +1608,13 @@ def finish_pr(key, entry, issue, state, since):
     w.update(status="pr-open", done_at=time.time())
 
 
-def work_lock():
-    """One step-4b pass at a time, so a manual `iwb code` never mistakes a running pass for an interrupted one."""
+def work_lock(name="work.lock"):
+    """One step-4b pass at a time, so a manual `iwb code` never mistakes a running pass for an interrupted one.
+    `tick.lock` does the same for the intake, analysis and approval part of `tick`, in both of its modes. None if
+    another process holds the lock."""
     import fcntl
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    f = open(WORK_DIR / "work.lock", "w")
+    f = open(WORK_DIR / name, "w")
     try:
         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -1593,7 +1632,7 @@ def approved_plan(entry):
     return (ap, units) if ap.get("plan_digest") == plan_digest(units) else (None, None)
 
 
-def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None):
+def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
     """Step 4b: code plans that step 4a approved, in repositories listed in config.json "coding_repos"."""
     ecc = ecc or run_ecc
     conf = read_config()
@@ -1609,6 +1648,8 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None):
     runs = 0
     try:
         for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
+            if only is not None and key not in only:
+                continue
             if entry.get("blocked") or entry.get("closed") or (entry.get("analysis") or {}).get("decision") != "plan":
                 continue
             ap, units = approved_plan(entry)
@@ -1635,13 +1676,13 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None):
                 busy = sum(1 for e in state.values() if isinstance(e, dict) and not e.get("blocked")
                            and (e.get("work") or {}).get("status") == "in-progress")
                 if runs >= limit or busy >= IN_PROGRESS_LIMIT:
-                    log(f"{key}: coding waits for the next pass")
+                    later(key, "coding waits for the next pass")
                     continue
             try:
                 issue = gh_json(["api", f"repos/{repo}/issues/{number}", "--jq",
                                  "{state, title, labels: [.labels[].name]}"])[0]
             except SystemExit:
-                log(f"{key}: could not read the issue; will retry")
+                later(key, "could not read the issue; will retry")
                 continue
             if issue["state"] != "open" or "bot:stop" in issue["labels"]:
                 continue
@@ -1656,7 +1697,7 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None):
                                           f"waits here. It is coded once the repository is in `coding_repos`."])
                     entry["coding_note"] = ap["plan_digest"]
                 except RuntimeError as e:
-                    log(f"{key}: could not post the coding note, will retry: {e}")
+                    later(key, f"could not post the coding note, will retry: {e}")
                 continue
             try:
                 if step == "interrupted":
@@ -1667,6 +1708,7 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None):
                     finish_pr(key, entry, issue, state, since)
                     continue
                 runs += 1
+                SPENT["code"] += 1
                 entry["work"] = {"status": "approved", "plan_digest": ap["plan_digest"], "approver": ap["approver"],
                                  "approved_at": ap["at"], "approval_comment": ap.get("comment", "")}
                 code_plan(key, entry, issue, state, since, ecc)
@@ -1679,6 +1721,114 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None):
         lock.close()
     log(f"coding pass done: {runs} run{'s' if runs != 1 else ''}")
     return 0
+
+
+def cmd_tick():
+    """The full scan: intake, then analysis, then 4a and 4b when switched on. Coding runs after tick.lock is
+    released, under its own lock, so an hours-long run doesn't hold up queued events."""
+    lock = work_lock("tick.lock")
+    if lock is None:
+        log("another tick is running; skipping this one")
+        return 0
+    try:
+        cmd_intake()
+        cmd_analyze()
+        if read_config().get("approval_live"):   # step 4a joins the scheduled job only once switched on
+            cmd_approve()
+    finally:
+        lock.close()
+    if read_config().get("coding_live"):         # step 4b too, separately
+        return cmd_code()
+    return 0
+
+
+REPO_NAME = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+")   # GitHub owners have no dots
+
+
+def queue_files(d):
+    """Event files in the queue folder, oldest first: regular *.json files whose name doesn't start with a dot."""
+    if not d.is_dir():
+        return []
+    return sorted(f for f in d.iterdir() if f.name.endswith(".json") and not f.name.startswith(".")
+                  and f.is_file() and not f.is_symlink())
+
+
+def read_event(f):
+    """(repo, number, kind) from one event file, or None if it can never be handled."""
+    try:
+        ev = json.loads(f.read_text())
+        repo, number = ev["repo"], ev["number"]
+    except (ValueError, KeyError, TypeError, IndexError):
+        return None
+    if not isinstance(repo, str) or not REPO_NAME.fullmatch(repo) or type(number) is not int or number < 1:
+        return None
+    return repo, number, ev.get("kind")
+
+
+def cmd_drain(queue_dir):
+    """`tick --from-queue DIR`: the per-issue part of tick for each issue that has event files in DIR, then those
+    files are deleted. Files that can never be handled are deleted with a log line; an issue whose handling raised,
+    or that was left for a later pass (a failed read, a per-pass limit), keeps its files for the next run."""
+    files = queue_files(Path(queue_dir).expanduser())
+    if not files:
+        return 0
+    lock = work_lock("tick.lock")
+    if lock is None:
+        log(f"queue: another tick is running; {len(files)} event file{'s' if len(files) != 1 else ''} wait")
+        return 0
+    PENDING.clear()
+    SPENT.update(dict.fromkeys(SPENT, 0))
+    groups, failed = {}, set()
+    try:
+        cfg = prbot.load_config()
+        repos = {r.lower(): r for b in WORKERS.values() if b in cfg for r in prbot.installed_repos(b)}
+        for f in files:
+            try:
+                ev = read_event(f)
+            except OSError as e:          # gone or unreadable right now: leave it for the next run
+                log(f"queue: {f.name}: could not read ({e}); left for the next run")
+                continue
+            if ev is None:
+                log(f"queue: {f.name}: not valid JSON with a repo and an issue number; deleted")
+                f.unlink(missing_ok=True)
+                continue
+            repo, number, kind = ev
+            if kind != "issue" or repo.lower() not in repos:
+                why = "not an issue" if kind != "issue" else f"{repo} is not a worker repository"
+                log(f"queue: {f.name}: {why}; deleted")
+                f.unlink(missing_ok=True)
+                continue
+            groups.setdefault(f"{repos[repo.lower()]}#{number}", []).append(f)
+        for key in groups:
+            try:
+                cmd_intake(limit=LIMIT - SPENT["intake"], only={key})
+                cmd_analyze(limit=ANALYZE_LIMIT - SPENT["analyze"], only={key})
+                if read_config().get("approval_live"):
+                    cmd_approve(limit=APPROVE_LIMIT - SPENT["approve"], only={key})
+            except (Exception, SystemExit) as e:
+                failed.add(key)
+                log(f"{key}: queued event failed, its files stay for the next run: {e!r}")
+    finally:
+        lock.close()
+    if read_config().get("coding_live"):
+        for key in groups:
+            if key in failed:
+                continue
+            try:
+                cmd_code(limit=CODE_LIMIT - SPENT["code"], only={key})
+            except (Exception, SystemExit) as e:
+                failed.add(key)
+                log(f"{key}: queued event failed while coding, its files stay for the next run: {e!r}")
+    for key, fs in groups.items():
+        if key in failed or key in PENDING:
+            continue
+        for f in fs:
+            f.unlink(missing_ok=True)
+    kept = sorted(set(groups) & (failed | PENDING))
+    done = len(groups) - len(kept)
+    log(f"queue pass done: {done} issue{'s' if done != 1 else ''} handled"
+        + (f"; kept for the next run: {', '.join(kept)}" if kept else ""))
+    return 1 if failed else 0
 
 
 def main(argv):
@@ -1696,13 +1846,12 @@ def main(argv):
     if argv[0] == "code":
         return cmd_code(dry_run="--dry-run" in argv)
     if argv[0] == "tick":   # what launchd runs: pick up new issues, then analyze one
-        cmd_intake()
-        cmd_analyze()
-        if read_config().get("approval_live"):   # step 4a joins the scheduled job only once switched on
-            cmd_approve()
-        if read_config().get("coding_live"):     # step 4b too, separately
-            return cmd_code()
-        return 0
+        if "--from-queue" in argv:
+            i = argv.index("--from-queue") + 1
+            if i >= len(argv) or argv[i].startswith("-"):
+                prbot.die("tick --from-queue needs the queue folder")
+            return cmd_drain(argv[i])
+        return cmd_tick()
     prbot.die(f"unknown command '{argv[0]}'")
 
 

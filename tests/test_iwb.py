@@ -1438,3 +1438,206 @@ class Checkout(unittest.TestCase):
         self.assertEqual(sorted(files), [".env", "src_config.py"])
         problems = iwb.scope_problems(files, [coding_unit(files=["src_config.py"])], "kennylhilljr/demo")
         self.assertIn("`.env` is a protected path", problems)
+
+
+class Queue(unittest.TestCase):
+    """tick --from-queue: one JSON file per GitHub event, written by OpenClaw's github-event-router."""
+    REPO = "kennylhilljr/demo"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.q = Path(self.tmp.name, "queue")
+        self.q.mkdir()
+        p = iwb.prbot
+        saved = {k: getattr(p, k) for k in ("load_config", "installed_repos")}
+        saved_iwb = {k: getattr(iwb, k) for k in ("STATE", "CONFIG", "WORK_DIR", "cmd_intake", "cmd_analyze",
+                                                   "cmd_approve", "cmd_code")}
+        self.addCleanup(lambda: [setattr(p, k, v) for k, v in saved.items()]
+                        + [setattr(iwb, k, v) for k, v in saved_iwb.items()])
+        iwb.STATE = Path(self.tmp.name, "state.json")
+        iwb.CONFIG = Path(self.tmp.name, "config.json")
+        iwb.WORK_DIR = Path(self.tmp.name, "work")
+        p.load_config = lambda: {"claude-dev": {"owner": OWNER, "slug": "claude-dev-gh"},
+                                 "codex-dev": {"owner": OWNER, "slug": "codex-dev-gh"}}
+        p.installed_repos = lambda bot: {self.REPO}
+        self.calls = []        # (step, only)
+        self.failing = {}         # (step, key) -> exception to raise
+        self.wait = set()      # (step, key) that leave the issue for a later pass
+        for step in ("intake", "analyze", "approve", "code"):
+            setattr(iwb, f"cmd_{step}", lambda *a, _s=step, only=None, **kw: self.fake_step(_s, only))
+        self.n = 0
+
+    def fake_step(self, step, only):
+        self.calls.append((step, sorted(only) if only is not None else None))
+        for key in only or ():
+            if (step, key) in self.failing:
+                raise self.failing[step, key]
+            if (step, key) in self.wait:
+                iwb.later(key, "waits for the next pass")
+        return 0
+
+    def event(self, number, event="opened", repo=None, kind="issue", raw=None, name=None):
+        self.n += 1
+        repo = repo or self.REPO
+        name = name or f"20261103T1415{self.n:02d}123Z-1730643302_12345{self.n}-{repo.replace('/', '__')}-{kind}-{number}-{event}.json"
+        f = self.q / name
+        f.write_text(raw if raw is not None else json.dumps(
+            {"repo": repo, "kind": kind, "number": number, "event": event, "received_at": "2026-11-03T14:15:02.123Z",
+             "slack_message_id": "1730643302.123456", "slack_channel": "C0CEMPH1L0N",
+             "source": "github-event-router", "version": 1}))
+        return f
+
+    def drain(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = iwb.main(["tick", "--from-queue", str(self.q)])
+        return code, out.getvalue()
+
+    def left(self):
+        return sorted(f.name for f in self.q.iterdir())
+
+    def test_each_issue_once_per_run_and_its_files_go_after_success(self):
+        self.event(42, "opened")
+        self.event(7, "comment")
+        self.event(42, "comment")
+        self.event(42, "labeled")
+        code, _ = self.drain()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.calls, [("intake", [f"{self.REPO}#42"]), ("analyze", [f"{self.REPO}#42"]),
+                                      ("intake", [f"{self.REPO}#7"]), ("analyze", [f"{self.REPO}#7"])])
+        self.assertEqual(self.left(), [])
+
+    def test_approve_and_code_follow_their_switches(self):
+        iwb.CONFIG.write_text(json.dumps({"approval_live": True, "coding_live": True}))
+        held = []
+
+        def code(only=None, **kw):
+            lock = iwb.work_lock("tick.lock")
+            held.append(lock is None)
+            if lock:
+                lock.close()
+            return self.fake_step("code", only)
+        iwb.cmd_code = code
+        self.event(3)
+        self.assertEqual(self.drain()[0], 0)
+        self.assertEqual([s for s, _ in self.calls], ["intake", "analyze", "approve", "code"])
+        self.assertEqual(held, [False])        # coding runs after tick.lock is released
+
+    def test_a_failure_keeps_that_issues_files_and_exits_nonzero(self):
+        bad = [self.event(1, "opened"), self.event(1, "comment")]
+        self.event(2)
+        self.failing["analyze", f"{self.REPO}#1"] = SystemExit(1)       # prbot.die, as a failed gh read does
+        code, out = self.drain()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.left(), sorted(f.name for f in bad))
+        self.assertIn(("analyze", [f"{self.REPO}#2"]), self.calls)    # the other issue still ran
+        self.assertIn(f"{self.REPO}#1: queued event failed", out)
+        del self.failing["analyze", f"{self.REPO}#1"]
+        self.assertEqual(self.drain()[0], 0)                          # the next run retries and clears it
+        self.assertEqual(self.left(), [])
+
+    def test_an_issue_left_for_a_later_pass_keeps_its_files(self):
+        kept = self.event(5)
+        self.event(6)
+        self.wait.add(("analyze", f"{self.REPO}#5"))                  # e.g. the one-analysis-per-pass limit
+        code, out = self.drain()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.left(), [kept.name])
+        self.assertIn(f"kept for the next run: {self.REPO}#5", out)
+
+    def test_the_analysis_limit_is_shared_by_the_issues_in_a_run(self):
+        seen = []
+        iwb.cmd_analyze = lambda only=None, limit=None, **kw: seen.append(limit) or iwb.SPENT.update(analyze=1)
+        self.event(1)
+        self.event(2)
+        self.drain()
+        self.assertEqual(seen, [1, 0])
+
+    def test_unusable_files_are_logged_and_deleted(self):
+        names = [self.event(1, raw="{not json").name,
+                 self.event(2, raw=json.dumps({"repo": self.REPO, "kind": "issue"})).name,
+                 self.event(3, raw=json.dumps({"repo": self.REPO, "kind": "issue", "number": "3"})).name,
+                 self.event(4, raw=json.dumps({"repo": self.REPO, "kind": "issue", "number": True})).name,
+                 self.event(5, raw=json.dumps({"repo": "../etc", "kind": "issue", "number": 5})).name,
+                 self.event(6, raw=json.dumps(["not", "an", "object"])).name]
+        code, out = self.drain()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.left(), [])
+        self.assertEqual(self.calls, [])
+        for name in names:
+            self.assertIn(f"queue: {name}: not valid JSON with a repo and an issue number; deleted", out)
+
+    def test_other_repositories_and_pull_requests_are_deleted_unhandled(self):
+        other = self.event(1, repo="someone/else")
+        pr = self.event(2, kind="pull_request")
+        code, out = self.drain()
+        self.assertEqual((code, self.left(), self.calls), (0, [], []))
+        self.assertIn(f"queue: {other.name}: someone/else is not a worker repository; deleted", out)
+        self.assertIn(f"queue: {pr.name}: not an issue; deleted", out)
+
+    def test_dotfiles_other_files_and_folders_are_left_alone(self):
+        self.event(1, name=".20261103T141502123Z-partial.json")
+        (self.q / "notes.txt").write_text("x")
+        (self.q / "sub.json").mkdir()
+        code, out = self.drain()
+        self.assertEqual((code, out, self.calls), (0, "", []))
+        self.assertEqual(self.left(), [".20261103T141502123Z-partial.json", "notes.txt", "sub.json"])
+
+    def test_empty_or_missing_folder_is_quiet(self):
+        iwb.prbot.load_config = lambda: self.fail_test("no GitHub or config read for an empty queue")
+        self.assertEqual(self.drain(), (0, ""))
+        self.q.rmdir()
+        self.assertEqual(self.drain(), (0, ""))
+
+    def fail_test(self, msg):
+        raise AssertionError(msg)
+
+    def test_plain_tick_still_scans_everything(self):
+        self.event(9)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(iwb.main(["tick"]), 0)
+        self.assertEqual(self.calls, [("intake", None), ("analyze", None)])
+        self.assertEqual(len(self.left()), 1)                         # the queue is not touched
+
+    def test_both_modes_skip_while_another_tick_holds_the_lock(self):
+        self.event(1)
+        held = iwb.work_lock("tick.lock")
+        self.addCleanup(held.close)
+        code, out = self.drain()
+        self.assertEqual((code, self.calls, len(self.left())), (0, [], 1))
+        self.assertIn("another tick is running", out)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(iwb.main(["tick"]), 0)
+        self.assertEqual(self.calls, [])
+        held.close()
+        self.assertEqual(self.drain()[0], 0)
+        self.assertEqual(self.left(), [])
+
+    def test_intake_reads_only_the_queued_issue(self):
+        saved = {k: getattr(iwb, k) for k in ("cmd_intake", "pick_up")}
+        self.addCleanup(lambda: [setattr(iwb, k, v) for k, v in saved.items()])
+        iwb.cmd_intake = Queue.real_intake
+        reads, picked = [], []
+        issues = {1: {**issue(1), "state": "open"}, 2: {**issue(2), "state": "closed"},
+                  3: {**issue(3), "state": "open", "pull_request": {"url": "x"}}}
+
+        def gh(args):
+            reads.append(args[1])
+            if args[1].endswith("/comments?per_page=100"):
+                return ""
+            return json.dumps(issues[int(args[1].rsplit("/", 1)[1])])
+        saved_gh = iwb.prbot.gh_read
+        self.addCleanup(lambda: setattr(iwb.prbot, "gh_read", saved_gh))
+        iwb.prbot.gh_read = gh
+        iwb.pick_up = lambda repo, i, agent, reason: picked.append(i["number"]) or "https://x/c"
+        with redirect_stdout(io.StringIO()):
+            for n in (1, 2, 3):
+                iwb.cmd_intake(only={f"{self.REPO}#{n}"})
+        self.assertEqual(picked, [1])
+        self.assertNotIn(f"repos/{self.REPO}/issues?state=open&per_page=100", reads)   # no full scan
+        self.assertEqual(json.loads(iwb.STATE.read_text())[f"{self.REPO}#1"]["agent"], "claude")
+
+
+Queue.real_intake = staticmethod(iwb.cmd_intake)
