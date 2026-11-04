@@ -1466,7 +1466,8 @@ class Queue(unittest.TestCase):
         p.installed_repos = lambda bot: {self.REPO}
         self.calls = []        # (step, only)
         self.failing = {}         # (step, key) -> exception to raise
-        self.wait = set()      # (step, key) that leave the issue for a later pass
+        self.wait = set()      # (step, key) that leave the issue for a later pass after an error
+        self.hold = set()      # (step, key) held back only by a per-pass limit
         for step in ("intake", "analyze", "approve", "code"):
             setattr(iwb, f"cmd_{step}", lambda *a, _s=step, only=None, **kw: self.fake_step(_s, only))
         self.n = 0
@@ -1477,7 +1478,9 @@ class Queue(unittest.TestCase):
             if (step, key) in self.failing:
                 raise self.failing[step, key]
             if (step, key) in self.wait:
-                iwb.later(key, "waits for the next pass")
+                iwb.later(key, "could not read the issue; will retry")
+            if (step, key) in self.hold:
+                iwb.held(key, "waits for the next pass (limit 1)")
         return 0
 
     def event(self, number, event="opened", repo=None, kind="issue", raw=None, name=None):
@@ -1555,14 +1558,60 @@ class Queue(unittest.TestCase):
         self.assertEqual(self.drain()[0], 0)                          # fixed: handled and deleted
         self.assertEqual((self.left(), self.left(self.deferred)), ([], []))
 
-    def test_an_issue_left_for_a_later_pass_is_deferred_without_failing(self):
+    def test_a_failed_read_is_deferred_without_failing_the_run(self):
         kept = self.event(5)
         self.event(6)
-        self.wait.add(("analyze", f"{self.REPO}#5"))                  # e.g. the one-analysis-per-pass limit
+        self.wait.add(("analyze", f"{self.REPO}#5"))                  # later(): a GitHub read that failed
         code, out = self.drain()
         self.assertEqual(code, 0)
         self.assertEqual((self.left(), self.left(self.deferred)), ([], [kept.name]))
+        self.assertEqual(self.attempts(self.deferred), [1])
         self.assertIn(f"deferred: {self.REPO}#5", out)
+
+    def test_a_limit_held_issue_stays_in_the_queue_untouched(self):
+        held = self.event(5)
+        before = held.read_text()
+        self.event(6)
+        self.hold.add(("analyze", f"{self.REPO}#5"))
+        code, out = self.drain()
+        self.assertEqual((code, self.left(), self.left(self.deferred)), (0, [held.name], []))
+        self.assertEqual(held.read_text(), before)                     # no attempts field added
+        self.assertNotIn("attempts", json.loads(held.read_text()))
+        self.assertIn(f"left in the queue for the next run: {self.REPO}#5", out)
+
+    def test_a_burst_drains_one_analysis_per_run(self):
+        def analyze(only=None, limit=None, **kw):
+            (key,) = only
+            if limit <= 0:
+                iwb.held(key, "analysis waits for the next pass (limit 1)")
+            else:
+                iwb.SPENT["analyze"] += 1
+                analyzed.append(key)
+        analyzed = []
+        iwb.cmd_analyze = analyze
+        for n in (1, 2, 3):
+            self.event(n)
+        for left in (2, 1, 0):                                        # what launchd would do, a minute apart
+            self.assertEqual(self.drain()[0], 0)
+            self.assertEqual(len(self.left()), left)
+        self.assertEqual(analyzed, [f"{self.REPO}#{n}" for n in (1, 2, 3)])
+        self.assertEqual(self.left(self.deferred), [])
+
+    def test_a_run_that_would_only_hold_defers_instead(self):
+        self.event(5)
+        self.hold.add(("intake", f"{self.REPO}#5"))                   # can't happen with a fresh budget; guarded
+        code, out = self.drain()
+        self.assertEqual((code, self.left()), (0, []))
+        self.assertEqual(self.attempts(self.deferred), [1])
+        self.assertIn("every issue was held by a limit", out)
+
+    def test_a_retry_delay_wait_is_deferred(self):
+        iwb.cmd_analyze = Queue.real_analyze
+        iwb.STATE.write_text(json.dumps({f"{self.REPO}#5": {"agent": "claude", "analysis_failed_at": time.time()}}))
+        self.event(5)
+        code, _ = self.drain()
+        self.assertEqual((code, self.left()), (0, []))
+        self.assertEqual(self.attempts(self.deferred), [1])
 
     def test_rejected_after_too_many_attempts(self):
         f = self.event(5)
@@ -1726,3 +1775,4 @@ class Queue(unittest.TestCase):
 
 
 Queue.real_intake = staticmethod(iwb.cmd_intake)
+Queue.real_analyze = staticmethod(iwb.cmd_analyze)

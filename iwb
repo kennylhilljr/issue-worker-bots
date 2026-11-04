@@ -5,7 +5,8 @@
   iwb tick --from-queue DIR
       The same steps for just the issues named by event files in DIR (one JSON file per GitHub event, written by
       OpenClaw's github-event-router). Each issue is handled once per run however many files it has. Nothing stays
-      in DIR: a handled issue's files are deleted; one that failed or waits for a later pass has its files moved to
+      in DIR except issues held back only by a per-pass limit, which the next run (a minute later) takes first: a
+      handled issue's files are deleted; one that failed or waits out a delay has its files moved to
       DIR-deferred with an "attempts" count (the next plain tick moves them back; after 24 attempts they go to
       DIR-rejected); anything that can never be handled (another file, bad JSON, a pull request, a repository the
       bots aren't installed on) goes to DIR-rejected. Exits 1 if an issue failed. Both forms of tick skip with a
@@ -58,14 +59,22 @@ def log(msg):
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
 
 
-# What this process left for a later pass: issues it could not read or post to, or that hit a per-pass limit, and
-# the runs each step spent. `tick --from-queue` keeps those issues' queue files and shares the limits across issues.
+# What this process left for a later pass, and the runs each step spent. PENDING: issues it could not read or post
+# to, or that wait out a delay; `tick --from-queue` moves their queue files to the deferred folder. HELD: issues
+# that only hit a per-pass limit; their queue files stay where they are for the next run. SPENT shares the limits
+# across the issues of one queue run.
 PENDING = set()
+HELD = set()
 SPENT = {"intake": 0, "analyze": 0, "approve": 0, "code": 0}
 
 
 def later(key, msg):
     PENDING.add(key)
+    log(f"{key}: {msg}")
+
+
+def held(key, msg):
+    HELD.add(key)
     log(f"{key}: {msg}")
 
 
@@ -255,7 +264,7 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None):
                 log(f"{key}: qualifies ({reason}), but {WORKERS[agent]}-gh is not registered or installed here")
                 continue
             if picked >= limit:
-                later(key, f"qualifies ({reason}); waits for the next pass (limit {limit})")
+                held(key, f"qualifies ({reason}); waits for the next pass (limit {limit})")
                 continue
             picked += 1
             SPENT["intake"] += 1
@@ -545,6 +554,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None):
         if "agent" not in entry or paused or only is not None and key not in only:
             continue
         if time.time() - entry.get("analysis_failed_at", 0) < RETRY_AFTER:
+            PENDING.add(key)                  # waiting out a model failure; a queued event retries later
             continue
         repo, number = key.rsplit("#", 1)
         try:
@@ -610,7 +620,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None):
         if not why:
             continue
         if runs >= limit:
-            later(key, f"analysis ({why}) waits for the next pass (limit {limit})")
+            held(key, f"analysis ({why}) waits for the next pass (limit {limit})")
             continue
         runs += 1
         SPENT["analyze"] += 1
@@ -985,6 +995,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None):
         if a.get("decision") != "plan" or entry.get("blocked") or entry.get("closed") or not entry.get("plan_file"):
             continue
         if time.time() - entry.get("approval_failed_at", 0) < RETRY_AFTER:
+            PENDING.add(key)
             continue                                   # a model failure (limit, outage) retries after an hour
         units = json.loads(Path(entry["plan_file"]).read_text())["units"]
         digest = plan_digest(units)
@@ -1020,7 +1031,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None):
             if level == "full":
                 model = {**model, "effort": "high"}
             if runs >= limit:
-                later(key, f"approval waits for the next pass (limit {limit})")
+                held(key, f"approval waits for the next pass (limit {limit})")
                 continue
         work = None
         try:
@@ -1669,6 +1680,7 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
                 step = "interrupted"
             elif time.time() - entry.get("work_failed_at", 0) < RETRY_AFTER:
                 step = None                 # the last try failed for a reason outside the plan (outage, setup)
+                PENDING.add(key)
             elif current and w.get("status") == "pushed":
                 step = "pr"                 # pushed, but the PR wasn't finished: continue from the branch
             else:
@@ -1678,8 +1690,11 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
             if step == "code":
                 busy = sum(1 for e in state.values() if isinstance(e, dict) and not e.get("blocked")
                            and (e.get("work") or {}).get("status") == "in-progress")
-                if runs >= limit or busy >= IN_PROGRESS_LIMIT:
-                    later(key, "coding waits for the next pass")
+                if runs >= limit:
+                    held(key, f"coding waits for the next pass (limit {limit})")
+                    continue
+                if busy >= IN_PROGRESS_LIMIT:     # other issues are being coded; that can take hours
+                    later(key, f"coding waits until fewer than {IN_PROGRESS_LIMIT} issues are being coded")
                     continue
             try:
                 issue = gh_json(["api", f"repos/{repo}/issues/{number}", "--jq",
@@ -1847,7 +1862,8 @@ def cmd_drain(queue_dir):
         log(f"queue: another tick is running; {len(entries)} entr{'ies' if len(entries) != 1 else 'y'} wait")
         return 0
     PENDING.clear()
-    SPENT.update(dict.fromkeys(SPENT, 0))
+    HELD.clear()
+    SPENT.update(dict.fromkeys(SPENT, 0))   # a fresh budget, so the first issue of every run is never limit-held
     deferred, rejected = sibling(q, "deferred"), sibling(q, "rejected")
     groups, failed, events = {}, set(), []
     try:
@@ -1901,18 +1917,27 @@ def cmd_drain(queue_dir):
             except (Exception, SystemExit) as e:
                 failed.add(key)
                 log(f"{key}: queued event failed while coding: {e!r}")
+    if groups and set(groups) <= HELD - failed - PENDING:
+        # Can't happen with a fresh budget, but a run that only holds files back would leave the queue as it was
+        # and launchd would start it again forever; defer instead.
+        log("queue: every issue was held by a limit; deferring them")
+        PENDING.update(groups)
     for key, fs in groups.items():
         for f, ev in fs:
             if key in failed:
                 defer(f, ev, deferred, rejected, "failed")
             elif key in PENDING:
-                defer(f, ev, deferred, rejected, "waits for a later pass")
+                defer(f, ev, deferred, rejected, "will retry later")
+            elif key in HELD:
+                pass                      # only a per-pass limit: stays in the queue for the next run, a minute on
             else:
                 f.unlink(missing_ok=True)
     later_keys = sorted(set(groups) & (failed | PENDING))
-    done = len(groups) - len(later_keys)
+    held_keys = sorted(set(groups) & HELD - failed - PENDING)
+    done = len(groups) - len(later_keys) - len(held_keys)
     log(f"queue pass done: {done} issue{'s' if done != 1 else ''} handled"
-        + (f"; deferred: {', '.join(later_keys)}" if later_keys else ""))
+        + (f"; deferred: {', '.join(later_keys)}" if later_keys else "")
+        + (f"; left in the queue for the next run: {', '.join(held_keys)}" if held_keys else ""))
     return 1 if failed else 0
 
 

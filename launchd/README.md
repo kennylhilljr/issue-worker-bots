@@ -7,15 +7,15 @@ These two plists are a proposal and are not installed by anything in this reposi
 | `com.kennylhilljr.issue-intake-queue` | `iwb tick --from-queue ~/.local/state/github-events/iwb` | Whenever the queue folder has files (`QueueDirectories`), at most once a minute (`ThrottleInterval` 60), and once at load |
 | `com.kennylhilljr.issue-intake` | `iwb tick` | Every hour (`StartInterval` 3600), as a backstop for missed events |
 
-OpenClaw's github-event-router writes one JSON file per GitHub issue event into the queue folder. launchd relaunches the queue job for as long as that folder holds any entry, so each run empties it into three places:
+OpenClaw's github-event-router writes one JSON file per GitHub issue event into the queue folder. launchd relaunches the queue job for as long as that folder holds any entry, so each run deletes or moves out everything except issues held back by a per-pass limit, and a run's first issue is never held back:
 
 | Folder | Contents |
 | --- | --- |
-| `~/.local/state/github-events/iwb/` | Watched by the queue job. New events only. |
-| `~/.local/state/github-events/iwb-deferred/` | Events of issues that failed or wait for a later pass, with an `attempts` count. The hourly job moves them back into the queue after its scan. |
+| `~/.local/state/github-events/iwb/` | Watched by the queue job. New events, and the untouched events of issues that only hit a per-pass limit. |
+| `~/.local/state/github-events/iwb-deferred/` | Events of issues that failed, hit a failed GitHub read or post, or are waiting out the hour after a model failure, with an `attempts` count. The hourly job moves them back into the queue after its scan. |
 | `~/.local/state/github-events/iwb-rejected/` | Events that can never be handled, entries that aren't regular `.json` files (such as `.DS_Store`), and events deferred 24 times. |
 
-Handled events are deleted. A failing issue is therefore retried once an hour and rejected after about a day. A burst of events larger than the per-pass limits (one analysis per run) also waits for the hourly job, so it drains about one analysis an hour. Nothing empties `iwb-rejected/`: check it now and then, and delete what you have read. If the queue job finds the hourly job holding `tick.lock`, it leaves the queue as it is and exits 0, and launchd starts it again a minute later. Both jobs log to `~/Library/Logs/issue-intake.log`.
+Handled events are deleted. A failing issue is retried once an hour and rejected after about a day. A burst of events larger than the per-pass limits (one analysis per run) drains one run at a time: the issues a run couldn't reach stay in the queue, and launchd starts the next run after `ThrottleInterval`, about a minute later. Each run starts with a fresh budget, so it always gets through at least one issue. Nothing empties `iwb-rejected/`: check it now and then, and delete what you have read. If the queue job finds the hourly job holding `tick.lock`, it leaves the queue as it is and exits 0, and launchd starts it again a minute later. Both jobs log to `~/Library/Logs/issue-intake.log`.
 
 The paths are absolute because launchd does not expand `~`. `PATH` and `HOME` are copied from the plist that `install-intake.sh` wrote on this machine; if Python, `gh` or the CLIs move, update both files.
 

@@ -115,15 +115,15 @@ Log: `~/Library/Logs/issue-intake.log`. State: `~/.config/issue-worker-bots/stat
 
 ### Event-driven intake (proposed)
 
-OpenClaw's github-event-router can drop one JSON file per GitHub issue event into `~/.local/state/github-events/iwb/`. `iwb tick --from-queue <folder>` runs the steps of `tick` for just the issues named there, reading each issue fresh from GitHub. launchd starts the queue job again for as long as the folder holds anything, so every run empties it, using two folders next to it:
+OpenClaw's github-event-router can drop one JSON file per GitHub issue event into `~/.local/state/github-events/iwb/`. `iwb tick --from-queue <folder>` runs the steps of `tick` for just the issues named there, reading each issue fresh from GitHub. launchd starts the queue job again, at most once a minute, for as long as the folder holds anything. Every run deletes or moves out everything except issues held back by a per-pass limit, and a run's first issue is never held back. It uses two folders next to the queue:
 
 | Folder | What goes there |
 | --- | --- |
-| `~/.local/state/github-events/iwb/` | New events from the router. Emptied by every queue run. |
-| `~/.local/state/github-events/iwb-deferred/` | Files of an issue whose handling failed (the run exits 1) or that waits for a later pass (a failed GitHub read, the one-analysis-per-pass limit; exit 0). Each move adds 1 to an `attempts` field in the file. The hourly `tick` moves them back into the queue after its scan. |
+| `~/.local/state/github-events/iwb/` | New events from the router, and the untouched files of issues that only hit a per-pass limit (one analysis per run, for example). Those are taken first on the next run. |
+| `~/.local/state/github-events/iwb-deferred/` | Files of an issue whose handling failed (the run exits 1), or that hit a failed GitHub read or post or is waiting out the hour after a model failure (exit 0). Each move adds 1 to an `attempts` field in the file. The hourly `tick` moves them back into the queue after its scan. |
 | `~/.local/state/github-events/iwb-rejected/` | Anything that can never be handled: bad JSON, no valid repo or issue number, a pull request, a repository the bots aren't installed on, any entry that isn't a regular `.json` file (`.DS_Store`, folders, symlinks), and files deferred 24 times. Nothing reads or clears this folder; look through it and empty it by hand now and then. |
 
-Handled issues' files are deleted. An empty or missing queue folder exits 0 without a log line. Because deferred files wait for the hourly `tick`, a burst of new issues larger than the per-pass limits is worked through about one analysis an hour, not one a minute. Plain `tick` reads the queue folder from `IWB_QUEUE_DIR`, with the path above as the default.
+Handled issues' files are deleted. An empty or missing queue folder exits 0 without a log line. A burst of new issues larger than the per-pass limits drains one run at a time, about a minute apart: each run starts with a fresh budget, so its first issue always goes through, and the issues it couldn't reach stay in the queue for the next run. Plain `tick` reads the queue folder from `IWB_QUEUE_DIR`, with the path above as the default.
 
 [`launchd/`](launchd/README.md) holds the proposed jobs: a queue job that launchd starts whenever the folder has files, and the full-scan `tick` slowed to once an hour as a backstop. They are not installed by `install-intake.sh`; the steps and the rollback are in `launchd/README.md`.
 
