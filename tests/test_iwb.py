@@ -1472,11 +1472,16 @@ class Queue(unittest.TestCase):
         self.wait = set()      # (step, key) that leave the issue for a later pass after an error
         self.hold = set()      # (step, key) held back only by a per-pass limit
         for step in ("intake", "analyze", "approve", "code"):
-            setattr(iwb, f"cmd_{step}", lambda *a, _s=step, only=None, **kw: self.fake_step(_s, only))
+            setattr(iwb, f"cmd_{step}", lambda *a, _s=step, only=None, **kw: self.fake_step(_s, only, kw.get("repo")))
+        self.passes = []       # (step, repo) for repository-wide passes (only=None): plain tick and sweeps
         self.n = 0
 
-    def fake_step(self, step, only):
+    def fake_step(self, step, only, repo=None):
         self.calls.append((step, sorted(only) if only is not None else None))
+        if only is None:
+            self.passes.append((step, repo))
+            if (step, "pass") in self.failing:
+                raise self.failing[step, "pass"]
         for key in only or ():
             if (step, key) in self.failing:
                 raise self.failing[step, key]
@@ -1525,6 +1530,13 @@ class Queue(unittest.TestCase):
                 "analysis": {"decision": "plan", "at": 1, "digest": iwb.issue_digest({"title": "t", "body": "b"})},
                 "approval": {"verdict": "approve", "plan_digest": iwb.plan_digest(units), "approver": "codex-pr-gh",
                              "at": 1}, **over}
+
+    def sweep(self, repo, name="sweep.json"):
+        f = self.q / name
+        f.write_text(json.dumps({"kind": "sweep", "repo": repo, "received_at": "2026-11-03T14:15:02.123Z",
+                                 "slack_message_id": "1730643302.123456", "slack_channel": "C0CEMPH1L0N",
+                                 "source": "github-event-router", "version": 1}))
+        return f
 
     def save(self, entries):
         iwb.STATE.write_text(json.dumps({f"{self.REPO}#{n}": e for n, e in entries.items()}))
@@ -1798,6 +1810,100 @@ class Queue(unittest.TestCase):
         self.assertEqual(self.drain()[0], 0)
         self.assertEqual(self.left(), [])
 
+    def test_a_sweep_runs_the_full_pass_for_its_repository_and_is_deleted(self):
+        iwb.CONFIG.write_text(json.dumps({"approval_live": True}))
+        self.sweep(self.REPO)
+        code, out = self.drain()
+        self.assertEqual((code, self.left()), (0, []))
+        self.assertEqual(self.passes, [("intake", self.REPO), ("analyze", self.REPO), ("approve", self.REPO)])
+        self.assertIn(f"sweep of {self.REPO}", out)
+
+    def test_a_sweep_without_a_repository_covers_all_of_them(self):
+        self.sweep(None)
+        self.assertEqual(self.drain()[0], 0)
+        self.assertEqual(self.passes, [("intake", None), ("analyze", None)])
+        self.assertEqual(self.left(), [])
+
+    def test_a_sweep_runs_after_the_queued_issues(self):
+        self.event(1)
+        self.sweep(self.REPO)
+        self.drain()
+        self.assertEqual(self.calls, [("intake", [f"{self.REPO}#1"]), ("analyze", [f"{self.REPO}#1"]),
+                                      ("intake", None), ("analyze", None)])
+        self.assertEqual(self.left(), [])
+
+    def test_a_failed_sweep_is_deferred_with_an_attempt(self):
+        self.sweep(self.REPO)
+        self.failing["analyze", "pass"] = RuntimeError("boom")
+        code, _ = self.drain()
+        self.assertEqual((code, self.left(), self.left(self.deferred)), (1, [], ["sweep.json"]))
+        self.assertEqual(self.attempts(self.deferred), [1])
+
+    def test_a_sweep_that_could_not_list_its_repository_failed(self):
+        self.sweep(None)
+        iwb.cmd_intake = lambda only=None, **kw: iwb.mark(self.REPO, "deferred")   # what a listing failure records
+        self.assertEqual(self.drain()[0], 1)
+        self.assertEqual(self.left(self.deferred), ["sweep.json"])
+
+    def test_a_sweep_of_an_unknown_or_invalid_repository_is_rejected(self):
+        self.sweep("someone/else")
+        self.sweep(5, name="sweep.1.json")
+        self.assertEqual(self.drain()[0], 0)
+        self.assertEqual((self.left(), self.passes), ([], []))
+        self.assertEqual(self.left(self.rejected), ["sweep.1.json", "sweep.json"])
+
+    def test_a_sweep_hands_ready_issues_to_coding_and_never_codes(self):
+        iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
+        self.save({7: self.approved(7)})
+        self.sweep(self.REPO)
+        self.assertEqual(self.drain()[0], 0)
+        self.assertNotIn("code", [s for s, _ in self.calls])
+        (handoff,) = self.cq.iterdir()
+        ev = json.loads(handoff.read_text())
+        self.assertEqual((ev["repo"], ev["number"], ev["event"], ev["stage"]), (self.REPO, 7, "sweep", "code"))
+
+    def test_a_sweep_never_changes_the_outcome_of_queued_events(self):
+        self.event(1)
+        self.sweep(None)
+        iwb.cmd_analyze = lambda only=None, **kw: None if only else iwb.mark(f"{self.REPO}#1", "failed")
+        self.assertEqual(self.drain()[0], 0)
+        self.assertEqual((self.left(), self.left(self.deferred)), ([], []))
+
+    def test_unusable_deferred_or_rejected_folders_are_refused_untouched(self):
+        f = self.event(1)
+        (self.q / ".DS_Store").write_text("x")
+        self.rejected.write_text("not a folder")
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self.drain()[0], 2)
+        self.rejected.unlink()
+        elsewhere = Path(self.tmp.name, "elsewhere")
+        elsewhere.mkdir()
+        self.rejected.symlink_to(elsewhere)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self.drain()[0], 2)
+        self.rejected.unlink()
+        self.deferred.symlink_to(elsewhere)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self.drain()[0], 2)
+        self.code_event(3)
+        self.cdeferred.write_text("x")
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self.code_drain()[0], 2)
+        self.assertEqual(self.left(), sorted([".DS_Store", f.name]))
+        self.assertEqual(list(elsewhere.iterdir()), [])
+        self.assertEqual(self.calls, [])
+
+    def test_the_hourly_requeue_skips_a_symlinked_deferred_folder(self):
+        elsewhere = Path(self.tmp.name, "elsewhere")
+        elsewhere.mkdir()
+        (elsewhere / "a.json").write_text("{}")
+        self.deferred.symlink_to(elsewhere)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            iwb.main(["tick"])
+        self.assertEqual((self.left(), [f.name for f in elsewhere.iterdir()]), ([], ["a.json"]))
+        self.assertIn("is a symlink", out.getvalue())
+
     def test_the_hourly_requeue_also_checks_the_folder(self):
         Path(self.tmp.name, iwb.QUEUE_MARKER).unlink()
         self.deferred.mkdir()
@@ -1985,6 +2091,57 @@ class QueueRealSteps(Queue):
             self.assertIn(f"waiting: {self.KEY}", out)
             self.backstop()                                           # the hourly tick puts it back
             self.assertEqual(len(self.left(self.cq)), 1)
+
+    def test_a_stale_plan_goes_back_to_the_issue_queue_instead_of_being_coded(self):
+        # regression (Codex review of #12, P1): a comment that arrived after the hand-off was written did not stop
+        # the code queue from implementing the older approved plan
+        iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
+        self.save({5: self.approved(5)})
+        handoff = self.code_event(5)
+        self.comments[5] = [{"user": OWNER, "body": "Wait, the API changed.", "at": "2026-11-03T14:00:00Z"}]
+        code, out = self.code_drain()
+        self.assertEqual(code, 0)
+        self.assertNotIn("code", [s for s, _ in self.calls])          # not coded
+        self.assertFalse(handoff.exists())
+        (back,) = self.q.iterdir()
+        ev = json.loads(back.read_text())
+        self.assertEqual((ev["repo"], ev["number"], ev["kind"], ev["event"]), (self.REPO, 5, "issue", "stale-plan"))
+        self.assertNotIn("stage", ev)
+        self.assertEqual(list(Path(self.tmp.name, ".tmp").iterdir()), [])
+        self.assertIn("out of date (reply after plan)", out)
+
+    def test_a_current_plan_is_coded_and_an_edited_issue_is_not(self):
+        iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
+        self.save({5: self.approved(5)})
+        self.code_event(5)
+        self.assertEqual(self.code_drain()[0], 0)
+        self.assertIn(("code", [self.KEY]), self.calls)
+        self.calls.clear()
+        self.save({5: self.approved(5, analysis={"decision": "plan", "at": 1, "digest": "an-older-body"})})
+        self.code_event(5)
+        self.code_drain()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(len(self.left()), 1)
+
+    def test_a_failed_re_read_before_coding_is_deferred(self):
+        iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
+        self.save({5: self.approved(5)})
+        self.code_event(5)
+        iwb.prbot.gh_read = lambda args: (_ for _ in ()).throw(SystemExit(1))
+        self.assertEqual(self.code_drain()[0], 0)
+        self.assertEqual((self.calls, self.attempts(self.cdeferred)), ([], [1]))
+
+    def test_hand_offs_carry_the_installed_repository_name(self):
+        # regression (Codex review of #12, P2): a hand-off kept the event's casing, so the code queue found no
+        # state for KennyLHillJr/Demo#3 and dropped it
+        iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
+        self.save({3: self.approved(3)})
+        self.event(3, repo="KennyLHillJr/Demo")
+        self.assertEqual(self.drain()[0], 0)
+        (handoff,) = self.cq.iterdir()
+        self.assertEqual(json.loads(handoff.read_text())["repo"], self.REPO)
+        self.code_drain()
+        self.assertIn(("code", [f"{self.REPO}#3"]), self.calls)
 
     def test_a_coding_failure_is_deferred_in_the_code_queue_and_requeued(self):
         iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
