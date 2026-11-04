@@ -2,6 +2,29 @@
 """iwb: issue worker bots. Step 2 of DESIGN.md: intake only.
 
   iwb tick                  what launchd runs: intake, then analyze, then approve and code when switched on
+  iwb tick --from-queue DIR
+      Intake, analysis and approval for just the issues named by event files in DIR (one JSON file per GitHub
+      event, written by OpenClaw's github-event-router), each once per run however many files it has. Once a stage
+      holds, defers or fails an issue, its later stages skip it this run. An issue ready to code is handed to the
+      code queue (DIR-code) instead of being coded here. Nothing stays in DIR except issues held back only by a
+      per-pass limit, which the next run (a minute later) takes first: a handled issue's files are deleted; one
+      that failed or waits has its files moved to DIR-deferred (the next plain tick moves them back; 24 counted
+      attempts send them to DIR-rejected); other files, symlinks and events that can never be handled go to
+      DIR-rejected, folders and symlinks as whole entries (a link is never followed). Sweep events (any file with
+      kind "sweep") together run one full intake, analysis and approval pass for their repositories, or for all
+      of them when one has repo null, after the queued issues; the files claimed are deleted once the pass ran, deferred if it
+      failed, and a sweep that arrives during the pass waits for the next run. DIR must
+      be the default folder or sit in a folder holding a .github-events-queue file, and DIR-deferred and
+      DIR-rejected must be absent or real folders, else exit 2. Exits 1 if an issue failed. Both forms of tick
+      skip with a log line while the other one holds the lock. Plain tick reads the queue folder from
+      IWB_QUEUE_DIR (default ~/.local/state/github-events/iwb).
+  iwb code --from-queue DIR
+      Step 4b for the issues handed off in DIR (default ~/.local/state/github-events/iwb-code), with the same
+      deferred and rejected folders. A coding lock held by another pass defers the event without counting it.
+      Right before new coding starts (here, in plain tick and in iwb code, under work.lock), the issue and its
+      trusted comments are read again; if the issue changed since the approved
+      plan was analyzed, the state entry is marked stale_plan (no approval or coding anywhere until a new
+      analysis), an event goes back to the issue queue, and nothing is coded.
   iwb code [--dry-run]
       Step 4b: for one plan that step 4a approved, in a repository listed in config.json "coding_repos": an
       orchestrator run in iwb's own clone, one commit by the worker bot on bot/<n>-<slug>-<attempt>, and a draft PR marked
@@ -20,8 +43,8 @@
 
 Sign-in, tokens and repository lists come from prbot (PRBOT_PATH, default ../pr-review-bots/prbot).
 """
-import calendar, copy, datetime, hashlib, importlib.util, json, os, pwd, re, shlex, shutil, signal, subprocess, sys, \
-    tempfile, time
+import calendar, copy, datetime, hashlib, importlib.util, json, os, pwd, re, shlex, shutil, signal, stat, subprocess, \
+    sys, tempfile, time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -49,9 +72,98 @@ def log(msg):
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
 
 
+# Per-issue outcome of the steps this process ran, for `tick --from-queue`; an issue with no entry was handled.
+#   held     only a per-pass limit stopped it: its queue files stay for the next run
+#   waiting  capacity or a delay (coding lock busy, other issues being coded, the hour after a model failure): its
+#            files go to the deferred folder without counting an attempt
+#   deferred a GitHub read failed: deferred, counting an attempt
+#   failed   the step itself failed (model, post, push): deferred, counting an attempt, and the run exits 1
+#   rejected the event can never be handled here (its number is a pull request): moved to the rejected folder
+# The worst outcome a step reports for an issue wins. SPENT shares the per-pass limits across one queue run.
+OUTCOME = {}
+OUTCOME_RANK = {"held": 1, "waiting": 2, "deferred": 3, "failed": 4, "rejected": 5}
+SPENT = {"intake": 0, "analyze": 0, "approve": 0, "code": 0}
+
+
+def mark(key, outcome, msg=None):
+    if OUTCOME_RANK[outcome] > OUTCOME_RANK.get(OUTCOME.get(key), 0):
+        OUTCOME[key] = outcome
+    if msg:
+        log(f"{key}: {msg}")
+
+
+def parse_state_file():
+    """(contents, None), or (None, why it is unusable)."""
+    if not STATE.exists():
+        return {}, None
+    try:
+        data = json.loads(STATE.read_text())
+    except ValueError as e:
+        return None, f"not valid JSON ({e})"
+    if not isinstance(data, dict):
+        return None, f"not a JSON object ({type(data).__name__})"
+    return data, None
+
+
+class state_lock:
+    """Hold state.lock: every pass takes it from reading the state file to replacing it."""
+    def __enter__(self):
+        import fcntl
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(state_lock_path(), "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        self.f.close()
+
+
+def read_state_file(locked=False):
+    """The state file's contents. A file that isn't a JSON object is moved aside to state.json.corrupt-<UTC time>
+    and the pass starts empty, but only after reading it again while holding state.lock: another pass may have just
+    replaced it with a good one. Pass locked=True when the caller already holds the lock. The picked-up marker
+    comments keep intake from picking issues up twice after a reset."""
+    data, why = parse_state_file()
+    if why is None:
+        return data
+    if locked:
+        return quarantine_state(why)
+    with state_lock():
+        data, why = parse_state_file()
+        return data if why is None else quarantine_state(why)
+
+
+def quarantine_state(why):
+    """Move the unusable state file aside. Call only while holding state.lock."""
+    base = f"{STATE.name}.corrupt-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+    dest, n = STATE.parent / base, 1
+    while dest.exists():
+        dest, n = STATE.parent / f"{base}.{n}", n + 1
+    try:
+        os.replace(STATE, dest)
+    except FileNotFoundError:
+        pass
+    log(f"state: {STATE} was {why}; moved to {dest}, starting empty")
+    return {}
+
+
+def write_atomic(path, text):
+    """Write a file through a temporary file in the same folder and a rename, so a reader never sees half of it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def load_state():
     """(state, snapshot): the state to change, and a deep copy as loaded for save_state to diff against."""
-    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    state = read_state_file()
     return state, copy.deepcopy(state)
 
 
@@ -81,11 +193,8 @@ def save_state(state, since):
     """Write what this pass changed since `since` onto the file as it is now, atomically, under a lock every pass
     takes from read to rename. A pass can run for hours; saving its whole stale copy would undo what another pass
     wrote meanwhile."""
-    import fcntl
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    with open(state_lock_path(), "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        disk = merge_changes(json.loads(STATE.read_text()) if STATE.exists() else {}, since, state)
+    with state_lock():
+        disk = merge_changes(read_state_file(locked=True), since, state)
         fd, tmp = tempfile.mkstemp(dir=STATE.parent, prefix=".state.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
@@ -178,7 +287,21 @@ def pick_up(repo, issue, agent, reason):
     return run_gh_as(bot, repo, ["issue", "comment", str(issue["number"]), "-R", repo, "--body", body])
 
 
-def cmd_intake(dry_run=False, baseline=False, limit=LIMIT):
+def queued_issues(repo, only):
+    """The open issues (not pull requests) among `only` ("owner/repo#n" keys) in this repository, read one by one."""
+    found = []
+    for key in sorted(k for k in only if k.rsplit("#", 1)[0] == repo):
+        i = gh_json(["api", f"repos/{repo}/issues/{key.rsplit('#', 1)[1]}"])[0]
+        if i.get("pull_request"):
+            mark(key, "rejected", "is a pull request, not an issue; the worker bots leave pull requests alone")
+        elif i.get("state") == "open":
+            found.append(i)
+    return found
+
+
+def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None, repo_filter=None, listed=None):
+    """`only`: a set of "owner/repo#n" keys to look at instead of every open issue (tick --from-queue).
+    `listed`: a dict this pass fills with repository -> whether its issues could be read (a sweep's own record)."""
     state, since = load_state()
     if read_config().get("paused") and not baseline:
         log("paused in config.json; nothing picked up")
@@ -191,12 +314,24 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT):
     bot_logins = {cfg[b]["slug"] + "[bot]" for b in bots}
     installed = {b: prbot.installed_repos(b) for b in bots}
     picked = 0
-    for repo in sorted(set().union(*installed.values())):
+    repos = set().union(*installed.values())
+    if only is not None:
+        repos &= {k.rsplit("#", 1)[0] for k in only}
+    if repo_filter is not None:           # a sweep limited to one repository
+        repos &= {repo_filter}
+    for repo in sorted(repos):
         try:
-            issues = open_issues(repo)
+            issues = open_issues(repo) if only is None else queued_issues(repo, only)
         except SystemExit:
             log(f"{repo}: could not list issues; skipping this pass")
+            if listed is not None:
+                listed[repo] = False
+            for k in (only or ()):
+                if k.rsplit("#", 1)[0] == repo:
+                    mark(k, "deferred")
             continue
+        if listed is not None:
+            listed[repo] = True
         for issue in issues:
             key = f"{repo}#{issue['number']}"
             if key in state:
@@ -213,16 +348,17 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT):
                     state[key] = {"picked_up_at": time.time(), "note": "found an earlier pick-up comment"}
                     continue
             except SystemExit:
-                log(f"{key}: could not read the issue; will retry")
+                mark(key, "deferred", "could not read the issue; will retry")
                 continue
             agent = choose_agent(issue, state)
             if WORKERS[agent] not in bots or repo not in installed[WORKERS[agent]]:
                 log(f"{key}: qualifies ({reason}), but {WORKERS[agent]}-gh is not registered or installed here")
                 continue
             if picked >= limit:
-                log(f"{key}: qualifies ({reason}); waits for the next pass (limit {limit})")
+                mark(key, "held", f"qualifies ({reason}); waits for the next pass (limit {limit})")
                 continue
             picked += 1
+            SPENT["intake"] += 1
             if dry_run:
                 state["_last_agent"] = agent   # not saved; keeps the alternation honest in the preview
                 log(f"{key}: would be picked up by {WORKERS[agent]}-gh ({reason}): {issue['title'][:70]}")
@@ -230,7 +366,7 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT):
             try:
                 url = pick_up(repo, issue, agent, reason)
             except RuntimeError as e:
-                log(f"{key}: pick-up failed, will retry: {e}")
+                mark(key, "failed", f"pick-up failed, will retry: {e}")
                 continue
             state[key] = {"agent": agent, "picked_up_at": time.time(), "comment": url}
             state["_last_agent"] = agent
@@ -451,6 +587,8 @@ def needs_analysis(entry, comments, trusted, digest, edited_at=None):
     a = entry.get("analysis")
     if a is None:
         return entry.pop("reason", "new")
+    if entry.get("stale_plan"):
+        return "plan out of date"         # the code queue found a newer comment or edit; only a new analysis clears it
     if a.get("digest") and a["digest"] != digest:
         return "issue edited"
     if not a.get("digest"):
@@ -495,7 +633,7 @@ def command_reply(cmd, entry, slug):
     return "There's no code change planned here. Describe the change you want and I'll plan it."
 
 
-def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
+def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo_filter=None):
     state, since = load_state()
     paused = read_config().get("paused", False)
     cfg = prbot.load_config()
@@ -506,15 +644,17 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
     approver_logins = {cfg[b]["slug"] + "[bot]" for b in ("claude", "codex") if b in cfg}   # the review bots
     runs = 0
     for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
-        if "agent" not in entry or paused:
+        if "agent" not in entry or paused or only is not None and key not in only \
+                or repo_filter is not None and not key.startswith(repo_filter + "#"):
             continue
         if time.time() - entry.get("analysis_failed_at", 0) < RETRY_AFTER:
+            mark(key, "waiting")              # the hour after a model failure; a queued event retries later
             continue
         repo, number = key.rsplit("#", 1)
         try:
             issue, comments, text = issue_text(repo, number, trusted, bot_logins, approver_logins)
         except SystemExit:
-            log(f"{key}: could not read the issue; will retry")
+            mark(key, "deferred", "could not read the issue; will retry")
             continue
         if issue["state"] != "open":
             entry["closed"] = True
@@ -558,7 +698,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
                         run_gh_as(bot, repo, ["issue", "edit", str(number), "-R", repo, "--add-label", "bot:stop"])
                     url = run_gh_as(bot, repo, ["issue", "comment", str(number), "-R", repo, "--body", body])
                 except RuntimeError as e:
-                    log(f"{key}: could not answer '{cmd}', will retry: {e}")
+                    mark(key, "failed", f"could not answer '{cmd}', will retry: {e}")
                     continue
                 entry["handled_at"] = iso_epoch(new[-1]["at"])
                 log(f"{key}: answered '{cmd}' {url}")
@@ -568,15 +708,16 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
             try:
                 edited_at = last_edited(repo, number)
             except (SystemExit, ValueError, IndexError, KeyError):
-                log(f"{key}: could not read when the issue was edited; will retry")
+                mark(key, "deferred", "could not read when the issue was edited; will retry")
                 continue
         why = needs_analysis(entry, comments, trusted, digest, edited_at)
         if not why:
             continue
         if runs >= limit:
-            log(f"{key}: analysis ({why}) waits for the next pass (limit {limit})")
+            mark(key, "held", f"analysis ({why}) waits for the next pass (limit {limit})")
             continue
         runs += 1
+        SPENT["analyze"] += 1
         agent, bot = entry["agent"], WORKERS[entry["agent"]]
         model = analysis_model(agent)["model"]
         log(f"{key}: analyzing with {model} ({why})")
@@ -588,7 +729,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
             answer = parse_answer(run_model(agent, prompt, text, f"{work}/repo"))
         except (RuntimeError, subprocess.SubprocessError, SystemExit) as e:
             entry["analysis_failed_at"] = time.time()
-            log(f"{key}: analysis could not run; retrying in {RETRY_AFTER // 60} minutes: {e}")
+            mark(key, "failed", f"analysis could not run; retrying in {RETRY_AFTER // 60} minutes: {e}")
             continue
         except ValueError as e:
             entry["attempts"] = entry.get("attempts", 0) + 1
@@ -601,6 +742,8 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
                 entry["blocked"] = True
                 prbot.openclaw_attention(f"blocked: {repo}#{number}",
                                          {"url": url, "title": issue["title"], "worker": slug, "problem": str(e)})
+            else:
+                mark(key, "deferred")         # the next pass asks the model again
             continue
         finally:
             if work:
@@ -621,8 +764,9 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT):
         if answer["decision"] == "plan":
             PLANS_DIR.mkdir(parents=True, exist_ok=True)
             plan_file = PLANS_DIR / f"{repo.replace('/', '__')}__{number}.json"
-            plan_file.write_text(json.dumps({"units": answer["units"]}, indent=1) + "\n")
+            write_atomic(plan_file, json.dumps({"units": answer["units"]}, indent=1) + "\n")
             entry["plan_file"] = str(plan_file)
+        entry.pop("stale_plan", None)        # a fresh analysis replaces the out-of-date plan
         entry["analysis"] = {"decision": answer["decision"], "at": time.time(), "model": model, "comment": url,
                              "digest": digest}
         tell_openclaw(repo, number, issue["title"], slug, model, answer, url)
@@ -931,7 +1075,7 @@ def send_back(entry, key, repo, number, worker, issue, digest, problems):
         log(f"{key}: blocked after a revision {url}")
 
 
-def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
+def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo_filter=None):
     """Step 4a for planned issues: policy gate, red check, then approval by the other agent's review bot."""
     state, since = load_state()
     if read_config().get("paused"):
@@ -943,12 +1087,21 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
     runs = 0
     for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
         a = entry.get("analysis") or {}
+        if only is not None and key not in only or repo_filter is not None and not key.startswith(repo_filter + "#"):
+            continue
         if a.get("decision") != "plan" or entry.get("blocked") or entry.get("closed") or not entry.get("plan_file"):
             continue
+        if entry.get("stale_plan"):
+            continue                                   # out of date: no approval until a new analysis
         if time.time() - entry.get("approval_failed_at", 0) < RETRY_AFTER:
+            mark(key, "waiting")
             continue                                   # a model failure (limit, outage) retries after an hour
-        units = json.loads(Path(entry["plan_file"]).read_text())["units"]
-        digest = plan_digest(units)
+        try:
+            units = json.loads(Path(entry["plan_file"]).read_text())["units"]
+            digest = plan_digest(units)
+        except PLAN_ERRORS as e:
+            mark(key, "failed", f"could not read the plan file {entry['plan_file']}: {e!r}")
+            continue
         done = entry.get("approval") or {}
         if done.get("plan_digest") == digest or done.get("source_digest") == digest:
             continue                                   # this exact plan was already judged
@@ -981,7 +1134,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
             if level == "full":
                 model = {**model, "effort": "high"}
             if runs >= limit:
-                log(f"{key}: approval waits for the next pass (limit {limit})")
+                mark(key, "held", f"approval waits for the next pass (limit {limit})")
                 continue
         work = None
         try:
@@ -1008,6 +1161,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
                 log(f"{key}: approved by rule, no model {url}")
                 continue
             runs += 1                          # only a model review counts against the per-pass limit
+            SPENT["approve"] += 1
             log(f"{key}: red check and {level} approval by {slug} with {model['model']} ({model['effort']} effort)")
             red = red_check(units, f"{work}/repo")
             _, _, text = issue_text(repo, number, trusted, bot_logins)   # the same issue text the planner saw
@@ -1017,7 +1171,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
             v = parse_verdict(run_model(approver_agent, prompt, stdin, f"{work}/repo", model=model))
         except (RuntimeError, subprocess.SubprocessError, SystemExit, ValueError) as e:
             entry["approval_failed_at"] = time.time()
-            log(f"{key}: approval could not finish; will retry: {e}")
+            mark(key, "failed", f"approval could not finish; will retry: {e}")
             continue
         finally:
             if work:
@@ -1032,7 +1186,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT):
             continue
         if v["verdict"] == "approve":
             units = apply_verdict(units, v)
-            Path(entry["plan_file"]).write_text(json.dumps({"units": units}, indent=1) + "\n")
+            write_atomic(entry["plan_file"], json.dumps({"units": units}, indent=1) + "\n")
             url = post(reviewer, repo, number, body, "bot:approved")
             entry["approval"] = {"verdict": "approve", "level": level, "plan_digest": plan_digest(units), "source_digest": digest,
                                  "approver": f"{slug}", "model": model["model"], "at": time.time(), "comment": url}
@@ -1549,7 +1703,7 @@ def finish_pr(key, entry, issue, state, since):
             rec["ready"] = True
     except RuntimeError as e:
         entry["work_failed_at"] = time.time()
-        log(f"{key}: pull request for `{w['branch']}` not finished; retrying in {RETRY_AFTER // 60} minutes: {e}")
+        mark(key, "failed", f"pull request for `{w['branch']}` not finished; retrying in {RETRY_AFTER // 60} minutes: {e}")
         return
     for old in entry["branches"]:
         if old is not rec and old.get("pr") and not old.get("closed"):
@@ -1566,16 +1720,18 @@ def finish_pr(key, entry, issue, state, since):
                             f"{rec['pr']}", "bot:pr-open")
     except RuntimeError as e:       # still "pushed": the next try skips the steps above that are done
         entry["work_failed_at"] = time.time()
-        log(f"{key}: could not label the issue bot:pr-open; retrying in {RETRY_AFTER // 60} minutes: {e}")
+        mark(key, "failed", f"could not label the issue bot:pr-open; retrying in {RETRY_AFTER // 60} minutes: {e}")
         return
     w.update(status="pr-open", done_at=time.time())
 
 
-def work_lock():
-    """One step-4b pass at a time, so a manual `iwb code` never mistakes a running pass for an interrupted one."""
+def work_lock(name="work.lock"):
+    """One step-4b pass at a time, so a manual `iwb code` never mistakes a running pass for an interrupted one.
+    `tick.lock` does the same for the intake, analysis and approval part of `tick`, in both of its modes. None if
+    another process holds the lock."""
     import fcntl
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    f = open(WORK_DIR / "work.lock", "w")
+    f = open(WORK_DIR / name, "w")
     try:
         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -1584,16 +1740,34 @@ def work_lock():
     return f
 
 
+PLAN_ERRORS = (OSError, ValueError, KeyError, TypeError)   # a plan file that is missing, unreadable or malformed
+
+
 def approved_plan(entry):
-    """(approval record, units) when main's step 4a approved the plan file as it is now, else (None, None)."""
+    """(approval record, units) when main's step 4a approved the plan file as it is now, else (None, None). Raises
+    one of PLAN_ERRORS when an approved plan's file is missing or malformed: that needs attention, not silence."""
     ap = entry.get("approval") or {}
-    if ap.get("verdict") != "approve" or not entry.get("plan_file") or not Path(entry["plan_file"]).exists():
+    if ap.get("verdict") != "approve" or not entry.get("plan_file"):
         return None, None
     units = json.loads(Path(entry["plan_file"]).read_text())["units"]
     return (ap, units) if ap.get("plan_digest") == plan_digest(units) else (None, None)
 
 
-def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None):
+def needs_coding(entry):
+    """Whether step 4b has anything to do for this state entry: a plan step 4a approved as it is now, not yet turned
+    into a PR or blocked. cmd_code decides the rest; this keeps other issues out of coding waits and hand-offs.
+    Raises one of PLAN_ERRORS when the plan file can't be read; callers treat that as a failure of that issue."""
+    if not isinstance(entry, dict) or entry.get("blocked") or entry.get("closed") or entry.get("stale_plan") \
+            or (entry.get("analysis") or {}).get("decision") != "plan":
+        return False
+    ap, _ = approved_plan(entry)
+    if not ap:
+        return False
+    w = entry.get("work") or {}
+    return not (w.get("plan_digest") == ap["plan_digest"] and w.get("status") in ("pr-open", "blocked"))
+
+
+def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
     """Step 4b: code plans that step 4a approved, in repositories listed in config.json "coding_repos"."""
     ecc = ecc or run_ecc
     conf = read_config()
@@ -1603,15 +1777,32 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None):
     lock = work_lock()
     if lock is None:
         log("another coding pass is running; skipping")
+        if only:                          # only issues that have coding to do wait for the lock
+            state = read_state_file()
+            for key in only:
+                try:
+                    if needs_coding(state.get(key)):
+                        mark(key, "waiting")
+                except PLAN_ERRORS as e:
+                    mark(key, "failed", f"could not read the plan file: {e!r}")
         return 0
     state, since = load_state()
     coding = set(conf.get("coding_repos", []))
     runs = 0
     try:
         for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
+            if only is not None and key not in only:
+                continue
             if entry.get("blocked") or entry.get("closed") or (entry.get("analysis") or {}).get("decision") != "plan":
                 continue
-            ap, units = approved_plan(entry)
+            if entry.get("stale_plan"):
+                log(f"{key}: the approved plan is out of date; not coding until a new analysis")
+                continue
+            try:
+                ap, units = approved_plan(entry)
+            except PLAN_ERRORS as e:
+                mark(key, "failed", f"could not read the plan file {entry.get('plan_file')}: {e!r}")
+                continue
             if not ap:
                 continue
             w = entry.get("work") or {}
@@ -1625,6 +1816,7 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None):
                 step = "interrupted"
             elif time.time() - entry.get("work_failed_at", 0) < RETRY_AFTER:
                 step = None                 # the last try failed for a reason outside the plan (outage, setup)
+                mark(key, "waiting")
             elif current and w.get("status") == "pushed":
                 step = "pr"                 # pushed, but the PR wasn't finished: continue from the branch
             else:
@@ -1634,14 +1826,17 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None):
             if step == "code":
                 busy = sum(1 for e in state.values() if isinstance(e, dict) and not e.get("blocked")
                            and (e.get("work") or {}).get("status") == "in-progress")
-                if runs >= limit or busy >= IN_PROGRESS_LIMIT:
-                    log(f"{key}: coding waits for the next pass")
+                if runs >= limit:
+                    mark(key, "held", f"coding waits for the next pass (limit {limit})")
+                    continue
+                if busy >= IN_PROGRESS_LIMIT:     # other issues are being coded; that can take hours
+                    mark(key, "waiting", f"coding waits until fewer than {IN_PROGRESS_LIMIT} issues are being coded")
                     continue
             try:
                 issue = gh_json(["api", f"repos/{repo}/issues/{number}", "--jq",
                                  "{state, title, labels: [.labels[].name]}"])[0]
             except SystemExit:
-                log(f"{key}: could not read the issue; will retry")
+                mark(key, "deferred", "could not read the issue; will retry")
                 continue
             if issue["state"] != "open" or "bot:stop" in issue["labels"]:
                 continue
@@ -1649,6 +1844,11 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None):
             if dry_run:
                 log(f"{key}: would {step}")
                 continue
+            # Only "code" runs the coder and pushes. "interrupted" never resumes: it blocks the issue, and removing
+            # bot:blocked clears the analysis, so the plan is analyzed again. "pr" opens the PR for a branch already
+            # pushed; from then on feedback goes to the PR.
+            if step == "code" and not plan_still_current(key, entry, QUEUE_DIR):
+                continue                    # read again under work.lock: a newer comment or edit sends it back
             if step == "note":
                 try:
                     run_gh_as(bot, repo, ["issue", "comment", number, "-R", repo, "--body",
@@ -1656,7 +1856,7 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None):
                                           f"waits here. It is coded once the repository is in `coding_repos`."])
                     entry["coding_note"] = ap["plan_digest"]
                 except RuntimeError as e:
-                    log(f"{key}: could not post the coding note, will retry: {e}")
+                    mark(key, "failed", f"could not post the coding note, will retry: {e}")
                 continue
             try:
                 if step == "interrupted":
@@ -1667,18 +1867,537 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None):
                     finish_pr(key, entry, issue, state, since)
                     continue
                 runs += 1
+                SPENT["code"] += 1
                 entry["work"] = {"status": "approved", "plan_digest": ap["plan_digest"], "approver": ap["approver"],
                                  "approved_at": ap["at"], "approval_comment": ap.get("comment", "")}
                 code_plan(key, entry, issue, state, since, ecc)
             except (RuntimeError, subprocess.SubprocessError, SystemExit, OSError) as e:
                 entry["work_failed_at"] = time.time()
-                log(f"{key}: {step} could not run; retrying in {RETRY_AFTER // 60} minutes: {e}")
+                mark(key, "failed", f"{step} could not run; retrying in {RETRY_AFTER // 60} minutes: {e}")
     finally:
         if not dry_run:
             save_state(state, since)
         lock.close()
     log(f"coding pass done: {runs} run{'s' if runs != 1 else ''}")
     return 0
+
+
+def cmd_tick():
+    """The full scan: intake, then analysis, then 4a and 4b when switched on. Coding runs after tick.lock is
+    released, under its own lock. After the scan, deferred queue files go back into their queues so the queue jobs
+    check them again."""
+    lock = work_lock("tick.lock")
+    if lock is None:
+        log("another tick is running; skipping this one")
+        return 0
+    try:
+        cmd_intake()
+        cmd_analyze()
+        if read_config().get("approval_live"):   # step 4a joins the scheduled job only once switched on
+            cmd_approve()
+        requeue_deferred(QUEUE_DIR, QUEUE_DEFAULT)
+        requeue_deferred(sibling(QUEUE_DIR, "code"), CODE_QUEUE_DEFAULT)
+    finally:
+        lock.close()
+    if read_config().get("coding_live"):         # step 4b too, separately
+        return cmd_code()
+    return 0
+
+
+# ---------- the event queues: tick --from-queue and code --from-queue ----------
+# launchd's QueueDirectories relaunches a job while its folder has any entry at all, so nothing may stay there after
+# a run: an issue's files are deleted once handled, moved to <queue>-deferred when it failed or waits (the hourly
+# tick moves them back), and anything that can never be handled goes to <queue>-rejected, left for a person to clear.
+# Issues held back only by a per-pass limit stay for the next run, a minute later. The issue queue does intake,
+# analysis and approval; an issue that is ready to code is handed to the code queue, whose job runs the coding.
+EVENTS_ROOT = Path.home() / ".local" / "state" / "github-events"
+QUEUE_DEFAULT = EVENTS_ROOT / "iwb"
+CODE_QUEUE_DEFAULT = EVENTS_ROOT / "iwb-code"
+QUEUE_DIR = Path(os.environ.get("IWB_QUEUE_DIR", QUEUE_DEFAULT))
+QUEUE_MARKER = ".github-events-queue"   # a regular file in a queue folder's parent: it holds event queues
+QUEUE_MAX_ATTEMPTS = 24     # counted deferrals before an event file is rejected
+REPO_NAME = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+")   # GitHub owners have no dots
+
+
+def sibling(d, what):
+    """<parent>/<name>-<what>: next to the queue folder, never inside it."""
+    return d.parent / f"{d.name}-{what}"
+
+
+def queue_dir_problem(d, default):
+    """Why `d` must not be drained, or None. Accepted: the default folder, or a folder whose parent holds a regular
+    QUEUE_MARKER file. Refused: a symlink, a file, anything else. A missing folder is fine: there is nothing in it."""
+    if d.is_symlink():
+        return f"{d} is a symlink"
+    if not d.exists():
+        return None
+    if not d.is_dir():
+        return f"{d} is not a directory"
+    real = Path(os.path.realpath(d))
+    if real == Path(os.path.realpath(default)):
+        return None
+    marker = real.parent / QUEUE_MARKER
+    if marker.is_file() and not marker.is_symlink():
+        return None
+    return f"{d} is not {default}, and {real.parent} has no {QUEUE_MARKER} file marking it as an event queue"
+
+
+def dest_problem(d):
+    """Why `d` can't take moved or written events, or None: it must be absent or a real folder, never a symlink or a
+    file (checked with lstat, so a link is never followed)."""
+    try:
+        st = os.lstat(d)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        return f"{d} is a symlink"
+    if not stat.S_ISDIR(st.st_mode):
+        return f"{d} is not a directory"
+    return None
+
+
+def drain_problem(q, default):
+    """queue_dir_problem for the queue, then dest_problem for its deferred and rejected folders."""
+    for problem in (queue_dir_problem(q, default), dest_problem(sibling(q, "deferred")),
+                    dest_problem(sibling(q, "rejected"))):
+        if problem:
+            return problem
+    return None
+
+
+def utc_stamp():
+    t = time.time()
+    return time.strftime("%Y%m%dT%H%M%S", time.gmtime(t)) + f"{int(t * 1000) % 1000:03d}Z"
+
+
+def is_event_file(f):
+    return f.name.endswith(".json") and not f.name.startswith(".") and f.is_file() and not f.is_symlink()
+
+
+def free_name(dest, name):
+    """dest/name, or dest/<stem>.<n><ext> when that is taken."""
+    stem, ext = os.path.splitext(name)
+    target, n = dest / name, 1
+    while target.exists() or target.is_symlink():
+        target, n = dest / f"{stem}.{n}{ext}", n + 1
+    return target
+
+
+def move_out(f, dest, why):
+    """Move a queue entry by renaming it: a file, a folder with its contents, or a symlink as the link itself (a
+    rename never follows it)."""
+    dest.mkdir(parents=True, exist_ok=True)
+    target = free_name(dest, f.name)
+    os.replace(f, target)
+    log(f"queue: {f.name}: {why}; moved to {target}")
+
+
+def write_event(dest, name, ev, tmp_dir):
+    """Write an event file into `dest` atomically: a temporary file in `tmp_dir` (same filesystem), then a rename."""
+    for d in (dest, tmp_dir):
+        problem = dest_problem(d)
+        if problem:
+            raise OSError(problem)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=tmp_dir, prefix=".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(json.dumps(ev) + "\n")
+        target = free_name(dest, name)
+        os.replace(tmp, target)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return target
+
+
+def defer(f, ev, deferred, rejected, why, count=True):
+    """Move an event file to the deferred folder, written atomically. With `count` its "attempts" count goes up by
+    one, and at QUEUE_MAX_ATTEMPTS it goes to the rejected folder instead; capacity waits pass count=False."""
+    dest = deferred
+    if count:
+        n = ev.get("attempts")
+        ev = {**ev, "attempts": (n if type(n) is int and n >= 0 else 0) + 1}
+        if ev["attempts"] >= QUEUE_MAX_ATTEMPTS:
+            dest = rejected
+    target = write_event(dest, f.name, ev, dest)
+    f.unlink(missing_ok=True)
+    if dest == rejected:
+        log(f"queue: {f.name}: {why}, attempt {ev['attempts']} of {QUEUE_MAX_ATTEMPTS}; gave up, moved to {target}")
+    elif count:
+        log(f"queue: {f.name}: {why}, attempt {ev['attempts']}; moved to {target} until the hourly tick")
+    else:
+        log(f"queue: {f.name}: {why}, not counted as an attempt; moved to {target} until the hourly tick")
+
+
+def requeue_deferred(queue, default):
+    """The hourly tick's part: put deferred event files back in the queue so the queue job retries them."""
+    problem = drain_problem(queue, default)
+    if problem:
+        log(f"queue: not moving deferred events back: {problem}")
+        return
+    deferred = sibling(queue, "deferred")
+    if not queue.is_dir() or not deferred.is_dir() or deferred.is_symlink():
+        return
+    moved = 0
+    try:
+        for f in sorted(deferred.iterdir()):
+            if is_event_file(f):
+                os.replace(f, free_name(queue, f.name))
+                moved += 1
+    except OSError as e:
+        log(f"queue: could not move deferred events back: {e}")
+    if moved:
+        log(f"queue: {moved} deferred event file{'s' if moved != 1 else ''} moved back to {queue}")
+
+
+def read_event(f):
+    """The event as a dict, or None if it can never be handled (bad JSON, no valid repo or issue number). A sweep
+    ({"kind": "sweep", "repo": "owner/name" or null}) has no number."""
+    try:
+        ev = json.loads(f.read_text())
+        if isinstance(ev, dict) and ev.get("kind") == "sweep":
+            repo = ev.get("repo")
+            return ev if repo is None or isinstance(repo, str) and REPO_NAME.fullmatch(repo) else None
+        repo, number = ev["repo"], ev["number"]
+    except (ValueError, KeyError, TypeError, IndexError):
+        return None
+    if not isinstance(repo, str) or not REPO_NAME.fullmatch(repo) or type(number) is not int or number < 1:
+        return None
+    return ev
+
+
+def queue_events(q, rejected):
+    """[(file, event)] from the queue folder, oldest first. Every other entry goes to `rejected` by renaming the
+    entry itself: other files, unreadable or invalid events, folders (moved whole, contents untouched) and
+    symlinks (the link moves; its target is never followed or touched). Only call this on a folder that passed
+    queue_dir_problem."""
+    events = []
+    for e in sorted(q.iterdir()):
+        if e.is_symlink():
+            move_out(e, rejected, "a symlink")
+        elif e.is_dir():
+            move_out(e, rejected, "a folder")
+        elif not e.is_file():
+            move_out(e, rejected, "not a regular file")
+        elif not is_event_file(e):
+            move_out(e, rejected, "not a .json event file")
+        else:
+            try:
+                ev = read_event(e)
+            except OSError as err:
+                move_out(e, rejected, f"could not read ({err})")
+                continue
+            if ev is None:
+                move_out(e, rejected, "not valid JSON with a repo and an issue number")
+            else:
+                events.append((e, ev))
+    return events
+
+
+def refuse(problem):
+    print(f"iwb: refusing to drain the queue: {problem}", file=sys.stderr, flush=True)
+    return 2
+
+
+def settle(groups, deferred, rejected, what):
+    """Act on each grouped issue's OUTCOME: delete (handled), leave (held), or defer. Exits 1 if one failed."""
+    if groups and all(OUTCOME.get(k) == "held" for k in groups):
+        # Can't happen with a fresh budget, but a run that only holds files back would leave the queue as it was
+        # and launchd would start it again forever; defer instead.
+        log(f"{what}: every issue was held by a limit; deferring them")
+        OUTCOME.update(dict.fromkeys(groups, "waiting"))
+    why = {"failed": "failed", "deferred": "will retry later", "waiting": "waits for capacity, a pause or a delay"}
+    for key, fs in groups.items():
+        outcome = OUTCOME.get(key)
+        for f, ev in fs:
+            if outcome is None:
+                f.unlink(missing_ok=True)
+            elif outcome == "rejected":
+                move_out(f, rejected, f"{key} can't be handled here")
+            elif outcome != "held":       # held: only a per-pass limit, stays in the queue for the next run
+                defer(f, ev, deferred, rejected, why[outcome], count=outcome != "waiting")
+    by = {o: sorted(k for k in groups if OUTCOME.get(k) == o)
+          for o in ("failed", "deferred", "waiting", "held", "rejected")}
+    done = sum(1 for k in groups if k not in OUTCOME)
+    log(f"{what} pass done: {done} issue{'s' if done != 1 else ''} handled"
+        + "".join(f"; {o}: {', '.join(ks)}" for o, ks in by.items() if ks))
+    return 1 if by["failed"] else 0
+
+
+def hand_off_to_coding(code_q, name, ev):
+    """Write a coding hand-off for this issue into the code queue: the same event with "stage": "code"."""
+    root = code_q.parent
+    root.mkdir(parents=True, exist_ok=True)
+    marker = root / QUEUE_MARKER
+    if not marker.exists() and not marker.is_symlink():
+        marker.touch()
+    problem = queue_dir_problem(code_q, CODE_QUEUE_DEFAULT)
+    if problem:
+        raise OSError(problem)
+    out = {k: v for k, v in ev.items() if k != "attempts"}
+    out["stage"] = "code"
+    return write_event(code_q, name, out, root / ".tmp")
+
+
+def iso_now():
+    t = time.time()
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + f".{int(t * 1000) % 1000:03d}Z"
+
+
+def iwb_event(repo, number, event):
+    """(file name, event) for an event iwb writes itself, in the router's format."""
+    name = f"{utc_stamp()}-iwb-{repo.replace('/', '__')}-issue-{number}-{event}.json"
+    return name, {"repo": repo, "kind": "issue", "number": int(number), "event": event, "received_at": iso_now(),
+                  "source": "iwb", "version": 1}
+
+
+def hand_off_ready(q, keys, handed):
+    """Hand every issue in `keys` that is ready to code, has no outcome this run and wasn't handed off yet, to the
+    code queue. `keys` maps a state key to the (file name, event) to send."""
+    state = read_state_file()
+    for key, (name, ev) in keys.items():
+        if key in OUTCOME or key in handed:
+            continue
+        try:
+            if not needs_coding(state.get(key)):
+                continue
+        except PLAN_ERRORS as e:
+            mark(key, "failed", f"could not read the plan file: {e!r}")
+            continue
+        try:
+            target = hand_off_to_coding(sibling(q, "code"), name, ev)
+            handed.add(key)
+            log(f"{key}: ready to code; handed to the code queue as {target}")
+        except (OSError, ValueError) as e:
+            mark(key, "failed", f"could not hand the issue to the code queue: {e}")
+
+
+def sweep_pass(q, scope, groups, handed):
+    """A sweep from the router: the hourly tick's intake, analysis and approval, for the repositories in `scope`
+    (None: all of them), sharing what is left of this run's per-pass limits with the queued events; issues that
+    are ready to code get hand-offs. Returns (ran, held): ran is True when nothing raised and every repository
+    could be listed; held is True when a per-pass limit stopped some of its work, so the sweep stays queued for
+    the next run. Per-issue failures inside the pass are left to those issues' own retries, as in the hourly
+    tick, and never change the outcome of this run's queued events."""
+    before = {k: OUTCOME.get(k) for k in groups}
+    seen = set(OUTCOME)
+    ok, listed = True, {}                 # listed: this sweep's own record of which repositories it could read
+    try:
+        for r in scope or [None]:
+            cmd_intake(limit=LIMIT - SPENT["intake"], repo_filter=r, listed=listed)
+            cmd_analyze(limit=ANALYZE_LIMIT - SPENT["analyze"], repo_filter=r)
+            if read_config().get("approval_live"):
+                cmd_approve(limit=APPROVE_LIMIT - SPENT["approve"], repo_filter=r)
+    except (Exception, SystemExit) as e:
+        ok = False
+        log(f"queue: sweep failed: {e!r}")
+    unlisted = [r for r in (scope or []) if not listed.get(r)] + [r for r, good in listed.items() if not good]
+    if not listed and ok:
+        unlisted = ["every repository"]   # nothing could be listed at all (no worker bot, nothing installed)
+    unlisted = sorted(set(unlisted))
+    if unlisted:
+        ok = False
+        log(f"queue: sweep could not list {', '.join(sorted(unlisted))}")
+    if ok and read_config().get("coding_live"):
+        state = read_state_file()
+        ready = {k: iwb_event(*k.rsplit("#", 1), "sweep") for k in state
+                 if "#" in k and k not in groups and (scope is None or k.rsplit("#", 1)[0] in scope)}
+        hand_off_ready(q, ready, handed)
+    held = any(v == "held" for k, v in OUTCOME.items() if k not in seen and k not in groups)
+    for k, v in before.items():           # the sweep never changes what happens to this run's queued events
+        if v is None:
+            OUTCOME.pop(k, None)
+        else:
+            OUTCOME[k] = v
+    return ok, held
+
+
+def cmd_drain(queue_dir):
+    """`tick --from-queue DIR`: intake, analysis and approval for each issue that has event files in DIR. Once a
+    stage records an outcome for an issue (held, waiting, deferred, failed) the later stages skip it in this run.
+    An issue that is ready to code is handed to the code queue (DIR-code). Sweep events (kind "sweep") run the
+    full pass after the queued issues. Exits 1 if an issue or a sweep failed, 2 if DIR or its deferred or rejected
+    folder can't be used."""
+    q = Path(queue_dir).expanduser()
+    problem = drain_problem(q, QUEUE_DEFAULT)
+    if problem:
+        return refuse(problem)
+    entries = sorted(q.iterdir()) if q.is_dir() else []
+    if not entries:
+        return 0
+    lock = work_lock("tick.lock")
+    if lock is None:      # the other job is running and holds the lock; launchd starts this one again shortly
+        log(f"queue: another tick is running; {len(entries)} entr{'ies' if len(entries) != 1 else 'y'} wait")
+        return 0
+    OUTCOME.clear()
+    SPENT.update(dict.fromkeys(SPENT, 0))   # a fresh budget, so the first issue of every run is never limit-held
+    deferred, rejected = sibling(q, "deferred"), sibling(q, "rejected")
+    groups, sweeps, swept, sweep_held, paused = {}, [], True, False, False
+    try:
+        events = queue_events(q, rejected)
+        if not events:
+            return 0
+        try:
+            cfg = prbot.load_config()
+            repos = {r.lower(): r for b in WORKERS.values() if b in cfg for r in prbot.installed_repos(b)}
+        except (Exception, SystemExit) as e:
+            log(f"queue: could not list the worker repositories: {e!r}")
+            for f, ev in events:
+                defer(f, ev, deferred, rejected, "worker repositories unknown")
+            return 1
+        for f, ev in events:
+            if ev.get("kind") == "sweep":
+                if ev.get("repo") is not None and ev["repo"].lower() not in repos:
+                    move_out(f, rejected, f"sweep of {ev['repo']}, which is not a worker repository")
+                else:
+                    sweeps.append((f, ev))
+            elif ev.get("kind") != "issue":
+                move_out(f, rejected, "not an issue")
+            elif ev["repo"].lower() not in repos:
+                move_out(f, rejected, f"{ev['repo']} is not a worker repository")
+            else:
+                groups.setdefault(f"{repos[ev['repo'].lower()]}#{ev['number']}", []).append((f, ev))
+        paused = read_config().get("paused")
+        if paused:                        # nothing runs, and nothing is lost: everything waits for the unpause
+            log("queue: paused in config.json; queued events wait in the deferred folder")
+            OUTCOME.update(dict.fromkeys(groups, "waiting"))
+        for key in [] if paused else groups:
+            try:
+                cmd_intake(limit=LIMIT - SPENT["intake"], only={key})
+                if key not in OUTCOME:
+                    cmd_analyze(limit=ANALYZE_LIMIT - SPENT["analyze"], only={key})
+                if key not in OUTCOME and read_config().get("approval_live"):
+                    cmd_approve(limit=APPROVE_LIMIT - SPENT["approve"], only={key})
+            except (Exception, SystemExit) as e:
+                mark(key, "failed", f"queued event failed: {e!r}")
+        handed = set()
+        if read_config().get("coding_live") and not paused:
+            # the hand-off carries the installed repository's own name, which the state key uses
+            hand_off_ready(q, {k: (fs[-1][0].name, {**fs[-1][1], "repo": k.rsplit("#", 1)[0]})
+                               for k, fs in groups.items()}, handed)
+        if sweeps and not paused:
+            scope = None if any(ev.get("repo") is None for _, ev in sweeps) else \
+                sorted({repos[ev["repo"].lower()] for _, ev in sweeps})
+            log(f"queue: sweep of {', '.join(scope) if scope else 'every repository'}")
+            swept, sweep_held = sweep_pass(q, scope, groups, handed)
+            if swept and sweep_held:
+                log("queue: the sweep hit a per-pass limit; it stays queued for the next run")
+    finally:
+        lock.close()
+    rc = settle(groups, deferred, rejected, "queue")
+    for f, ev in sweeps:
+        if paused:
+            defer(f, ev, deferred, rejected, "sweep waits for the unpause", count=False)
+        elif not swept:
+            defer(f, ev, deferred, rejected, "sweep failed")
+        elif not sweep_held:              # held: left in the queue untouched, like a limit-held issue
+            f.unlink(missing_ok=True)
+    return 1 if sweeps and not swept else rc
+
+
+def mark_plan_stale(key, why):
+    """Record on the issue's state entry, under state.lock, that its approved plan is out of date. Approval and
+    coding refuse such an entry on every path, and analysis treats it as needing a new analysis, which clears it."""
+    state, since = load_state()
+    entry = state.get(key)
+    if not isinstance(entry, dict):
+        return
+    entry["stale_plan"] = {"at": time.time(), "reason": why}
+    save_state(state, since)
+
+
+def plan_still_current(key, entry, intake_q):
+    """Read the issue again right before coding it. True: the approved plan is current, go ahead. False: don't code
+    now. Either the issue couldn't be read (marked deferred), or the plan is out of date: then stale_plan is
+    recorded under state.lock first, so no path approves or codes it until a new analysis, and an event goes
+    back to the issue queue `intake_q`."""
+    try:
+        why = plan_is_stale(key, entry)
+    except (Exception, SystemExit) as e:
+        mark(key, "deferred", f"could not read the issue again before coding: {e!r}")
+        return False
+    if not why:
+        return True
+    if why == CLOSED:
+        log(f"{key}: not coded: the issue was closed")
+        return False                      # handled: nothing to code, nothing to send back
+    try:
+        mark_plan_stale(key, why)
+    except (Exception, SystemExit) as e:
+        mark(key, "failed", f"plan is out of date ({why}) but could not record that: {e!r}")
+        return False
+    try:
+        problem = queue_dir_problem(intake_q, QUEUE_DEFAULT)
+        if problem:
+            raise OSError(problem)
+        target = write_event(intake_q, *iwb_event(*key.rsplit("#", 1), "stale-plan"), intake_q.parent / ".tmp")
+        log(f"{key}: not coded: the approved plan is out of date ({why}); sent back to {target}")
+    except (OSError, ValueError) as e:
+        mark(key, "failed", f"plan is out of date ({why}) but could not go back to the issue queue: {e}")
+    return False
+
+
+CLOSED = "issue closed"
+
+
+def plan_is_stale(key, entry):
+    """Why an approved plan must not be coded now, or None. Reads the issue and its comments again: an edit to the
+    title or body, or a trusted comment after the analysis, means it needs analysis first (needs_analysis)."""
+    cfg = prbot.load_config()
+    owner = cfg[next(b for b in WORKERS.values() if b in cfg)]["owner"]
+    bot_logins = {cfg[b]["slug"] + "[bot]" for b in WORKERS.values() if b in cfg}
+    approver_logins = {cfg[b]["slug"] + "[bot]" for b in ("claude", "codex") if b in cfg}
+    repo, number = key.rsplit("#", 1)
+    trusted = trusted_openers(owner)
+    issue, comments, _ = issue_text(repo, number, trusted, bot_logins, approver_logins)
+    if issue["state"] != "open":
+        return CLOSED                     # closed since cmd_code's first read: stop, never code it
+    a = entry.get("analysis") or {}
+    edited_at = last_edited(repo, number) if a and not a.get("digest") else None   # as cmd_analyze does
+    return needs_analysis(copy.deepcopy(entry), comments, trusted, issue_digest(issue), edited_at)
+
+
+def cmd_code_drain(queue_dir):
+    """`code --from-queue DIR`: step 4b for each issue handed off in DIR by the issue queue. Same folders and
+    outcomes: DIR-deferred, DIR-rejected; a coding lock held elsewhere is an uncounted wait. cmd_code reads the
+    issue again under work.lock before coding; if it changed since its plan was analyzed, the plan is marked
+    stale_plan, an event goes back to the issue queue (IWB_QUEUE_DIR), and the hand-off counts as handled."""
+    q = Path(queue_dir).expanduser()
+    problem = drain_problem(q, CODE_QUEUE_DEFAULT)
+    if problem:
+        return refuse(problem)
+    entries = sorted(q.iterdir()) if q.is_dir() else []
+    if not entries:
+        return 0
+    OUTCOME.clear()
+    SPENT.update(dict.fromkeys(SPENT, 0))
+    deferred, rejected = sibling(q, "deferred"), sibling(q, "rejected")
+    groups = {}
+    for f, ev in queue_events(q, rejected):
+        if ev.get("kind") != "issue" or ev.get("stage") != "code":
+            move_out(f, rejected, "not a coding hand-off")
+        else:
+            groups.setdefault(f"{ev['repo']}#{ev['number']}", []).append((f, ev))
+    if not groups:
+        return 0
+    if read_config().get("paused"):       # before anything else: a pause never loses a hand-off
+        log("code queue: paused in config.json; hand-offs wait in the deferred folder")
+        OUTCOME.update(dict.fromkeys(groups, "waiting"))
+        return settle(groups, deferred, rejected, "code queue")
+    if not read_config().get("coding_live"):
+        log("code queue: coding_live is off; hand-offs dropped")
+        for fs in groups.values():
+            for f, _ in fs:
+                f.unlink(missing_ok=True)
+        return 0
+    for key in groups:
+        try:                              # cmd_code reads the issue again under work.lock before coding it
+            cmd_code(limit=CODE_LIMIT - SPENT["code"], only={key})
+        except (Exception, SystemExit) as e:
+            mark(key, "failed", f"coding hand-off failed: {e!r}")
+    return settle(groups, deferred, rejected, "code queue")
 
 
 def main(argv):
@@ -1694,15 +2413,19 @@ def main(argv):
     if argv[0] == "approve":
         return cmd_approve(dry_run="--dry-run" in argv)
     if argv[0] == "code":
+        if "--from-queue" in argv:
+            i = argv.index("--from-queue") + 1
+            if i >= len(argv) or argv[i].startswith("-"):
+                prbot.die("code --from-queue needs the queue folder")
+            return cmd_code_drain(argv[i])
         return cmd_code(dry_run="--dry-run" in argv)
     if argv[0] == "tick":   # what launchd runs: pick up new issues, then analyze one
-        cmd_intake()
-        cmd_analyze()
-        if read_config().get("approval_live"):   # step 4a joins the scheduled job only once switched on
-            cmd_approve()
-        if read_config().get("coding_live"):     # step 4b too, separately
-            return cmd_code()
-        return 0
+        if "--from-queue" in argv:
+            i = argv.index("--from-queue") + 1
+            if i >= len(argv) or argv[i].startswith("-"):
+                prbot.die("tick --from-queue needs the queue folder")
+            return cmd_drain(argv[i])
+        return cmd_tick()
     prbot.die(f"unknown command '{argv[0]}'")
 
 

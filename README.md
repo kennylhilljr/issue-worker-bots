@@ -111,7 +111,29 @@ Then install the launchd job, which runs `iwb tick` every 5 minutes:
 ./install-intake.sh
 ```
 
-Log: `~/Library/Logs/issue-intake.log`. State: `~/.config/issue-worker-bots/state.json`. Saved plans: `~/.config/issue-worker-bots/plans/`. To remove the job, run `./install-intake.sh --uninstall`.
+Log: `~/Library/Logs/issue-intake.log`. State: `~/.config/issue-worker-bots/state.json`. Saved plans: `~/.config/issue-worker-bots/plans/`. State and plans are written through a temporary file and a rename; a state file that still isn't a JSON object when read again under `state.lock` is moved aside to `state.json.corrupt-<UTC time>` with a log line, and the pass starts empty. An approved plan whose file is missing or malformed fails only that issue; its event is deferred. To remove the job, run `./install-intake.sh --uninstall`.
+
+### Event-driven intake (proposed)
+
+OpenClaw's github-event-router can drop one JSON file per GitHub issue event into `~/.local/state/github-events/iwb/`. `iwb tick --from-queue <folder>` runs intake, analysis and approval for just the issues named there, reading each issue fresh from GitHub. Once a stage holds, defers or fails an issue, the later stages skip it for that run. The queue job never codes: an issue whose approved plan is ready to code (with `coding_live` set) gets a hand-off file, the same event with `"stage": "code"` and the installed repository's own name, in `~/.local/state/github-events/iwb-code/`, and `iwb code --from-queue <folder>` drains that queue under `work.lock`. Right before any new coding starts, on every path (the code job, the hourly `tick`, a manual `iwb code`) and while holding `work.lock`, `iwb` reads the issue and its trusted comments again. An issue closed in the meantime is not coded. If the title or body changed, or a trusted comment came after the analysis, the plan is out of date: `iwb` first records `stale_plan` on the issue's state entry, so approval and coding refuse it on every path (the code job, the hourly `tick`, a manual `iwb code`) until a new analysis clears it. Then it sends an event (`"event": "stale-plan"`) back into the issue queue, which analyzes the issue again; a code-queue hand-off for it is deleted.
+
+When the router sees a post from an allowed GitHub app but can't tell which issue it is about, it writes a sweep request into the issue queue: a uniquely named file such as `sweep-20261103T150000000Z-3fa9c1.json` with `"kind": "sweep"` and `"repo"` set to one repository or null. `iwb` recognizes sweeps by that content, not by the file name. All sweep files a run finds become one pass, and the run deletes exactly those; a sweep that arrives during the pass waits for the next run. A sweep runs the hourly pass (intake, analysis, and approval when `approval_live` is set, sharing whatever is left of the run's per-pass limits after the queued issues) for that repository, or for every repository when `repo` is null, after the run's queued issues. If a limit stops some of the sweep's work, the sweep file stays in the queue untouched and the next run, a minute later, sweeps again. Issues that become ready to code get hand-offs; the sweep never codes. It is deleted once the pass ran, deferred with an attempt when the pass failed or a repository could not be listed, and rejected when it names a repository the bots aren't installed on. A failure of a single issue inside the pass is left to that issue's own retry, as in the hourly `tick`.
+
+launchd starts each queue job again, at most once a minute, for as long as its folder holds anything. Every run deletes or moves out everything except issues held back by a per-pass limit, and a run's first issue is never held back. Each queue has two folders next to it (shown for the issue queue; the code queue's are `iwb-code-deferred/` and `iwb-code-rejected/`):
+
+| Folder | What goes there |
+| --- | --- |
+| `~/.local/state/github-events/iwb/` | New events from the router, and the untouched files of issues that only hit a per-pass limit (one analysis per run, for example). Those are taken first on the next run. |
+| `~/.local/state/github-events/iwb-deferred/` | Files of an issue whose step failed, even when the step caught the error itself (a model, post or push failure; the run exits 1), or whose GitHub read failed (exit 0). Each such move adds 1 to an `attempts` field in the file. Issues waiting for capacity, a pause or a delay also go here, without counting an attempt: every queued event and sweep while `"paused": true` is set in `config.json`, another pass holding `work.lock` (only for an issue that has coding to do), two issues already being coded, the hour after a model failure. The hourly `tick` moves them all back into their queue after its scan. |
+| `~/.local/state/github-events/iwb-rejected/` | Anything that can never be handled: bad JSON, no valid repo or issue number, a pull request (including an issue event whose number turns out to be a pull request), a repository the bots aren't installed on, files deferred 24 times, and every other entry found in the queue: stray files such as `.DS_Store`, folders (moved whole, contents untouched) and symlinks (the link itself moves; its target is never followed or touched). Nothing reads or clears this folder; look through it and empty it by hand now and then. |
+
+Handled issues' files are deleted. An empty or missing queue folder exits 0 without a log line. A burst of new issues larger than the per-pass limits drains one run at a time, about a minute apart: each run starts with a fresh budget, so its first issue always goes through, and the issues it couldn't reach stay in the queue for the next run. Plain `tick` reads the issue queue folder from `IWB_QUEUE_DIR`, with the path above as the default; the code queue is the folder next to it with `-code` added.
+
+A queue folder is only touched if it is the default path, or its parent folder holds a regular file named `.github-events-queue`. The router creates that file in `~/.local/state/github-events/` with every write, and `iwb` creates it when it writes a hand-off. Any other folder, a folder that is a symlink, or a path that is not a folder is refused with exit 2 and left as it is. The same happens when the queue's `-deferred` or `-rejected` folder exists but is a symlink or a file (checked without following links). The hourly requeue skips such a queue with a log line.
+
+[`launchd/`](launchd/README.md) holds the proposed jobs: the issue queue job and the code job, which launchd starts whenever their folders have entries, and the full-scan `tick` slowed to once an hour as a backstop. They are not installed by `install-intake.sh`; the steps and the rollback are in `launchd/README.md`.
+
+Both forms of `tick` take `~/.local/state/issue-worker-bots/tick.lock` (non-blocking) for intake, analysis and approval, so the two jobs never run those steps at once. A run that finds the lock held logs a line and exits 0. A queue run then leaves the folder as it is, since the run holding the lock is active, and launchd starts it again a minute later. Coding, in the code job and in the hourly `tick`, takes `work.lock`, so only one coding pass runs at a time.
 
 ## How an issue is handled
 
@@ -182,6 +204,8 @@ Plans ready, questions posted and blocked issues appear in OpenClaw as `attentio
 | Command | What it does |
 | --- | --- |
 | `iwb tick` | What launchd runs: intake, then one analysis, then step 4a when `approval_live` is set and step 4b when `coding_live` is set. |
+| `iwb tick --from-queue DIR` | Intake, analysis and approval for only the issues named by event files in `DIR`, each once per run; hands issues ready to code to `DIR-code`. Deletes a handled issue's files and moves the rest to `DIR-deferred` or `DIR-rejected`. Exits 1 if an issue failed, 2 if `DIR` is not a queue folder. |
+| `iwb code --from-queue DIR` | Codes the issues handed off in `DIR`, with the same deferred and rejected folders. |
 | `iwb code [--dry-run]` | Codes one approved plan and opens its PR. `--dry-run` prints what it would do. |
 | `iwb intake [--dry-run] [--baseline] [--limit N]` | One pass over open issues; picks up at most N (default 5). `--dry-run` prints and saves nothing; `--baseline` marks the open issues as seen without commenting. |
 | `iwb analyze [--dry-run] [--limit N]` | Analyzes up to N picked-up issues (default 1) and posts a no-code answer, questions or a plan. |
@@ -194,6 +218,7 @@ Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bo
 | --- | --- |
 | `iwb` | The CLI. Standard library only; uses `prbot` for sign-in and tokens. |
 | `install-intake.sh` | Installs the launchd job that runs `iwb tick` every 5 minutes. |
+| `launchd/` | Proposed plists for event-driven intake (issue queue job, code queue job, hourly backstop) and how to install or roll them back. |
 | `bots/` | App specs for `prbot register --spec`, including each App's permissions. |
 | `logos/` | Bot logos: SVG sources and 512 px PNGs uploaded to GitHub. |
 | `docs/assets/` | The README header (SVG source and WebP). |
