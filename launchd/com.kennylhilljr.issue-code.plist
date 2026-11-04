@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.kennylhilljr.issue-code</string>
+  <key>ProgramArguments</key>
+  <array><string>/Library/Frameworks/Python.framework/Versions/3.13/bin/python3</string><string>/Users/bkh223/Documents/GitHub/issue-worker-bots/iwb</string><string>code</string><string>--from-queue</string><string>/Users/bkh223/.local/state/github-events/iwb-code</string></array>
+  <key>WorkingDirectory</key><string>/Users/bkh223/Documents/GitHub/issue-worker-bots</string>
+  <key>QueueDirectories</key>
+  <array><string>/Users/bkh223/.local/state/github-events/iwb-code</string></array>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/bkh223/Library/Logs/issue-code.log</string>
+  <key>StandardErrorPath</key><string>/Users/bkh223/Library/Logs/issue-code.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Library/Frameworks/Python.framework/Versions/3.13/bin:/opt/homebrew/bin:/Users/bkh223/.local/bin:/Users/bkh223/.nvm/versions/node/v24.16.0/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>/Users/bkh223</string>
+  </dict>
+</dict>
+</plist>

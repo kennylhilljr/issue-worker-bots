@@ -115,19 +115,23 @@ Log: `~/Library/Logs/issue-intake.log`. State: `~/.config/issue-worker-bots/stat
 
 ### Event-driven intake (proposed)
 
-OpenClaw's github-event-router can drop one JSON file per GitHub issue event into `~/.local/state/github-events/iwb/`. `iwb tick --from-queue <folder>` runs the steps of `tick` for just the issues named there, reading each issue fresh from GitHub. launchd starts the queue job again, at most once a minute, for as long as the folder holds anything. Every run deletes or moves out everything except issues held back by a per-pass limit, and a run's first issue is never held back. It uses two folders next to the queue:
+OpenClaw's github-event-router can drop one JSON file per GitHub issue event into `~/.local/state/github-events/iwb/`. `iwb tick --from-queue <folder>` runs intake, analysis and approval for just the issues named there, reading each issue fresh from GitHub. Once a stage holds, defers or fails an issue, the later stages skip it for that run, so an approved plan is never coded while a newer comment on it waits for analysis. The queue job never codes: an issue whose approved plan is ready to code (with `coding_live` set) gets a hand-off file, the same event with `"stage": "code"`, in `~/.local/state/github-events/iwb-code/`, and `iwb code --from-queue <folder>` drains that queue under `work.lock`.
+
+launchd starts each queue job again, at most once a minute, for as long as its folder holds anything. Every run deletes or moves out everything except issues held back by a per-pass limit, and a run's first issue is never held back. Each queue has two folders next to it (shown for the issue queue; the code queue's are `iwb-code-deferred/` and `iwb-code-rejected/`):
 
 | Folder | What goes there |
 | --- | --- |
 | `~/.local/state/github-events/iwb/` | New events from the router, and the untouched files of issues that only hit a per-pass limit (one analysis per run, for example). Those are taken first on the next run. |
-| `~/.local/state/github-events/iwb-deferred/` | Files of an issue whose step failed, even when the step caught the error itself (a model, post or push failure; the run exits 1), or whose GitHub read failed (exit 0). Each such move adds 1 to an `attempts` field in the file. Issues waiting for capacity or a delay (another `iwb code` holding `work.lock`, two issues already being coded, the hour after a model failure) also go here, but without counting an attempt. The hourly `tick` moves them all back into the queue after its scan. |
-| `~/.local/state/github-events/iwb-rejected/` | Anything that can never be handled: bad JSON, no valid repo or issue number, a pull request, a repository the bots aren't installed on, any entry that isn't a regular `.json` file (`.DS_Store`, folders, symlinks), and files deferred 24 times. Nothing reads or clears this folder; look through it and empty it by hand now and then. |
+| `~/.local/state/github-events/iwb-deferred/` | Files of an issue whose step failed, even when the step caught the error itself (a model, post or push failure; the run exits 1), or whose GitHub read failed (exit 0). Each such move adds 1 to an `attempts` field in the file. Issues waiting for capacity or a delay also go here, without counting an attempt: another pass holding `work.lock` (only for an issue that has coding to do), two issues already being coded, the hour after a model failure. The hourly `tick` moves them all back into their queue after its scan. |
+| `~/.local/state/github-events/iwb-rejected/` | Anything that can never be handled: bad JSON, no valid repo or issue number, a pull request, a repository the bots aren't installed on, files deferred 24 times, and every other entry found in the queue: stray files such as `.DS_Store`, folders (moved whole, contents untouched) and symlinks (the link itself moves; its target is never followed or touched). Nothing reads or clears this folder; look through it and empty it by hand now and then. |
 
-Handled issues' files are deleted. An empty or missing queue folder exits 0 without a log line. A burst of new issues larger than the per-pass limits drains one run at a time, about a minute apart: each run starts with a fresh budget, so its first issue always goes through, and the issues it couldn't reach stay in the queue for the next run. Plain `tick` reads the queue folder from `IWB_QUEUE_DIR`, with the path above as the default.
+Handled issues' files are deleted. An empty or missing queue folder exits 0 without a log line. A burst of new issues larger than the per-pass limits drains one run at a time, about a minute apart: each run starts with a fresh budget, so its first issue always goes through, and the issues it couldn't reach stay in the queue for the next run. Plain `tick` reads the issue queue folder from `IWB_QUEUE_DIR`, with the path above as the default; the code queue is the folder next to it with `-code` added.
 
-[`launchd/`](launchd/README.md) holds the proposed jobs: a queue job that launchd starts whenever the folder has files, and the full-scan `tick` slowed to once an hour as a backstop. They are not installed by `install-intake.sh`; the steps and the rollback are in `launchd/README.md`.
+A queue folder is only touched if it is the default path, or its parent folder holds a regular file named `.github-events-queue`. The router creates that file in `~/.local/state/github-events/` with every write, and `iwb` creates it when it writes a hand-off. Any other folder, a folder that is a symlink, or a path that is not a folder is refused with exit 2 and left as it is; the hourly requeue skips such a folder with a log line.
 
-Both forms of `tick` take `~/.local/state/issue-worker-bots/tick.lock` (non-blocking) for intake, analysis and approval, so the two jobs never run those steps at once. A run that finds the lock held logs a line and exits 0. A queue run then leaves the folder as it is, since the run holding the lock is active, and launchd starts it again a minute later. Coding takes its own `work.lock` after `tick.lock` is released, so an hours-long coding run doesn't hold up queued events.
+[`launchd/`](launchd/README.md) holds the proposed jobs: the issue queue job and the code job, which launchd starts whenever their folders have entries, and the full-scan `tick` slowed to once an hour as a backstop. They are not installed by `install-intake.sh`; the steps and the rollback are in `launchd/README.md`.
+
+Both forms of `tick` take `~/.local/state/issue-worker-bots/tick.lock` (non-blocking) for intake, analysis and approval, so the two jobs never run those steps at once. A run that finds the lock held logs a line and exits 0. A queue run then leaves the folder as it is, since the run holding the lock is active, and launchd starts it again a minute later. Coding, in the code job and in the hourly `tick`, takes `work.lock`, so only one coding pass runs at a time.
 
 ## How an issue is handled
 
@@ -198,7 +202,8 @@ Plans ready, questions posted and blocked issues appear in OpenClaw as `attentio
 | Command | What it does |
 | --- | --- |
 | `iwb tick` | What launchd runs: intake, then one analysis, then step 4a when `approval_live` is set and step 4b when `coding_live` is set. |
-| `iwb tick --from-queue DIR` | The same steps for only the issues named by event files in `DIR`, each once per run. Deletes a handled issue's files and moves the rest to `DIR-deferred` or `DIR-rejected`. Exits 1 if an issue failed. |
+| `iwb tick --from-queue DIR` | Intake, analysis and approval for only the issues named by event files in `DIR`, each once per run; hands issues ready to code to `DIR-code`. Deletes a handled issue's files and moves the rest to `DIR-deferred` or `DIR-rejected`. Exits 1 if an issue failed, 2 if `DIR` is not a queue folder. |
+| `iwb code --from-queue DIR` | Codes the issues handed off in `DIR`, with the same deferred and rejected folders. |
 | `iwb code [--dry-run]` | Codes one approved plan and opens its PR. `--dry-run` prints what it would do. |
 | `iwb intake [--dry-run] [--baseline] [--limit N]` | One pass over open issues; picks up at most N (default 5). `--dry-run` prints and saves nothing; `--baseline` marks the open issues as seen without commenting. |
 | `iwb analyze [--dry-run] [--limit N]` | Analyzes up to N picked-up issues (default 1) and posts a no-code answer, questions or a plan. |
@@ -211,7 +216,7 @@ Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bo
 | --- | --- |
 | `iwb` | The CLI. Standard library only; uses `prbot` for sign-in and tokens. |
 | `install-intake.sh` | Installs the launchd job that runs `iwb tick` every 5 minutes. |
-| `launchd/` | Proposed plists for event-driven intake (queue job plus hourly backstop) and how to install or roll them back. |
+| `launchd/` | Proposed plists for event-driven intake (issue queue job, code queue job, hourly backstop) and how to install or roll them back. |
 | `bots/` | App specs for `prbot register --spec`, including each App's permissions. |
 | `logos/` | Bot logos: SVG sources and 512 px PNGs uploaded to GitHub. |
 | `docs/assets/` | The README header (SVG source and WebP). |

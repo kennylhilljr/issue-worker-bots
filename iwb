@@ -3,15 +3,20 @@
 
   iwb tick                  what launchd runs: intake, then analyze, then approve and code when switched on
   iwb tick --from-queue DIR
-      The same steps for just the issues named by event files in DIR (one JSON file per GitHub event, written by
-      OpenClaw's github-event-router). Each issue is handled once per run however many files it has. Nothing stays
-      in DIR except issues held back only by a per-pass limit, which the next run (a minute later) takes first: a
-      handled issue's files are deleted; one that failed or waits out a delay has its files moved to
-      DIR-deferred with an "attempts" count (the next plain tick moves them back; after 24 attempts they go to
-      DIR-rejected); anything that can never be handled (another file, bad JSON, a pull request, a repository the
-      bots aren't installed on) goes to DIR-rejected. Exits 1 if an issue failed. Both forms of tick skip with a
-      log line while the other one holds the lock. Plain tick reads the queue folder from IWB_QUEUE_DIR
-      (default ~/.local/state/github-events/iwb).
+      Intake, analysis and approval for just the issues named by event files in DIR (one JSON file per GitHub
+      event, written by OpenClaw's github-event-router), each once per run however many files it has. Once a stage
+      holds, defers or fails an issue, its later stages skip it this run. An issue ready to code is handed to the
+      code queue (DIR-code) instead of being coded here. Nothing stays in DIR except issues held back only by a
+      per-pass limit, which the next run (a minute later) takes first: a handled issue's files are deleted; one
+      that failed or waits has its files moved to DIR-deferred (the next plain tick moves them back; 24 counted
+      attempts send them to DIR-rejected); other files, symlinks and events that can never be handled go to
+      DIR-rejected, folders and symlinks as whole entries (a link is never followed). DIR must be the default folder or sit
+      in a folder holding a .github-events-queue file, else exit 2. Exits 1 if an issue failed. Both forms of tick
+      skip with a log line while the other one holds the lock. Plain tick reads the queue folder from
+      IWB_QUEUE_DIR (default ~/.local/state/github-events/iwb).
+  iwb code --from-queue DIR
+      Step 4b for the issues handed off in DIR (default ~/.local/state/github-events/iwb-code), with the same
+      deferred and rejected folders. A coding lock held by another pass defers the event without counting it.
   iwb code [--dry-run]
       Step 4b: for one plan that step 4a approved, in a repository listed in config.json "coding_repos": an
       orchestrator run in iwb's own clone, one commit by the worker bot on bot/<n>-<slug>-<attempt>, and a draft PR marked
@@ -1688,6 +1693,19 @@ def approved_plan(entry):
     return (ap, units) if ap.get("plan_digest") == plan_digest(units) else (None, None)
 
 
+def needs_coding(entry):
+    """Whether step 4b has anything to do for this state entry: a plan step 4a approved as it is now, not yet turned
+    into a PR or blocked. cmd_code decides the rest; this keeps other issues out of coding waits and hand-offs."""
+    if not isinstance(entry, dict) or entry.get("blocked") or entry.get("closed") \
+            or (entry.get("analysis") or {}).get("decision") != "plan":
+        return False
+    ap, _ = approved_plan(entry)
+    if not ap:
+        return False
+    w = entry.get("work") or {}
+    return not (w.get("plan_digest") == ap["plan_digest"] and w.get("status") in ("pr-open", "blocked"))
+
+
 def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
     """Step 4b: code plans that step 4a approved, in repositories listed in config.json "coding_repos"."""
     ecc = ecc or run_ecc
@@ -1698,8 +1716,11 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
     lock = work_lock()
     if lock is None:
         log("another coding pass is running; skipping")
-        for key in only or ():
-            mark(key, "waiting")
+        if only:                          # only issues that have coding to do wait for the lock
+            state = read_state_file()
+            for key in only:
+                if needs_coding(state.get(key)):
+                    mark(key, "waiting")
         return 0
     state, since = load_state()
     coding = set(conf.get("coding_repos", []))
@@ -1787,8 +1808,8 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
 
 def cmd_tick():
     """The full scan: intake, then analysis, then 4a and 4b when switched on. Coding runs after tick.lock is
-    released, under its own lock, so an hours-long run doesn't hold up queued events. After the scan, deferred
-    queue files go back into the queue so the queue job checks them again."""
+    released, under its own lock. After the scan, deferred queue files go back into their queues so the queue jobs
+    check them again."""
     lock = work_lock("tick.lock")
     if lock is None:
         log("another tick is running; skipping this one")
@@ -1798,7 +1819,8 @@ def cmd_tick():
         cmd_analyze()
         if read_config().get("approval_live"):   # step 4a joins the scheduled job only once switched on
             cmd_approve()
-        requeue_deferred(QUEUE_DIR)
+        requeue_deferred(QUEUE_DIR, QUEUE_DEFAULT)
+        requeue_deferred(sibling(QUEUE_DIR, "code"), CODE_QUEUE_DEFAULT)
     finally:
         lock.close()
     if read_config().get("coding_live"):         # step 4b too, separately
@@ -1806,19 +1828,42 @@ def cmd_tick():
     return 0
 
 
-# ---------- the event queue: tick --from-queue ----------
-# launchd's QueueDirectories relaunches the job while the queue folder has any entry at all, so nothing may stay
-# there after a run: an issue's files are deleted once handled, moved to <queue>-deferred when it failed or waits
-# for a later pass (the hourly tick moves them back), and anything that can never be handled goes to
-# <queue>-rejected, which is left for a person to clear.
-QUEUE_DIR = Path(os.environ.get("IWB_QUEUE_DIR", Path.home() / ".local" / "state" / "github-events" / "iwb"))
-QUEUE_MAX_ATTEMPTS = 24     # deferrals before an event file is rejected
+# ---------- the event queues: tick --from-queue and code --from-queue ----------
+# launchd's QueueDirectories relaunches a job while its folder has any entry at all, so nothing may stay there after
+# a run: an issue's files are deleted once handled, moved to <queue>-deferred when it failed or waits (the hourly
+# tick moves them back), and anything that can never be handled goes to <queue>-rejected, left for a person to clear.
+# Issues held back only by a per-pass limit stay for the next run, a minute later. The issue queue does intake,
+# analysis and approval; an issue that is ready to code is handed to the code queue, whose job runs the coding.
+EVENTS_ROOT = Path.home() / ".local" / "state" / "github-events"
+QUEUE_DEFAULT = EVENTS_ROOT / "iwb"
+CODE_QUEUE_DEFAULT = EVENTS_ROOT / "iwb-code"
+QUEUE_DIR = Path(os.environ.get("IWB_QUEUE_DIR", QUEUE_DEFAULT))
+QUEUE_MARKER = ".github-events-queue"   # a regular file in a queue folder's parent: it holds event queues
+QUEUE_MAX_ATTEMPTS = 24     # counted deferrals before an event file is rejected
 REPO_NAME = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+")   # GitHub owners have no dots
 
 
 def sibling(d, what):
     """<parent>/<name>-<what>: next to the queue folder, never inside it."""
     return d.parent / f"{d.name}-{what}"
+
+
+def queue_dir_problem(d, default):
+    """Why `d` must not be drained, or None. Accepted: the default folder, or a folder whose parent holds a regular
+    QUEUE_MARKER file. Refused: a symlink, a file, anything else. A missing folder is fine: there is nothing in it."""
+    if d.is_symlink():
+        return f"{d} is a symlink"
+    if not d.exists():
+        return None
+    if not d.is_dir():
+        return f"{d} is not a directory"
+    real = Path(os.path.realpath(d))
+    if real == Path(os.path.realpath(default)):
+        return None
+    marker = real.parent / QUEUE_MARKER
+    if marker.is_file() and not marker.is_symlink():
+        return None
+    return f"{d} is not {default}, and {real.parent} has no {QUEUE_MARKER} file marking it as an event queue"
 
 
 def is_event_file(f):
@@ -1835,10 +1880,28 @@ def free_name(dest, name):
 
 
 def move_out(f, dest, why):
+    """Move a queue entry by renaming it: a file, a folder with its contents, or a symlink as the link itself (a
+    rename never follows it)."""
     dest.mkdir(parents=True, exist_ok=True)
     target = free_name(dest, f.name)
     os.replace(f, target)
     log(f"queue: {f.name}: {why}; moved to {target}")
+
+
+def write_event(dest, name, ev, tmp_dir):
+    """Write an event file into `dest` atomically: a temporary file in `tmp_dir` (same filesystem), then a rename."""
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=tmp_dir, prefix=".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(json.dumps(ev) + "\n")
+        target = free_name(dest, name)
+        os.replace(tmp, target)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return target
 
 
 def defer(f, ev, deferred, rejected, why, count=True):
@@ -1850,16 +1913,7 @@ def defer(f, ev, deferred, rejected, why, count=True):
         ev = {**ev, "attempts": (n if type(n) is int and n >= 0 else 0) + 1}
         if ev["attempts"] >= QUEUE_MAX_ATTEMPTS:
             dest = rejected
-    dest.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=dest, prefix=".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as out:
-            out.write(json.dumps(ev) + "\n")
-        target = free_name(dest, f.name)
-        os.replace(tmp, target)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    target = write_event(dest, f.name, ev, dest)
     f.unlink(missing_ok=True)
     if dest == rejected:
         log(f"queue: {f.name}: {why}, attempt {ev['attempts']} of {QUEUE_MAX_ATTEMPTS}; gave up, moved to {target}")
@@ -1869,10 +1923,14 @@ def defer(f, ev, deferred, rejected, why, count=True):
         log(f"queue: {f.name}: {why}, not counted as an attempt; moved to {target} until the hourly tick")
 
 
-def requeue_deferred(queue):
+def requeue_deferred(queue, default):
     """The hourly tick's part: put deferred event files back in the queue so the queue job retries them."""
+    problem = queue_dir_problem(queue, default)
+    if problem:
+        log(f"queue: not moving deferred events back: {problem}")
+        return
     deferred = sibling(queue, "deferred")
-    if not queue.is_dir() or not deferred.is_dir():
+    if not queue.is_dir() or not deferred.is_dir() or deferred.is_symlink():
         return
     moved = 0
     try:
@@ -1898,11 +1956,85 @@ def read_event(f):
     return ev
 
 
+def queue_events(q, rejected):
+    """[(file, event)] from the queue folder, oldest first. Every other entry goes to `rejected` by renaming the
+    entry itself: other files, unreadable or invalid events, folders (moved whole, contents untouched) and
+    symlinks (the link moves; its target is never followed or touched). Only call this on a folder that passed
+    queue_dir_problem."""
+    events = []
+    for e in sorted(q.iterdir()):
+        if e.is_symlink():
+            move_out(e, rejected, "a symlink")
+        elif e.is_dir():
+            move_out(e, rejected, "a folder")
+        elif not e.is_file():
+            move_out(e, rejected, "not a regular file")
+        elif not is_event_file(e):
+            move_out(e, rejected, "not a .json event file")
+        else:
+            try:
+                ev = read_event(e)
+            except OSError as err:
+                move_out(e, rejected, f"could not read ({err})")
+                continue
+            if ev is None:
+                move_out(e, rejected, "not valid JSON with a repo and an issue number")
+            else:
+                events.append((e, ev))
+    return events
+
+
+def refuse(problem):
+    print(f"iwb: refusing to drain the queue: {problem}", file=sys.stderr, flush=True)
+    return 2
+
+
+def settle(groups, deferred, rejected, what):
+    """Act on each grouped issue's OUTCOME: delete (handled), leave (held), or defer. Exits 1 if one failed."""
+    if groups and all(OUTCOME.get(k) == "held" for k in groups):
+        # Can't happen with a fresh budget, but a run that only holds files back would leave the queue as it was
+        # and launchd would start it again forever; defer instead.
+        log(f"{what}: every issue was held by a limit; deferring them")
+        OUTCOME.update(dict.fromkeys(groups, "waiting"))
+    why = {"failed": "failed", "deferred": "will retry later", "waiting": "waits for capacity or a retry delay"}
+    for key, fs in groups.items():
+        outcome = OUTCOME.get(key)
+        for f, ev in fs:
+            if outcome is None:
+                f.unlink(missing_ok=True)
+            elif outcome != "held":       # held: only a per-pass limit, stays in the queue for the next run
+                defer(f, ev, deferred, rejected, why[outcome], count=outcome != "waiting")
+    by = {o: sorted(k for k in groups if OUTCOME.get(k) == o) for o in ("failed", "deferred", "waiting", "held")}
+    done = sum(1 for k in groups if k not in OUTCOME)
+    log(f"{what} pass done: {done} issue{'s' if done != 1 else ''} handled"
+        + "".join(f"; {o}: {', '.join(ks)}" for o, ks in by.items() if ks))
+    return 1 if by["failed"] else 0
+
+
+def hand_off_to_coding(code_q, f, ev):
+    """Write a coding hand-off for this issue into the code queue: the same event with "stage": "code"."""
+    root = code_q.parent
+    root.mkdir(parents=True, exist_ok=True)
+    marker = root / QUEUE_MARKER
+    if not marker.exists() and not marker.is_symlink():
+        marker.touch()
+    problem = queue_dir_problem(code_q, CODE_QUEUE_DEFAULT)
+    if problem:
+        raise OSError(problem)
+    out = {k: v for k, v in ev.items() if k != "attempts"}
+    out["stage"] = "code"
+    return write_event(code_q, f.name, out, root / ".tmp")
+
+
 def cmd_drain(queue_dir):
-    """`tick --from-queue DIR`: the per-issue part of tick for each issue that has event files in DIR. Every entry
-    leaves DIR: handled issues' files are deleted, failed or postponed ones go to DIR-deferred, and entries that
-    can never be handled go to DIR-rejected. Exits 1 if an issue failed; postponing is not a failure."""
+    """`tick --from-queue DIR`: intake, analysis and approval for each issue that has event files in DIR. Once a
+    stage records an outcome for an issue (held, waiting, deferred, failed) the later stages skip it in this run.
+    An issue that is ready to code is handed to the code queue (DIR-code). Exits 1 if an issue failed, 2 if DIR
+    is not a queue folder."""
     q = Path(queue_dir).expanduser()
+    problem = queue_dir_problem(q, QUEUE_DEFAULT)
+    if problem:
+        return refuse(problem)
     entries = sorted(q.iterdir()) if q.is_dir() else []
     if not entries:
         return 0
@@ -1913,21 +2045,9 @@ def cmd_drain(queue_dir):
     OUTCOME.clear()
     SPENT.update(dict.fromkeys(SPENT, 0))   # a fresh budget, so the first issue of every run is never limit-held
     deferred, rejected = sibling(q, "deferred"), sibling(q, "rejected")
-    groups, events = {}, []
+    groups = {}
     try:
-        for f in entries:
-            if not is_event_file(f):
-                move_out(f, rejected, "not a regular .json event file")
-                continue
-            try:
-                ev = read_event(f)
-            except OSError as e:
-                move_out(f, rejected, f"could not read ({e})")
-                continue
-            if ev is None:
-                move_out(f, rejected, "not valid JSON with a repo and an issue number")
-                continue
-            events.append((f, ev))
+        events = queue_events(q, rejected)
         if not events:
             return 0
         try:
@@ -1948,39 +2068,60 @@ def cmd_drain(queue_dir):
         for key in groups:
             try:
                 cmd_intake(limit=LIMIT - SPENT["intake"], only={key})
-                cmd_analyze(limit=ANALYZE_LIMIT - SPENT["analyze"], only={key})
-                if read_config().get("approval_live"):
+                if key not in OUTCOME:
+                    cmd_analyze(limit=ANALYZE_LIMIT - SPENT["analyze"], only={key})
+                if key not in OUTCOME and read_config().get("approval_live"):
                     cmd_approve(limit=APPROVE_LIMIT - SPENT["approve"], only={key})
             except (Exception, SystemExit) as e:
                 mark(key, "failed", f"queued event failed: {e!r}")
+        if read_config().get("coding_live"):
+            state = read_state_file()
+            for key, fs in groups.items():
+                if key in OUTCOME or not needs_coding(state.get(key)):
+                    continue
+                try:
+                    target = hand_off_to_coding(sibling(q, "code"), *fs[-1])
+                    log(f"{key}: ready to code; handed to the code queue as {target}")
+                except (OSError, ValueError) as e:
+                    mark(key, "failed", f"could not hand the issue to the code queue: {e}")
     finally:
         lock.close()
-    if read_config().get("coding_live"):
-        for key in groups:
-            if OUTCOME.get(key) == "failed":
-                continue
-            try:
-                cmd_code(limit=CODE_LIMIT - SPENT["code"], only={key})
-            except (Exception, SystemExit) as e:
-                mark(key, "failed", f"queued event failed while coding: {e!r}")
-    if groups and all(OUTCOME.get(k) == "held" for k in groups):
-        # Can't happen with a fresh budget, but a run that only holds files back would leave the queue as it was
-        # and launchd would start it again forever; defer instead.
-        log("queue: every issue was held by a limit; deferring them")
-        OUTCOME.update(dict.fromkeys(groups, "waiting"))
-    why = {"failed": "failed", "deferred": "will retry later", "waiting": "waits for capacity or a retry delay"}
-    for key, fs in groups.items():
-        outcome = OUTCOME.get(key)
-        for f, ev in fs:
-            if outcome is None:
+    return settle(groups, deferred, rejected, "queue")
+
+
+def cmd_code_drain(queue_dir):
+    """`code --from-queue DIR`: step 4b for each issue handed off in DIR by the issue queue. Same folders and
+    outcomes: DIR-deferred, DIR-rejected; a coding lock held elsewhere is an uncounted wait."""
+    q = Path(queue_dir).expanduser()
+    problem = queue_dir_problem(q, CODE_QUEUE_DEFAULT)
+    if problem:
+        return refuse(problem)
+    entries = sorted(q.iterdir()) if q.is_dir() else []
+    if not entries:
+        return 0
+    OUTCOME.clear()
+    SPENT.update(dict.fromkeys(SPENT, 0))
+    deferred, rejected = sibling(q, "deferred"), sibling(q, "rejected")
+    groups = {}
+    for f, ev in queue_events(q, rejected):
+        if ev.get("kind") != "issue" or ev.get("stage") != "code":
+            move_out(f, rejected, "not a coding hand-off")
+        else:
+            groups.setdefault(f"{ev['repo']}#{ev['number']}", []).append((f, ev))
+    if not groups:
+        return 0
+    if not read_config().get("coding_live"):
+        log("code queue: coding_live is off; hand-offs dropped")
+        for fs in groups.values():
+            for f, _ in fs:
                 f.unlink(missing_ok=True)
-            elif outcome != "held":       # held: only a per-pass limit, stays in the queue for the next run
-                defer(f, ev, deferred, rejected, why[outcome], count=outcome != "waiting")
-    by = {o: sorted(k for k in groups if OUTCOME.get(k) == o) for o in ("failed", "deferred", "waiting", "held")}
-    done = sum(1 for k in groups if k not in OUTCOME)
-    log(f"queue pass done: {done} issue{'s' if done != 1 else ''} handled"
-        + "".join(f"; {o}: {', '.join(ks)}" for o, ks in by.items() if ks))
-    return 1 if by["failed"] else 0
+        return 0
+    for key in groups:
+        try:
+            cmd_code(limit=CODE_LIMIT - SPENT["code"], only={key})
+        except (Exception, SystemExit) as e:
+            mark(key, "failed", f"coding hand-off failed: {e!r}")
+    return settle(groups, deferred, rejected, "code queue")
 
 
 def main(argv):
@@ -1996,6 +2137,11 @@ def main(argv):
     if argv[0] == "approve":
         return cmd_approve(dry_run="--dry-run" in argv)
     if argv[0] == "code":
+        if "--from-queue" in argv:
+            i = argv.index("--from-queue") + 1
+            if i >= len(argv) or argv[i].startswith("-"):
+                prbot.die("code --from-queue needs the queue folder")
+            return cmd_code_drain(argv[i])
         return cmd_code(dry_run="--dry-run" in argv)
     if argv[0] == "tick":   # what launchd runs: pick up new issues, then analyze one
         if "--from-queue" in argv:
