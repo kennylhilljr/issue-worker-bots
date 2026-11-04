@@ -635,10 +635,11 @@ class Code(unittest.TestCase):
         self.saved = {k: getattr(p, k) for k in ("gh_read", "bot_config", "openclaw_attention")}
         self.saved_iwb = {k: getattr(iwb, k) for k in (
             "STATE", "CONFIG", "WORK_DIR", "post", "run_gh_as", "checkout", "trusted_copy", "changed_files",
-            "commit_as", "push_branch", "create_pr", "ready_pr", "ECC_DEFAULTS", "orchestrator_drift")}
+            "commit_as", "push_branch", "create_pr", "ready_pr", "ECC_DEFAULTS", "orchestrator_drift", "QUEUE_DIR")}
         iwb.STATE = Path(self.tmp.name, "state.json")
         iwb.CONFIG = Path(self.tmp.name, "config.json")
         iwb.WORK_DIR = Path(self.tmp.name, "work")
+        iwb.QUEUE_DIR = Path(self.tmp.name, "queue")      # plain tick moves deferred events back; never the real ones
         iwb.CONFIG.write_text(json.dumps(self.PILOT))
         iwb.ECC_DEFAULTS = {"certifications": str(Path(self.tmp.name, "cert-latest.json"))}
         self.certify()
@@ -1451,13 +1452,15 @@ class Queue(unittest.TestCase):
         self.q.mkdir()
         p = iwb.prbot
         saved = {k: getattr(p, k) for k in ("load_config", "installed_repos")}
-        saved_iwb = {k: getattr(iwb, k) for k in ("STATE", "CONFIG", "WORK_DIR", "cmd_intake", "cmd_analyze",
-                                                   "cmd_approve", "cmd_code")}
+        saved_iwb = {k: getattr(iwb, k) for k in ("STATE", "CONFIG", "WORK_DIR", "QUEUE_DIR", "cmd_intake",
+                                                   "cmd_analyze", "cmd_approve", "cmd_code")}
         self.addCleanup(lambda: [setattr(p, k, v) for k, v in saved.items()]
                         + [setattr(iwb, k, v) for k, v in saved_iwb.items()])
         iwb.STATE = Path(self.tmp.name, "state.json")
         iwb.CONFIG = Path(self.tmp.name, "config.json")
         iwb.WORK_DIR = Path(self.tmp.name, "work")
+        iwb.QUEUE_DIR = self.q
+        self.deferred, self.rejected = Path(self.tmp.name, "queue-deferred"), Path(self.tmp.name, "queue-rejected")
         p.load_config = lambda: {"claude-dev": {"owner": OWNER, "slug": "claude-dev-gh"},
                                  "codex-dev": {"owner": OWNER, "slug": "codex-dev-gh"}}
         p.installed_repos = lambda bot: {self.REPO}
@@ -1494,8 +1497,16 @@ class Queue(unittest.TestCase):
             code = iwb.main(["tick", "--from-queue", str(self.q)])
         return code, out.getvalue()
 
-    def left(self):
-        return sorted(f.name for f in self.q.iterdir())
+    def left(self, d=None):
+        d = d or self.q
+        return sorted(f.name for f in d.iterdir()) if d.exists() else []
+
+    def attempts(self, d):
+        return sorted(json.loads(f.read_text()).get("attempts") for f in d.iterdir() if f.suffix == ".json")
+
+    def backstop(self):
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(iwb.main(["tick"]), 0)
 
     def test_each_issue_once_per_run_and_its_files_go_after_success(self):
         self.event(42, "opened")
@@ -1524,27 +1535,73 @@ class Queue(unittest.TestCase):
         self.assertEqual([s for s, _ in self.calls], ["intake", "analyze", "approve", "code"])
         self.assertEqual(held, [False])        # coding runs after tick.lock is released
 
-    def test_a_failure_keeps_that_issues_files_and_exits_nonzero(self):
+    def test_a_failure_is_deferred_with_an_attempt_count_and_exits_nonzero(self):
         bad = [self.event(1, "opened"), self.event(1, "comment")]
         self.event(2)
-        self.failing["analyze", f"{self.REPO}#1"] = SystemExit(1)       # prbot.die, as a failed gh read does
+        self.failing["analyze", f"{self.REPO}#1"] = SystemExit(1)    # prbot.die, as a failed gh read does
         code, out = self.drain()
         self.assertEqual(code, 1)
-        self.assertEqual(self.left(), sorted(f.name for f in bad))
+        self.assertEqual(self.left(), [])                             # nothing left for launchd to relaunch on
+        self.assertEqual(self.left(self.deferred), sorted(f.name for f in bad))
+        self.assertEqual(self.attempts(self.deferred), [1, 1])
         self.assertIn(("analyze", [f"{self.REPO}#2"]), self.calls)    # the other issue still ran
         self.assertIn(f"{self.REPO}#1: queued event failed", out)
+        self.backstop()                                               # the hourly tick puts them back
+        self.assertEqual(self.left(), sorted(f.name for f in bad))
+        self.assertEqual(self.drain()[0], 1)                          # still failing: attempt 2
+        self.assertEqual(self.attempts(self.deferred), [2, 2])
+        self.backstop()
         del self.failing["analyze", f"{self.REPO}#1"]
-        self.assertEqual(self.drain()[0], 0)                          # the next run retries and clears it
-        self.assertEqual(self.left(), [])
+        self.assertEqual(self.drain()[0], 0)                          # fixed: handled and deleted
+        self.assertEqual((self.left(), self.left(self.deferred)), ([], []))
 
-    def test_an_issue_left_for_a_later_pass_keeps_its_files(self):
+    def test_an_issue_left_for_a_later_pass_is_deferred_without_failing(self):
         kept = self.event(5)
         self.event(6)
         self.wait.add(("analyze", f"{self.REPO}#5"))                  # e.g. the one-analysis-per-pass limit
         code, out = self.drain()
         self.assertEqual(code, 0)
-        self.assertEqual(self.left(), [kept.name])
-        self.assertIn(f"kept for the next run: {self.REPO}#5", out)
+        self.assertEqual((self.left(), self.left(self.deferred)), ([], [kept.name]))
+        self.assertIn(f"deferred: {self.REPO}#5", out)
+
+    def test_rejected_after_too_many_attempts(self):
+        f = self.event(5)
+        ev = json.loads(f.read_text())
+        f.write_text(json.dumps({**ev, "attempts": iwb.QUEUE_MAX_ATTEMPTS - 2}))
+        self.failing["intake", f"{self.REPO}#5"] = RuntimeError("down")
+        self.drain()
+        self.assertEqual(self.attempts(self.deferred), [iwb.QUEUE_MAX_ATTEMPTS - 1])
+        self.backstop()
+        code, out = self.drain()
+        self.assertEqual(code, 1)
+        self.assertEqual((self.left(), self.left(self.deferred)), ([], []))
+        self.assertEqual(self.attempts(self.rejected), [iwb.QUEUE_MAX_ATTEMPTS])
+        self.assertIn("gave up", out)
+
+    def test_name_collisions_get_a_suffix(self):
+        f = self.event(5)
+        self.deferred.mkdir()
+        (self.deferred / f.name).write_text("{}")                     # an older deferral with the same name
+        self.wait.add(("analyze", f"{self.REPO}#5"))
+        self.drain()
+        stem = f.name[:-len(".json")]
+        self.assertEqual(self.left(self.deferred), sorted([f.name, f"{stem}.1.json"]))
+
+    def test_unknown_worker_repositories_defer_every_event(self):
+        self.event(1)
+        self.event(2, raw="{bad")
+        iwb.prbot.installed_repos = lambda bot: (_ for _ in ()).throw(SystemExit(1))   # prbot.die on a failed read
+        code, _ = self.drain()
+        self.assertEqual((code, self.left(), self.calls), (1, [], []))
+        self.assertEqual(self.attempts(self.deferred), [1])
+        self.assertEqual(len(self.left(self.rejected)), 1)
+
+    def test_side_folders_are_siblings_outside_the_queue(self):
+        self.assertEqual(iwb.sibling(self.q, "deferred"), self.deferred)
+        self.assertEqual(iwb.sibling(self.q, "rejected"), self.rejected)
+        for d in (self.deferred, self.rejected):
+            self.assertEqual(d.parent, self.q.parent)
+            self.assertNotIn(self.q, d.parents)
 
     def test_the_analysis_limit_is_shared_by_the_issues_in_a_run(self):
         seen = []
@@ -1554,7 +1611,7 @@ class Queue(unittest.TestCase):
         self.drain()
         self.assertEqual(seen, [1, 0])
 
-    def test_unusable_files_are_logged_and_deleted(self):
+    def test_unusable_files_are_logged_and_rejected(self):
         names = [self.event(1, raw="{not json").name,
                  self.event(2, raw=json.dumps({"repo": self.REPO, "kind": "issue"})).name,
                  self.event(3, raw=json.dumps({"repo": self.REPO, "kind": "issue", "number": "3"})).name,
@@ -1563,26 +1620,31 @@ class Queue(unittest.TestCase):
                  self.event(6, raw=json.dumps(["not", "an", "object"])).name]
         code, out = self.drain()
         self.assertEqual(code, 0)
-        self.assertEqual(self.left(), [])
+        self.assertEqual((self.left(), self.left(self.rejected)), ([], sorted(names)))
         self.assertEqual(self.calls, [])
         for name in names:
-            self.assertIn(f"queue: {name}: not valid JSON with a repo and an issue number; deleted", out)
+            self.assertIn(f"queue: {name}: not valid JSON with a repo and an issue number; moved to", out)
 
-    def test_other_repositories_and_pull_requests_are_deleted_unhandled(self):
+    def test_other_repositories_and_pull_requests_are_rejected_unhandled(self):
         other = self.event(1, repo="someone/else")
         pr = self.event(2, kind="pull_request")
         code, out = self.drain()
         self.assertEqual((code, self.left(), self.calls), (0, [], []))
-        self.assertIn(f"queue: {other.name}: someone/else is not a worker repository; deleted", out)
-        self.assertIn(f"queue: {pr.name}: not an issue; deleted", out)
+        self.assertEqual(self.left(self.rejected), sorted([other.name, pr.name]))
+        self.assertIn(f"queue: {other.name}: someone/else is not a worker repository; moved to", out)
+        self.assertIn(f"queue: {pr.name}: not an issue; moved to", out)
 
-    def test_dotfiles_other_files_and_folders_are_left_alone(self):
-        self.event(1, name=".20261103T141502123Z-partial.json")
+    def test_every_other_entry_leaves_the_queue(self):
+        # launchd QueueDirectories relaunches while any entry remains, so .DS_Store and the like must go too
+        (self.q / ".DS_Store").write_text("x")
         (self.q / "notes.txt").write_text("x")
         (self.q / "sub.json").mkdir()
+        (self.q / "link.json").symlink_to(self.event(1, name="target.txt"))
         code, out = self.drain()
-        self.assertEqual((code, out, self.calls), (0, "", []))
-        self.assertEqual(self.left(), [".20261103T141502123Z-partial.json", "notes.txt", "sub.json"])
+        self.assertEqual((code, self.calls, self.left()), (0, [], []))
+        self.assertEqual(self.left(self.rejected), [".DS_Store", "link.json", "notes.txt", "sub.json", "target.txt"])
+        self.assertTrue((self.rejected / "sub.json").is_dir())
+        self.assertIn("queue: .DS_Store: not a regular .json event file; moved to", out)
 
     def test_empty_or_missing_folder_is_quiet(self):
         iwb.prbot.load_config = lambda: self.fail_test("no GitHub or config read for an empty queue")
@@ -1595,11 +1657,34 @@ class Queue(unittest.TestCase):
 
     def test_plain_tick_still_scans_everything(self):
         self.event(9)
-        out = io.StringIO()
-        with redirect_stdout(out):
-            self.assertEqual(iwb.main(["tick"]), 0)
+        self.backstop()
         self.assertEqual(self.calls, [("intake", None), ("analyze", None)])
-        self.assertEqual(len(self.left()), 1)                         # the queue is not touched
+        self.assertEqual(len(self.left()), 1)                         # queue files are left for the queue job
+
+    def test_plain_tick_moves_deferred_events_back_after_the_scan(self):
+        self.deferred.mkdir()
+        (self.deferred / "a.json").write_text("{}")
+        (self.deferred / ".tmp123.tmp").write_text("partial")        # a deferral being written: stays
+        moved_at = []
+        iwb.cmd_analyze = lambda only=None, **kw: moved_at.append(self.left())
+        self.backstop()
+        self.assertEqual(moved_at, [[]])                              # still deferred while the scan ran
+        self.assertEqual((self.left(), self.left(self.deferred)), (["a.json"], [".tmp123.tmp"]))
+
+    def test_plain_tick_requeue_needs_both_folders_and_the_lock(self):
+        self.q.rmdir()
+        self.deferred.mkdir()
+        (self.deferred / "a.json").write_text("{}")
+        self.backstop()                                               # no queue folder: nothing moves
+        self.assertEqual(self.left(self.deferred), ["a.json"])
+        self.q.mkdir()
+        held = iwb.work_lock("tick.lock")
+        self.addCleanup(held.close)
+        self.backstop()                                               # another tick holds the lock
+        self.assertEqual(self.left(self.deferred), ["a.json"])
+        held.close()
+        self.backstop()
+        self.assertEqual(self.left(), ["a.json"])
 
     def test_both_modes_skip_while_another_tick_holds_the_lock(self):
         self.event(1)

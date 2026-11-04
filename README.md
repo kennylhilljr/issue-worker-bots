@@ -115,11 +115,19 @@ Log: `~/Library/Logs/issue-intake.log`. State: `~/.config/issue-worker-bots/stat
 
 ### Event-driven intake (proposed)
 
-OpenClaw's github-event-router can drop one JSON file per GitHub issue event into `~/.local/state/github-events/iwb/`. `iwb tick --from-queue <folder>` runs the steps of `tick` for just the issues named there, reading each issue fresh from GitHub, and deletes an issue's files once it was handled. An issue whose handling fails, or that waits for a later pass (a failed read, the one-analysis-per-pass limit), keeps its files; the run exits 1 if any issue failed. Files that can never be handled (bad JSON, no repo or number, a pull request, a repository the bots aren't installed on) are logged and deleted. Dotfiles and anything not ending in `.json` are ignored, and an empty or missing folder exits 0 without a log line.
+OpenClaw's github-event-router can drop one JSON file per GitHub issue event into `~/.local/state/github-events/iwb/`. `iwb tick --from-queue <folder>` runs the steps of `tick` for just the issues named there, reading each issue fresh from GitHub. launchd starts the queue job again for as long as the folder holds anything, so every run empties it, using two folders next to it:
+
+| Folder | What goes there |
+| --- | --- |
+| `~/.local/state/github-events/iwb/` | New events from the router. Emptied by every queue run. |
+| `~/.local/state/github-events/iwb-deferred/` | Files of an issue whose handling failed (the run exits 1) or that waits for a later pass (a failed GitHub read, the one-analysis-per-pass limit; exit 0). Each move adds 1 to an `attempts` field in the file. The hourly `tick` moves them back into the queue after its scan. |
+| `~/.local/state/github-events/iwb-rejected/` | Anything that can never be handled: bad JSON, no valid repo or issue number, a pull request, a repository the bots aren't installed on, any entry that isn't a regular `.json` file (`.DS_Store`, folders, symlinks), and files deferred 24 times. Nothing reads or clears this folder; look through it and empty it by hand now and then. |
+
+Handled issues' files are deleted. An empty or missing queue folder exits 0 without a log line. Because deferred files wait for the hourly `tick`, a burst of new issues larger than the per-pass limits is worked through about one analysis an hour, not one a minute. Plain `tick` reads the queue folder from `IWB_QUEUE_DIR`, with the path above as the default.
 
 [`launchd/`](launchd/README.md) holds the proposed jobs: a queue job that launchd starts whenever the folder has files, and the full-scan `tick` slowed to once an hour as a backstop. They are not installed by `install-intake.sh`; the steps and the rollback are in `launchd/README.md`.
 
-Both forms of `tick` take `~/.local/state/issue-worker-bots/tick.lock` (non-blocking) for intake, analysis and approval, so the two jobs never run those steps at once. A run that finds the lock held logs a line and exits 0; queue files stay for the next run. Coding takes its own `work.lock` after `tick.lock` is released, so an hours-long coding run doesn't hold up queued events.
+Both forms of `tick` take `~/.local/state/issue-worker-bots/tick.lock` (non-blocking) for intake, analysis and approval, so the two jobs never run those steps at once. A run that finds the lock held logs a line and exits 0. A queue run then leaves the folder as it is, since the run holding the lock is active, and launchd starts it again a minute later. Coding takes its own `work.lock` after `tick.lock` is released, so an hours-long coding run doesn't hold up queued events.
 
 ## How an issue is handled
 
@@ -190,7 +198,7 @@ Plans ready, questions posted and blocked issues appear in OpenClaw as `attentio
 | Command | What it does |
 | --- | --- |
 | `iwb tick` | What launchd runs: intake, then one analysis, then step 4a when `approval_live` is set and step 4b when `coding_live` is set. |
-| `iwb tick --from-queue DIR` | The same steps for only the issues named by event files in `DIR`, each once per run; deletes an issue's files after it was handled. Exits 1 if an issue failed. |
+| `iwb tick --from-queue DIR` | The same steps for only the issues named by event files in `DIR`, each once per run. Deletes a handled issue's files and moves the rest to `DIR-deferred` or `DIR-rejected`. Exits 1 if an issue failed. |
 | `iwb code [--dry-run]` | Codes one approved plan and opens its PR. `--dry-run` prints what it would do. |
 | `iwb intake [--dry-run] [--baseline] [--limit N]` | One pass over open issues; picks up at most N (default 5). `--dry-run` prints and saves nothing; `--baseline` marks the open issues as seen without commenting. |
 | `iwb analyze [--dry-run] [--limit N]` | Analyzes up to N picked-up issues (default 1) and posts a no-code answer, questions or a plan. |

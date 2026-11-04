@@ -4,10 +4,13 @@
   iwb tick                  what launchd runs: intake, then analyze, then approve and code when switched on
   iwb tick --from-queue DIR
       The same steps for just the issues named by event files in DIR (one JSON file per GitHub event, written by
-      OpenClaw's github-event-router). Each issue is handled once per run however many files it has; its files are
-      deleted once it was handled, and kept when it failed or waits for a later pass. Files that can never be handled
-      (bad JSON, no repo or number, a pull request, a repository the bots aren't installed on) are logged and
-      deleted. Exits 1 if an issue failed. Both forms of tick skip with a log line while the other one holds the lock.
+      OpenClaw's github-event-router). Each issue is handled once per run however many files it has. Nothing stays
+      in DIR: a handled issue's files are deleted; one that failed or waits for a later pass has its files moved to
+      DIR-deferred with an "attempts" count (the next plain tick moves them back; after 24 attempts they go to
+      DIR-rejected); anything that can never be handled (another file, bad JSON, a pull request, a repository the
+      bots aren't installed on) goes to DIR-rejected. Exits 1 if an issue failed. Both forms of tick skip with a
+      log line while the other one holds the lock. Plain tick reads the queue folder from IWB_QUEUE_DIR
+      (default ~/.local/state/github-events/iwb).
   iwb code [--dry-run]
       Step 4b: for one plan that step 4a approved, in a repository listed in config.json "coding_repos": an
       orchestrator run in iwb's own clone, one commit by the worker bot on bot/<n>-<slug>-<attempt>, and a draft PR marked
@@ -1725,7 +1728,8 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
 
 def cmd_tick():
     """The full scan: intake, then analysis, then 4a and 4b when switched on. Coding runs after tick.lock is
-    released, under its own lock, so an hours-long run doesn't hold up queued events."""
+    released, under its own lock, so an hours-long run doesn't hold up queued events. After the scan, deferred
+    queue files go back into the queue so the queue job checks them again."""
     lock = work_lock("tick.lock")
     if lock is None:
         log("another tick is running; skipping this one")
@@ -1735,6 +1739,7 @@ def cmd_tick():
         cmd_analyze()
         if read_config().get("approval_live"):   # step 4a joins the scheduled job only once switched on
             cmd_approve()
+        requeue_deferred(QUEUE_DIR)
     finally:
         lock.close()
     if read_config().get("coding_live"):         # step 4b too, separately
@@ -1742,19 +1747,83 @@ def cmd_tick():
     return 0
 
 
+# ---------- the event queue: tick --from-queue ----------
+# launchd's QueueDirectories relaunches the job while the queue folder has any entry at all, so nothing may stay
+# there after a run: an issue's files are deleted once handled, moved to <queue>-deferred when it failed or waits
+# for a later pass (the hourly tick moves them back), and anything that can never be handled goes to
+# <queue>-rejected, which is left for a person to clear.
+QUEUE_DIR = Path(os.environ.get("IWB_QUEUE_DIR", Path.home() / ".local" / "state" / "github-events" / "iwb"))
+QUEUE_MAX_ATTEMPTS = 24     # deferrals before an event file is rejected
 REPO_NAME = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+")   # GitHub owners have no dots
 
 
-def queue_files(d):
-    """Event files in the queue folder, oldest first: regular *.json files whose name doesn't start with a dot."""
-    if not d.is_dir():
-        return []
-    return sorted(f for f in d.iterdir() if f.name.endswith(".json") and not f.name.startswith(".")
-                  and f.is_file() and not f.is_symlink())
+def sibling(d, what):
+    """<parent>/<name>-<what>: next to the queue folder, never inside it."""
+    return d.parent / f"{d.name}-{what}"
+
+
+def is_event_file(f):
+    return f.name.endswith(".json") and not f.name.startswith(".") and f.is_file() and not f.is_symlink()
+
+
+def free_name(dest, name):
+    """dest/name, or dest/<stem>.<n><ext> when that is taken."""
+    stem, ext = os.path.splitext(name)
+    target, n = dest / name, 1
+    while target.exists() or target.is_symlink():
+        target, n = dest / f"{stem}.{n}{ext}", n + 1
+    return target
+
+
+def move_out(f, dest, why):
+    dest.mkdir(parents=True, exist_ok=True)
+    target = free_name(dest, f.name)
+    os.replace(f, target)
+    log(f"queue: {f.name}: {why}; moved to {target}")
+
+
+def defer(f, ev, deferred, rejected, why):
+    """Move an event file to the deferred folder with its "attempts" count raised by one, written atomically; after
+    QUEUE_MAX_ATTEMPTS it goes to the rejected folder instead."""
+    n = ev.get("attempts")
+    ev = {**ev, "attempts": (n if type(n) is int and n >= 0 else 0) + 1}
+    dest = rejected if ev["attempts"] >= QUEUE_MAX_ATTEMPTS else deferred
+    dest.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dest, prefix=".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(json.dumps(ev) + "\n")
+        target = free_name(dest, f.name)
+        os.replace(tmp, target)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    f.unlink(missing_ok=True)
+    if dest == rejected:
+        log(f"queue: {f.name}: {why}, attempt {ev['attempts']} of {QUEUE_MAX_ATTEMPTS}; gave up, moved to {target}")
+    else:
+        log(f"queue: {f.name}: {why}, attempt {ev['attempts']}; moved to {target} until the hourly tick")
+
+
+def requeue_deferred(queue):
+    """The hourly tick's part: put deferred event files back in the queue so the queue job retries them."""
+    deferred = sibling(queue, "deferred")
+    if not queue.is_dir() or not deferred.is_dir():
+        return
+    moved = 0
+    try:
+        for f in sorted(deferred.iterdir()):
+            if is_event_file(f):
+                os.replace(f, free_name(queue, f.name))
+                moved += 1
+    except OSError as e:
+        log(f"queue: could not move deferred events back: {e}")
+    if moved:
+        log(f"queue: {moved} deferred event file{'s' if moved != 1 else ''} moved back to {queue}")
 
 
 def read_event(f):
-    """(repo, number, kind) from one event file, or None if it can never be handled."""
+    """The event as a dict, or None if it can never be handled (bad JSON, no valid repo or issue number)."""
     try:
         ev = json.loads(f.read_text())
         repo, number = ev["repo"], ev["number"]
@@ -1762,43 +1831,56 @@ def read_event(f):
         return None
     if not isinstance(repo, str) or not REPO_NAME.fullmatch(repo) or type(number) is not int or number < 1:
         return None
-    return repo, number, ev.get("kind")
+    return ev
 
 
 def cmd_drain(queue_dir):
-    """`tick --from-queue DIR`: the per-issue part of tick for each issue that has event files in DIR, then those
-    files are deleted. Files that can never be handled are deleted with a log line; an issue whose handling raised,
-    or that was left for a later pass (a failed read, a per-pass limit), keeps its files for the next run."""
-    files = queue_files(Path(queue_dir).expanduser())
-    if not files:
+    """`tick --from-queue DIR`: the per-issue part of tick for each issue that has event files in DIR. Every entry
+    leaves DIR: handled issues' files are deleted, failed or postponed ones go to DIR-deferred, and entries that
+    can never be handled go to DIR-rejected. Exits 1 if an issue failed; postponing is not a failure."""
+    q = Path(queue_dir).expanduser()
+    entries = sorted(q.iterdir()) if q.is_dir() else []
+    if not entries:
         return 0
     lock = work_lock("tick.lock")
-    if lock is None:
-        log(f"queue: another tick is running; {len(files)} event file{'s' if len(files) != 1 else ''} wait")
+    if lock is None:      # the other job is running and holds the lock; launchd starts this one again shortly
+        log(f"queue: another tick is running; {len(entries)} entr{'ies' if len(entries) != 1 else 'y'} wait")
         return 0
     PENDING.clear()
     SPENT.update(dict.fromkeys(SPENT, 0))
-    groups, failed = {}, set()
+    deferred, rejected = sibling(q, "deferred"), sibling(q, "rejected")
+    groups, failed, events = {}, set(), []
     try:
-        cfg = prbot.load_config()
-        repos = {r.lower(): r for b in WORKERS.values() if b in cfg for r in prbot.installed_repos(b)}
-        for f in files:
+        for f in entries:
+            if not is_event_file(f):
+                move_out(f, rejected, "not a regular .json event file")
+                continue
             try:
                 ev = read_event(f)
-            except OSError as e:          # gone or unreadable right now: leave it for the next run
-                log(f"queue: {f.name}: could not read ({e}); left for the next run")
+            except OSError as e:
+                move_out(f, rejected, f"could not read ({e})")
                 continue
             if ev is None:
-                log(f"queue: {f.name}: not valid JSON with a repo and an issue number; deleted")
-                f.unlink(missing_ok=True)
+                move_out(f, rejected, "not valid JSON with a repo and an issue number")
                 continue
-            repo, number, kind = ev
-            if kind != "issue" or repo.lower() not in repos:
-                why = "not an issue" if kind != "issue" else f"{repo} is not a worker repository"
-                log(f"queue: {f.name}: {why}; deleted")
-                f.unlink(missing_ok=True)
-                continue
-            groups.setdefault(f"{repos[repo.lower()]}#{number}", []).append(f)
+            events.append((f, ev))
+        if not events:
+            return 0
+        try:
+            cfg = prbot.load_config()
+            repos = {r.lower(): r for b in WORKERS.values() if b in cfg for r in prbot.installed_repos(b)}
+        except (Exception, SystemExit) as e:
+            log(f"queue: could not list the worker repositories: {e!r}")
+            for f, ev in events:
+                defer(f, ev, deferred, rejected, "worker repositories unknown")
+            return 1
+        for f, ev in events:
+            if ev.get("kind") != "issue":
+                move_out(f, rejected, "not an issue")
+            elif ev["repo"].lower() not in repos:
+                move_out(f, rejected, f"{ev['repo']} is not a worker repository")
+            else:
+                groups.setdefault(f"{repos[ev['repo'].lower()]}#{ev['number']}", []).append((f, ev))
         for key in groups:
             try:
                 cmd_intake(limit=LIMIT - SPENT["intake"], only={key})
@@ -1807,7 +1889,7 @@ def cmd_drain(queue_dir):
                     cmd_approve(limit=APPROVE_LIMIT - SPENT["approve"], only={key})
             except (Exception, SystemExit) as e:
                 failed.add(key)
-                log(f"{key}: queued event failed, its files stay for the next run: {e!r}")
+                log(f"{key}: queued event failed: {e!r}")
     finally:
         lock.close()
     if read_config().get("coding_live"):
@@ -1818,16 +1900,19 @@ def cmd_drain(queue_dir):
                 cmd_code(limit=CODE_LIMIT - SPENT["code"], only={key})
             except (Exception, SystemExit) as e:
                 failed.add(key)
-                log(f"{key}: queued event failed while coding, its files stay for the next run: {e!r}")
+                log(f"{key}: queued event failed while coding: {e!r}")
     for key, fs in groups.items():
-        if key in failed or key in PENDING:
-            continue
-        for f in fs:
-            f.unlink(missing_ok=True)
-    kept = sorted(set(groups) & (failed | PENDING))
-    done = len(groups) - len(kept)
+        for f, ev in fs:
+            if key in failed:
+                defer(f, ev, deferred, rejected, "failed")
+            elif key in PENDING:
+                defer(f, ev, deferred, rejected, "waits for a later pass")
+            else:
+                f.unlink(missing_ok=True)
+    later_keys = sorted(set(groups) & (failed | PENDING))
+    done = len(groups) - len(later_keys)
     log(f"queue pass done: {done} issue{'s' if done != 1 else ''} handled"
-        + (f"; kept for the next run: {', '.join(kept)}" if kept else ""))
+        + (f"; deferred: {', '.join(later_keys)}" if later_keys else ""))
     return 1 if failed else 0
 
 
