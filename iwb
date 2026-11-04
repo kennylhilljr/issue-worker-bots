@@ -78,9 +78,10 @@ def log(msg):
 #            files go to the deferred folder without counting an attempt
 #   deferred a GitHub read failed: deferred, counting an attempt
 #   failed   the step itself failed (model, post, push): deferred, counting an attempt, and the run exits 1
+#   rejected the event can never be handled here (its number is a pull request): moved to the rejected folder
 # The worst outcome a step reports for an issue wins. SPENT shares the per-pass limits across one queue run.
 OUTCOME = {}
-OUTCOME_RANK = {"held": 1, "waiting": 2, "deferred": 3, "failed": 4}
+OUTCOME_RANK = {"held": 1, "waiting": 2, "deferred": 3, "failed": 4, "rejected": 5}
 SPENT = {"intake": 0, "analyze": 0, "approve": 0, "code": 0}
 
 
@@ -291,7 +292,9 @@ def queued_issues(repo, only):
     found = []
     for key in sorted(k for k in only if k.rsplit("#", 1)[0] == repo):
         i = gh_json(["api", f"repos/{repo}/issues/{key.rsplit('#', 1)[1]}"])[0]
-        if i.get("state") == "open" and not i.get("pull_request"):
+        if i.get("pull_request"):
+            mark(key, "rejected", "is a pull request, not an issue; the worker bots leave pull requests alone")
+        elif i.get("state") == "open":
             found.append(i)
     return found
 
@@ -2105,15 +2108,18 @@ def settle(groups, deferred, rejected, what):
         # and launchd would start it again forever; defer instead.
         log(f"{what}: every issue was held by a limit; deferring them")
         OUTCOME.update(dict.fromkeys(groups, "waiting"))
-    why = {"failed": "failed", "deferred": "will retry later", "waiting": "waits for capacity or a retry delay"}
+    why = {"failed": "failed", "deferred": "will retry later", "waiting": "waits for capacity, a pause or a delay"}
     for key, fs in groups.items():
         outcome = OUTCOME.get(key)
         for f, ev in fs:
             if outcome is None:
                 f.unlink(missing_ok=True)
+            elif outcome == "rejected":
+                move_out(f, rejected, f"{key} can't be handled here")
             elif outcome != "held":       # held: only a per-pass limit, stays in the queue for the next run
                 defer(f, ev, deferred, rejected, why[outcome], count=outcome != "waiting")
-    by = {o: sorted(k for k in groups if OUTCOME.get(k) == o) for o in ("failed", "deferred", "waiting", "held")}
+    by = {o: sorted(k for k in groups if OUTCOME.get(k) == o)
+          for o in ("failed", "deferred", "waiting", "held", "rejected")}
     done = sum(1 for k in groups if k not in OUTCOME)
     log(f"{what} pass done: {done} issue{'s' if done != 1 else ''} handled"
         + "".join(f"; {o}: {', '.join(ks)}" for o, ks in by.items() if ks))
@@ -2228,7 +2234,7 @@ def cmd_drain(queue_dir):
     OUTCOME.clear()
     SPENT.update(dict.fromkeys(SPENT, 0))   # a fresh budget, so the first issue of every run is never limit-held
     deferred, rejected = sibling(q, "deferred"), sibling(q, "rejected")
-    groups, sweeps, swept, sweep_held = {}, [], True, False
+    groups, sweeps, swept, sweep_held, paused = {}, [], True, False, False
     try:
         events = queue_events(q, rejected)
         if not events:
@@ -2253,7 +2259,11 @@ def cmd_drain(queue_dir):
                 move_out(f, rejected, f"{ev['repo']} is not a worker repository")
             else:
                 groups.setdefault(f"{repos[ev['repo'].lower()]}#{ev['number']}", []).append((f, ev))
-        for key in groups:
+        paused = read_config().get("paused")
+        if paused:                        # nothing runs, and nothing is lost: everything waits for the unpause
+            log("queue: paused in config.json; queued events wait in the deferred folder")
+            OUTCOME.update(dict.fromkeys(groups, "waiting"))
+        for key in [] if paused else groups:
             try:
                 cmd_intake(limit=LIMIT - SPENT["intake"], only={key})
                 if key not in OUTCOME:
@@ -2263,11 +2273,11 @@ def cmd_drain(queue_dir):
             except (Exception, SystemExit) as e:
                 mark(key, "failed", f"queued event failed: {e!r}")
         handed = set()
-        if read_config().get("coding_live"):
+        if read_config().get("coding_live") and not paused:
             # the hand-off carries the installed repository's own name, which the state key uses
             hand_off_ready(q, {k: (fs[-1][0].name, {**fs[-1][1], "repo": k.rsplit("#", 1)[0]})
                                for k, fs in groups.items()}, handed)
-        if sweeps:
+        if sweeps and not paused:
             scope = None if any(ev.get("repo") is None for _, ev in sweeps) else \
                 sorted({repos[ev["repo"].lower()] for _, ev in sweeps})
             log(f"queue: sweep of {', '.join(scope) if scope else 'every repository'}")
@@ -2278,7 +2288,9 @@ def cmd_drain(queue_dir):
         lock.close()
     rc = settle(groups, deferred, rejected, "queue")
     for f, ev in sweeps:
-        if not swept:
+        if paused:
+            defer(f, ev, deferred, rejected, "sweep waits for the unpause", count=False)
+        elif not swept:
             defer(f, ev, deferred, rejected, "sweep failed")
         elif not sweep_held:              # held: left in the queue untouched, like a limit-held issue
             f.unlink(missing_ok=True)
@@ -2308,6 +2320,9 @@ def plan_still_current(key, entry, intake_q):
         return False
     if not why:
         return True
+    if why == CLOSED:
+        log(f"{key}: not coded: the issue was closed")
+        return False                      # handled: nothing to code, nothing to send back
     try:
         mark_plan_stale(key, why)
     except (Exception, SystemExit) as e:
@@ -2324,6 +2339,9 @@ def plan_still_current(key, entry, intake_q):
     return False
 
 
+CLOSED = "issue closed"
+
+
 def plan_is_stale(key, entry):
     """Why an approved plan must not be coded now, or None. Reads the issue and its comments again: an edit to the
     title or body, or a trusted comment after the analysis, means it needs analysis first (needs_analysis)."""
@@ -2335,7 +2353,7 @@ def plan_is_stale(key, entry):
     trusted = trusted_openers(owner)
     issue, comments, _ = issue_text(repo, number, trusted, bot_logins, approver_logins)
     if issue["state"] != "open":
-        return None                       # cmd_code leaves closed issues alone
+        return CLOSED                     # closed since cmd_code's first read: stop, never code it
     a = entry.get("analysis") or {}
     edited_at = last_edited(repo, number) if a and not a.get("digest") else None   # as cmd_analyze does
     return needs_analysis(copy.deepcopy(entry), comments, trusted, issue_digest(issue), edited_at)
@@ -2364,6 +2382,10 @@ def cmd_code_drain(queue_dir):
             groups.setdefault(f"{ev['repo']}#{ev['number']}", []).append((f, ev))
     if not groups:
         return 0
+    if read_config().get("paused"):       # before anything else: a pause never loses a hand-off
+        log("code queue: paused in config.json; hand-offs wait in the deferred folder")
+        OUTCOME.update(dict.fromkeys(groups, "waiting"))
+        return settle(groups, deferred, rejected, "code queue")
     if not read_config().get("coding_live"):
         log("code queue: coding_live is off; hand-offs dropped")
         for fs in groups.values():

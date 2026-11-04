@@ -818,6 +818,26 @@ class Code(unittest.TestCase):
         self.run_pass()                                               # with the fake orchestrator
         self.assertEqual(self.labels(), ["bot:in-progress", "bot:pr-open"])
 
+    def test_an_issue_closed_before_the_re_read_is_not_coded(self):
+        # regression (Codex review of #12, P2): closed between cmd_code's first read and the re-read, the issue
+        # counted as current and was coded
+        reads = []
+
+        def gh(args):
+            if args[1].endswith("/comments?per_page=100"):
+                return ""
+            if args[1] == "graphql":
+                return json.dumps({"at": None})
+            reads.append(args[1])
+            return json.dumps({**self.issue, "state": "open" if len(reads) == 1 else "closed"})
+        iwb.prbot.gh_read = gh
+        out = self.run_pass()
+        self.assertEqual(len(reads), 2)                               # the first read, then the re-read
+        self.assertEqual((self.ecc_calls, self.posts, self.pushed), ([], [], []))
+        self.assertIn("not coded: the issue was closed", out)
+        self.assertNotIn("stale_plan", self.state())
+        self.assertFalse(iwb.QUEUE_DIR.exists())                      # nothing sent back either
+
     def test_drive_stop_or_out_of_scope_change_blocks_without_pushing(self):
         self.ecc_results["drive"] = (3, {"ok": False, "data": {"stop": "needs_owner"}, "checks": []})
         self.run_pass()
@@ -1582,7 +1602,8 @@ class Queue(unittest.TestCase):
         return sorted(f.name for f in d.iterdir()) if d.exists() else []
 
     def attempts(self, d):
-        return sorted(json.loads(f.read_text()).get("attempts") for f in d.iterdir() if f.suffix == ".json")
+        return sorted((json.loads(f.read_text()).get("attempts") for f in d.iterdir() if f.suffix == ".json"),
+                      key=lambda n: -1 if n is None else n)
 
     def backstop(self):
         with redirect_stdout(io.StringIO()):
@@ -1845,6 +1866,28 @@ class Queue(unittest.TestCase):
         self.event(1)
         self.assertEqual(self.drain()[0], 0)
         self.assertEqual(self.left(), [])
+
+    def test_paused_events_wait_uncounted_and_are_handled_after_the_unpause(self):
+        # regression (Codex review of #12, P1): with "paused" set the steps did nothing and recorded nothing, so the
+        # queued events were deleted as handled
+        iwb.CONFIG.write_text(json.dumps({"paused": True}))
+        f = self.event(1)
+        self.sweep(self.REPO)
+        self.code_event(2)
+        code, out = self.drain()
+        self.assertEqual((code, self.calls, self.left()), (0, [], []))
+        self.assertEqual(self.left(self.deferred), sorted([f.name, "sweep.json"]))
+        self.assertEqual(self.attempts(self.deferred), [None, None])  # a pause is not a failed attempt
+        self.assertIn("paused in config.json", out)
+        self.assertEqual(self.code_drain()[0], 0)
+        self.assertEqual((self.left(self.cq), self.attempts(self.cdeferred)), ([], [None]))
+        self.assertNotIn("code", [s for s, _ in self.calls])
+        iwb.CONFIG.write_text(json.dumps({}))                         # unpaused
+        self.backstop()                                               # the hourly tick puts them back
+        self.calls.clear()
+        self.assertEqual(self.drain()[0], 0)
+        self.assertEqual((self.left(), self.left(self.deferred)), ([], []))
+        self.assertIn(("analyze", [f"{self.REPO}#1"]), self.calls)
 
     def test_a_sweep_runs_the_full_pass_for_its_repository_and_is_deleted(self):
         iwb.CONFIG.write_text(json.dumps({"approval_live": True}))
@@ -2360,6 +2403,20 @@ class QueueRealSteps(Queue):
         self.assertIn("sweep.json", self.left(self.deferred))
         self.assertEqual(self.attempts(self.deferred), [1, 1])        # the queued event and the sweep
         self.assertIn(f"sweep could not list {self.REPO}", out)
+
+    def test_an_issue_event_for_a_pull_request_is_rejected(self):
+        # regression (Codex review of #12, P3): the pull request was filtered out quietly and its event deleted
+        iwb.cmd_intake = Queue.real_intake
+        base = self.gh
+        iwb.prbot.gh_read = lambda args: json.dumps({**json.loads(base(args)), "number": 3, "assignees": [],
+                                                     "user": {"login": OWNER}, "labels": [],
+                                                     "pull_request": {"url": "u"}}) \
+            if args[1].endswith("/issues/3") else base(args)
+        f = self.event(3)
+        code, out = self.drain()
+        self.assertEqual((code, self.left(), self.left(self.rejected)), (0, [], [f.name]))
+        self.assertNotIn(("analyze", [f"{self.REPO}#3"]), self.calls)
+        self.assertIn("is a pull request", out)
 
     def two_repos(self, entry):
         other = "kennylhilljr/other"
