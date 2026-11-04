@@ -21,7 +21,8 @@
   iwb code --from-queue DIR
       Step 4b for the issues handed off in DIR (default ~/.local/state/github-events/iwb-code), with the same
       deferred and rejected folders. A coding lock held by another pass defers the event without counting it.
-      Before coding, the issue and its trusted comments are read again; if the issue changed since the approved
+      Right before new coding starts (here, in plain tick and in iwb code, under work.lock), the issue and its
+      trusted comments are read again; if the issue changed since the approved
       plan was analyzed, the state entry is marked stale_plan (no approval or coding anywhere until a new
       analysis), an event goes back to the issue queue, and nothing is coded.
   iwb code [--dry-run]
@@ -295,7 +296,7 @@ def queued_issues(repo, only):
     return found
 
 
-def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None, repo=None):
+def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None, repo_filter=None):
     """`only`: a set of "owner/repo#n" keys to look at instead of every open issue (tick --from-queue)."""
     state, since = load_state()
     if read_config().get("paused") and not baseline:
@@ -312,8 +313,8 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None, repo=None)
     repos = set().union(*installed.values())
     if only is not None:
         repos &= {k.rsplit("#", 1)[0] for k in only}
-    if repo is not None:                  # a sweep limited to one repository
-        repos &= {repo}
+    if repo_filter is not None:           # a sweep limited to one repository
+        repos &= {repo_filter}
     for repo in sorted(repos):
         try:
             issues = open_issues(repo) if only is None else queued_issues(repo, only)
@@ -625,7 +626,7 @@ def command_reply(cmd, entry, slug):
     return "There's no code change planned here. Describe the change you want and I'll plan it."
 
 
-def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo=None):
+def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo_filter=None):
     state, since = load_state()
     paused = read_config().get("paused", False)
     cfg = prbot.load_config()
@@ -637,7 +638,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo=None):
     runs = 0
     for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
         if "agent" not in entry or paused or only is not None and key not in only \
-                or repo is not None and not key.startswith(repo + "#"):
+                or repo_filter is not None and not key.startswith(repo_filter + "#"):
             continue
         if time.time() - entry.get("analysis_failed_at", 0) < RETRY_AFTER:
             mark(key, "waiting")              # the hour after a model failure; a queued event retries later
@@ -1067,7 +1068,7 @@ def send_back(entry, key, repo, number, worker, issue, digest, problems):
         log(f"{key}: blocked after a revision {url}")
 
 
-def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo=None):
+def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo_filter=None):
     """Step 4a for planned issues: policy gate, red check, then approval by the other agent's review bot."""
     state, since = load_state()
     if read_config().get("paused"):
@@ -1079,7 +1080,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo=None):
     runs = 0
     for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
         a = entry.get("analysis") or {}
-        if only is not None and key not in only or repo is not None and not key.startswith(repo + "#"):
+        if only is not None and key not in only or repo_filter is not None and not key.startswith(repo_filter + "#"):
             continue
         if a.get("decision") != "plan" or entry.get("blocked") or entry.get("closed") or not entry.get("plan_file"):
             continue
@@ -1836,6 +1837,8 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
             if dry_run:
                 log(f"{key}: would {step}")
                 continue
+            if step == "code" and not plan_still_current(key, entry, QUEUE_DIR):
+                continue                    # read again under work.lock: a newer comment or edit sends it back
             if step == "note":
                 try:
                     run_gh_as(bot, repo, ["issue", "comment", number, "-R", repo, "--body",
@@ -2160,18 +2163,20 @@ def hand_off_ready(q, keys, handed):
 
 def sweep_pass(q, scope, groups, handed):
     """A sweep from the router: the hourly tick's intake, analysis and approval, for the repositories in `scope`
-    (None: all of them), with the usual per-pass limits; issues that are ready to code get hand-offs. True if it
-    ran: no exception and every repository could be listed. Per-issue failures inside the pass are left to those
-    issues' own retries, as in the hourly tick, and never change the outcome of this run's queued events."""
+    (None: all of them), sharing what is left of this run's per-pass limits with the queued events; issues that
+    are ready to code get hand-offs. Returns (ran, held): ran is True when nothing raised and every repository
+    could be listed; held is True when a per-pass limit stopped some of its work, so the sweep stays queued for
+    the next run. Per-issue failures inside the pass are left to those issues' own retries, as in the hourly
+    tick, and never change the outcome of this run's queued events."""
     before = {k: OUTCOME.get(k) for k in groups}
     seen = set(OUTCOME)
     ok = True
     try:
         for r in scope or [None]:
-            cmd_intake(repo=r)
-            cmd_analyze(repo=r)
+            cmd_intake(limit=LIMIT - SPENT["intake"], repo_filter=r)
+            cmd_analyze(limit=ANALYZE_LIMIT - SPENT["analyze"], repo_filter=r)
             if read_config().get("approval_live"):
-                cmd_approve(repo=r)
+                cmd_approve(limit=APPROVE_LIMIT - SPENT["approve"], repo_filter=r)
     except (Exception, SystemExit) as e:
         ok = False
         log(f"queue: sweep failed: {e!r}")
@@ -2184,12 +2189,13 @@ def sweep_pass(q, scope, groups, handed):
         ready = {k: iwb_event(*k.rsplit("#", 1), "sweep") for k in state
                  if "#" in k and k not in groups and (scope is None or k.rsplit("#", 1)[0] in scope)}
         hand_off_ready(q, ready, handed)
+    held = any(v == "held" for k, v in OUTCOME.items() if k not in seen and k not in groups)
     for k, v in before.items():           # the sweep never changes what happens to this run's queued events
         if v is None:
             OUTCOME.pop(k, None)
         else:
             OUTCOME[k] = v
-    return ok
+    return ok, held
 
 
 def cmd_drain(queue_dir):
@@ -2212,7 +2218,7 @@ def cmd_drain(queue_dir):
     OUTCOME.clear()
     SPENT.update(dict.fromkeys(SPENT, 0))   # a fresh budget, so the first issue of every run is never limit-held
     deferred, rejected = sibling(q, "deferred"), sibling(q, "rejected")
-    groups, sweeps, swept = {}, [], True
+    groups, sweeps, swept, sweep_held = {}, [], True, False
     try:
         events = queue_events(q, rejected)
         if not events:
@@ -2255,15 +2261,17 @@ def cmd_drain(queue_dir):
             scope = None if any(ev.get("repo") is None for _, ev in sweeps) else \
                 sorted({repos[ev["repo"].lower()] for _, ev in sweeps})
             log(f"queue: sweep of {', '.join(scope) if scope else 'every repository'}")
-            swept = sweep_pass(q, scope, groups, handed)
+            swept, sweep_held = sweep_pass(q, scope, groups, handed)
+            if swept and sweep_held:
+                log("queue: the sweep hit a per-pass limit; it stays queued for the next run")
     finally:
         lock.close()
     rc = settle(groups, deferred, rejected, "queue")
     for f, ev in sweeps:
-        if swept:
-            f.unlink(missing_ok=True)
-        else:
+        if not swept:
             defer(f, ev, deferred, rejected, "sweep failed")
+        elif not sweep_held:              # held: left in the queue untouched, like a limit-held issue
+            f.unlink(missing_ok=True)
     return 1 if sweeps and not swept else rc
 
 
@@ -2281,6 +2289,34 @@ def mark_plan_stale(key, why):
         return
     entry["stale_plan"] = {"at": time.time(), "reason": why}
     save_state(state, since)
+
+
+def plan_still_current(key, entry, intake_q):
+    """Read the issue again right before coding it. True: the approved plan is current, go ahead. False: don't code
+    now. Either the issue couldn't be read (marked deferred), or the plan is out of date: then stale_plan is
+    recorded under state.lock first, so no path approves or codes it until a new analysis, and an event goes
+    back to the issue queue `intake_q`."""
+    try:
+        why = plan_is_stale(key, entry)
+    except (Exception, SystemExit) as e:
+        mark(key, "deferred", f"could not read the issue again before coding: {e!r}")
+        return False
+    if not why:
+        return True
+    try:
+        mark_plan_stale(key, why)
+    except (Exception, SystemExit) as e:
+        mark(key, "failed", f"plan is out of date ({why}) but could not record that: {e!r}")
+        return False
+    try:
+        problem = queue_dir_problem(intake_q, QUEUE_DEFAULT)
+        if problem:
+            raise OSError(problem)
+        target = write_event(intake_q, *iwb_event(*key.rsplit("#", 1), "stale-plan"), intake_q.parent / ".tmp")
+        log(f"{key}: not coded: the approved plan is out of date ({why}); sent back to {target}")
+    except (OSError, ValueError) as e:
+        mark(key, "failed", f"plan is out of date ({why}) but could not go back to the issue queue: {e}")
+    return False
 
 
 def plan_is_stale(key, entry):
@@ -2333,28 +2369,8 @@ def cmd_code_drain(queue_dir):
         except PLAN_ERRORS as e:
             mark(key, "failed", f"could not read the plan file: {e!r}")
             continue
-        if ready:
-            try:
-                why = plan_is_stale(key, state[key])
-            except (Exception, SystemExit) as e:
-                mark(key, "deferred", f"could not read the issue again before coding: {e!r}")
-                continue
-            if why:
-                try:                      # first record it, so no path codes or approves the old plan any more
-                    mark_plan_stale(key, why)
-                except (Exception, SystemExit) as e:
-                    mark(key, "failed", f"plan is out of date ({why}) but could not record that: {e!r}")
-                    continue
-                try:
-                    intake_q = intake_queue_for(q)
-                    problem = queue_dir_problem(intake_q, QUEUE_DEFAULT)
-                    if problem:
-                        raise OSError(problem)
-                    target = write_event(intake_q, *iwb_event(*key.rsplit("#", 1), "stale-plan"), q.parent / ".tmp")
-                    log(f"{key}: not coded: the approved plan is out of date ({why}); sent back to {target}")
-                except (OSError, ValueError) as e:
-                    mark(key, "failed", f"plan is out of date ({why}) but could not go back to the issue queue: {e}")
-                continue                  # handled: the issue queue analyzes it again; this hand-off is deleted
+        if ready and not plan_still_current(key, state[key], intake_queue_for(q)):
+            continue                      # sent back as stale (handled, so the hand-off is deleted), or marked
         try:
             cmd_code(limit=CODE_LIMIT - SPENT["code"], only={key})
         except (Exception, SystemExit) as e:

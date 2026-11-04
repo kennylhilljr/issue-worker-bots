@@ -632,7 +632,7 @@ class Code(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         p = iwb.prbot
-        self.saved = {k: getattr(p, k) for k in ("gh_read", "bot_config", "openclaw_attention")}
+        self.saved = {k: getattr(p, k) for k in ("gh_read", "bot_config", "openclaw_attention", "load_config")}
         self.saved_iwb = {k: getattr(iwb, k) for k in (
             "STATE", "CONFIG", "WORK_DIR", "post", "run_gh_as", "checkout", "trusted_copy", "changed_files",
             "commit_as", "push_branch", "create_pr", "ready_pr", "ECC_DEFAULTS", "orchestrator_drift", "QUEUE_DIR")}
@@ -644,8 +644,12 @@ class Code(unittest.TestCase):
         iwb.ECC_DEFAULTS = {"certifications": str(Path(self.tmp.name, "cert-latest.json"))}
         self.certify()
         iwb.orchestrator_drift = lambda: None
-        self.issue = {"state": "open", "title": "Add retries", "labels": ["bot:approved"]}
-        p.gh_read = lambda args: json.dumps(self.issue)
+        self.issue = {"state": "open", "title": "Add retries", "labels": ["bot:approved"], "body": "", "user": OWNER}
+        self.comments = []                  # trusted comments, read again right before coding starts
+        p.gh_read = lambda args: "\n".join(json.dumps(c) for c in self.comments) \
+            if args[1].endswith("/comments?per_page=100") else json.dumps(self.issue)
+        p.load_config = lambda: {"claude-dev": {"owner": OWNER, "slug": "claude-dev-gh"},
+                                 "codex-dev": {"owner": OWNER, "slug": "codex-dev-gh"}}
         p.bot_config = lambda bot: {"slug": {"claude": "claude-pr-gh", "codex": "codex-pr-gh"}.get(bot, bot + "-gh")}
         self.events = []
         p.openclaw_attention = lambda r, d: self.events.append(r) or True
@@ -784,6 +788,34 @@ class Code(unittest.TestCase):
         calls.clear()
         iwb.main(["tick"])
         self.assertEqual(calls, ["cmd_intake", "cmd_analyze", "cmd_code"])   # independent of approval_live
+
+    def test_coding_reads_the_issue_again_and_sends_a_stale_plan_back(self):
+        # regression (Codex review of #12, P1): a trusted comment after approval did not stop a manual `iwb code`
+        # or the hourly pass from implementing the old plan
+        self.comments = [{"user": OWNER, "body": "Use the v2 API instead.", "at": "2026-11-03T14:00:00Z"}]
+        out = self.run_pass()
+        self.assertEqual((self.ecc_calls, self.posts), ([], []))      # nothing coded, nothing posted
+        self.assertEqual(self.state()["stale_plan"]["reason"], "reply after plan")
+        (back,) = iwb.QUEUE_DIR.iterdir()
+        self.assertEqual(json.loads(back.read_text())["event"], "stale-plan")
+        self.assertIn("not coded: the approved plan is out of date", out)
+        self.assertIn("out of date; not coding", self.run_pass())     # later passes refuse without reading again
+
+    def test_the_hourly_tick_codes_only_a_current_plan(self):
+        iwb.CONFIG.write_text(json.dumps({**self.PILOT, "coding_live": True}))
+        saved = {k: getattr(iwb, k) for k in ("cmd_intake", "cmd_analyze", "cmd_approve")}
+        self.addCleanup(lambda: [setattr(iwb, k, v) for k, v in saved.items()])
+        for k in saved:
+            setattr(iwb, k, lambda *a, **kw: 0)                       # e.g. the analysis limit went elsewhere
+        self.comments = [{"user": OWNER, "body": "Scope changed.", "at": "2026-11-03T14:00:00Z"}]
+        with redirect_stdout(io.StringIO()):
+            iwb.main(["tick"])
+        self.assertEqual(self.ecc_calls, [])
+        self.assertIn("stale_plan", self.state())
+        self.comments = []
+        self.approve_plan([coding_unit()])                            # a new analysis and approval, no new comments
+        self.run_pass()                                               # with the fake orchestrator
+        self.assertEqual(self.labels(), ["bot:in-progress", "bot:pr-open"])
 
     def test_drive_stop_or_out_of_scope_change_blocks_without_pushing(self):
         self.ecc_results["drive"] = (3, {"ok": False, "data": {"stop": "needs_owner"}, "checks": []})
@@ -1472,7 +1504,7 @@ class Queue(unittest.TestCase):
         self.wait = set()      # (step, key) that leave the issue for a later pass after an error
         self.hold = set()      # (step, key) held back only by a per-pass limit
         for step in ("intake", "analyze", "approve", "code"):
-            setattr(iwb, f"cmd_{step}", lambda *a, _s=step, only=None, **kw: self.fake_step(_s, only, kw.get("repo")))
+            setattr(iwb, f"cmd_{step}", lambda *a, _s=step, only=None, **kw: self.fake_step(_s, only, kw.get("repo_filter")))
         self.passes = []       # (step, repo) for repository-wide passes (only=None): plain tick and sweeps
         self.n = 0
 
@@ -1893,6 +1925,28 @@ class Queue(unittest.TestCase):
         self.assertEqual(list(elsewhere.iterdir()), [])
         self.assertEqual(self.calls, [])
 
+    def test_a_sweep_uses_only_the_budget_the_queued_events_left(self):
+        # regression (Codex review of #12, P2): a sweep reset the per-pass limits and could run extra analyses
+        limits = []
+
+        def analyze(only=None, limit=None, **kw):
+            limits.append((sorted(only) if only else None, limit))
+            if limit <= 0:
+                iwb.mark(f"{self.REPO}#9", "held", "analysis waits for the next pass (limit 0)")
+            else:
+                iwb.SPENT["analyze"] += 1
+        iwb.cmd_analyze = analyze
+        self.event(1)
+        f = self.sweep(self.REPO)
+        before = f.read_text()
+        code, out = self.drain()
+        self.assertEqual(limits, [([f"{self.REPO}#1"], 1), (None, 0)])
+        self.assertEqual((code, self.left(), f.read_text()), (0, ["sweep.json"], before))   # kept, untouched
+        self.assertIn("stays queued for the next run", out)
+        limits.clear()
+        self.assertEqual(self.drain()[0], 0)                          # next run: the sweep gets the budget
+        self.assertEqual((limits, self.left()), ([(None, 1)], []))
+
     def test_sweeps_are_recognized_by_content_and_only_claimed_ones_are_deleted(self):
         a = self.sweep(self.REPO, name="sweep-20261103T150000000Z-3fa9c1.json")
         b = self.sweep(None, name="sweep-20261103T150001000Z-0b7d22.json")
@@ -2233,6 +2287,46 @@ class QueueRealSteps(Queue):
 
     def fail_test(self, msg):
         raise AssertionError(msg)
+
+    def two_repos(self, entry):
+        other = "kennylhilljr/other"
+        iwb.prbot.installed_repos = lambda bot: {self.REPO, other}
+        iwb.STATE.write_text(json.dumps({f"{self.REPO}#1": dict(entry), f"{other}#2": dict(entry)}))
+        return [f"{self.REPO}#1", f"{other}#2"]
+
+    def test_plain_tick_and_an_all_repository_sweep_reach_every_repository(self):
+        # regression (Codex review of #12, P1): the repository filter was overwritten by the loop's own repo, so
+        # after the first issue every other repository was skipped
+        iwb.cmd_analyze = Queue.real_analyze
+        replies = []
+        saved = iwb.run_gh_as
+        self.addCleanup(lambda: setattr(iwb, "run_gh_as", saved))
+        iwb.run_gh_as = lambda bot, repo, args: replies.append(repo) or "https://x/c"
+        digest = iwb.issue_digest({"title": "t", "body": "b"})
+        entry = {"agent": "claude", "analysis": {"decision": "no_change", "at": 1, "digest": digest}}
+        for n in (1, 2):
+            self.comments[n] = [{"user": OWNER, "body": "status", "at": "2026-11-03T14:00:00Z"}]
+        keys = self.two_repos(entry)
+        self.backstop()
+        self.assertEqual(sorted(replies), [self.REPO, "kennylhilljr/other"])
+        replies.clear()
+        self.two_repos(entry)
+        self.sweep(None)
+        self.assertEqual(self.drain()[0], 0)
+        self.assertEqual(sorted(replies), [self.REPO, "kennylhilljr/other"])
+        state = json.loads(iwb.STATE.read_text())
+        self.assertTrue(all("handled_at" in state[k] for k in keys))
+
+    def test_analysis_with_room_for_two_analyzes_both_repositories(self):
+        saved = iwb.post
+        self.addCleanup(lambda: setattr(iwb, "post", saved))
+        iwb.post = lambda *a, **kw: "https://x/c"
+        iwb.run_model = lambda *a, **kw: answer({"decision": "no_change", "summary": "done"})
+        keys = self.two_repos({"agent": "claude"})
+        with redirect_stdout(io.StringIO()):
+            Queue.real_analyze(limit=5)
+        state = json.loads(iwb.STATE.read_text())
+        self.assertEqual([state[k]["analysis"]["decision"] for k in keys], ["no_change", "no_change"])
 
     def test_a_coding_failure_is_deferred_in_the_code_queue_and_requeued(self):
         iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
