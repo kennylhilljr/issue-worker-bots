@@ -448,9 +448,18 @@ def read_config():
     return json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
 
 
-def issue_cost():
-    """The most one issue may spend, in US dollars: drive's --max-cost-usd and the planner's per-unit limit."""
-    return read_config().get("max_cost_usd_per_issue", MAX_COST_USD)
+MAX_COST_CEILING = 100    # the most config.json "max_cost_usd_per_issue" may be; a typo shouldn't buy a $1e9 run
+
+
+def issue_cost(conf=None):
+    """The most one issue may spend, in US dollars: drive's --max-cost-usd and the planner's per-unit limit.
+    RuntimeError when config.json "max_cost_usd_per_issue" isn't a number above 0 and at most MAX_COST_CEILING,
+    so a bad value stops a pass before anything is posted rather than crashing a run that has started."""
+    cost = (read_config() if conf is None else conf).get("max_cost_usd_per_issue", MAX_COST_USD)
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)) or not 0 < cost <= MAX_COST_CEILING:
+        raise RuntimeError(f"config.json max_cost_usd_per_issue must be a number above 0 and at most "
+                           f"{MAX_COST_CEILING}, not {cost!r}")
+    return cost
 
 
 def example_unit(cost):
@@ -1648,11 +1657,11 @@ def ready_pr(bot, repo, url):
     run_gh_as(bot, repo, ["pr", "ready", url, "-R", repo])
 
 
-def orchestrator_config(path):
+def orchestrator_config(path, conf=None):
     """Write the orchestrator config for a run: certifications and catalog by default, overridden or extended by
     config.json "ecc_config" (any orchestrator config key, for example repo_checks). RuntimeError if the
     certifications are missing or would expire before the run could end, since no runner could be assigned."""
-    c = {**ECC_DEFAULTS, **read_config().get("ecc_config", {})}
+    c = {**ECC_DEFAULTS, **(read_config() if conf is None else conf).get("ecc_config", {})}
     c = {k: os.path.expanduser(v) if isinstance(v, str) else v for k, v in c.items()}
     if not Path(c.get("certifications") or "").is_file():
         raise RuntimeError(f"no orchestrator certifications at {c.get('certifications')}; set ecc_config in config.json")
@@ -1663,6 +1672,40 @@ def orchestrator_config(path):
         c.pop("catalog")
     Path(path).write_text(json.dumps(c, indent=1) + "\n")
     return path
+
+
+CLI_MODELS = {   # DESIGN.md "Model choice": each worker's Tier 0, 1 and 2 coding model
+    "claude": {"economical": "haiku", "standard": "sonnet", "advanced": "opus"},
+    "codex": {"economical": "gpt-5.6-terra", "standard": "gpt-5.6-sol", "advanced": "gpt-6-astra"}}
+
+
+def orchestrator_policy(agent, cost=None):
+    """The orchestrator policy for a run coded by `agent`'s worker. Without one the orchestrator has no model for
+    Tier 0: Claude serves it only through `cli_models` with `review_independence: persona`, Codex only through
+    `cli_models`, and the API runners only through `model_preferences`, which iwb can't use since dispatch
+    launches coding CLIs only. So every iwb run stopped with `no eligible certified runner for tier 0`. The worker
+    authors; both CLIs may review, the other one first, since the team review prefers another provider."""
+    cost = float(issue_cost() if cost is None else cost)
+    return {"schema_version": "1.0", "high_risk_paths": [".orchestration/**"], "required_checks": [],
+            "protected_commands": ["git push*", "git reset --hard*", "rm -rf*", "git clean -fdx*"],
+            "allowed_providers": sorted(CLI_MODELS), "author_providers": [agent], "review_independence": "persona",
+            "budget": {"max_cost_usd_per_unit": cost, "max_cost_usd_total": cost,
+                       "max_minutes_per_unit": DRIVE_TIMEOUT // 60},
+            "cli_models": copy.deepcopy(CLI_MODELS)}
+
+
+def policy_args(d, repo, agent, conf=None, cost=None):
+    """`--policy-file` with iwb's policy for `agent`, or nothing when the repository has its own
+    `.orchestration/config.yaml` or config.json "ecc_config" names a `policy_file`; those win. `conf` is the
+    config.json snapshot the run's orchestrator config was written from, so both agree on `policy_file`."""
+    conf = read_config() if conf is None else conf
+    own = Path(d) / ".orchestration" / "config.yaml"
+    if conf.get("ecc_config", {}).get("policy_file") or own.exists():
+        return []
+    path = WORK_DIR / "repos" / f"{repo.replace('/', '__')}.policy.json"
+    path.write_text(json.dumps(orchestrator_policy(agent, issue_cost(conf) if cost is None else cost), indent=1)
+                    + "\n")
+    return ["--policy-file", str(path)]
 
 
 def stop_reason(repo, number):
@@ -1681,7 +1724,9 @@ def code_plan(key, entry, issue, state, since, ecc):
     repo, number = key.rsplit("#", 1)
     owner, name = repo.split("/")
     (WORK_DIR / "repos").mkdir(parents=True, exist_ok=True)
-    ecc_cfg = orchestrator_config(WORK_DIR / "repos" / f"{repo.replace('/', '__')}.ecc.json")   # before any post
+    conf = read_config()            # one snapshot for the whole run: config.json may change while it drives
+    cost = issue_cost(conf)         # before any post: a bad value stops here, not after "Coding started"
+    ecc_cfg = orchestrator_config(WORK_DIR / "repos" / f"{repo.replace('/', '__')}.ecc.json", conf)
     drift = orchestrator_drift()
     if drift:
         raise RuntimeError(drift)
@@ -1712,7 +1757,8 @@ def code_plan(key, entry, issue, state, since, ecc):
         plan = str(Path(d).parent / f"{Path(d).name}.plan.json")
         Path(plan).write_text(json.dumps({"units": units}, indent=1) + "\n")
         cfg = ["--config", str(ecc_cfg), "--repo", d, "--target-branch", branch,
-               "--state-dir", str(WORK_DIR / "ecc-state"), "--worktree-root", str(WORK_DIR / "worktrees")]
+               "--state-dir", str(WORK_DIR / "ecc-state"), "--worktree-root", str(WORK_DIR / "worktrees")] \
+            + policy_args(d, repo, agent, conf, cost)
         opts = {"env": drive_env()}    # no sandbox-exec: codex can't write under one (DESIGN.md "Safety")
         approve = ["review-plan", "--json", "--approve", "--operator", w["approver"], "--session", session, "--"]
         create = ["create-run", "--run-id", run_id, "--plan", plan] + cfg
@@ -1720,7 +1766,6 @@ def code_plan(key, entry, issue, state, since, ecc):
         w["plan_sha256"] = review.get("plan_sha256")
         ecc_data(ecc, create + ["--yes", "--review-id", review["review_id"], "--json"], "create-run", **opts)
         hours = max(1, -(-sum(u["budget"]["minutes"] for u in units) // 60))
-        cost = issue_cost()
         drive = ["drive", "--run-id", run_id, "--max-hours", str(hours), "--max-cost-usd", str(cost)] + cfg
         review = ecc_data(ecc, approve + drive, "review-plan drive", **opts)
         ecc_data(ecc, drive + ["--yes", "--review-id", review["review_id"], "--json"], "drive", DRIVE_TIMEOUT,

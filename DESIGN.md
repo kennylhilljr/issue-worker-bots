@@ -189,7 +189,7 @@ Expensive models where judgment matters, cheaper models where the instructions a
 | Repair after review | Same tier as the original unit | Same | Findings are specific instructions, so the cheap tier usually suffices |
 | Issue comments and status notes | `haiku` | `gpt-6-luna` | Short summaries |
 
-These go in the orchestrator policy (`cli_models` and `model_preferences`), not in code, so swapping a model is a config change. The Codex list comes from the models the CLI reports today. On the Claude side, "older and cheaper" is better served by the smaller classes (Sonnet, Haiku) than by older Opus versions; I have no pricing data showing older Claude versions cost less on a subscription.
+These go in the orchestrator policy (`cli_models`), not in the orchestrator's code, so swapping a model is a config change. `iwb` writes that policy for each run (`CLI_MODELS` and `orchestrator_policy` in `iwb`) unless the repository has its own `.orchestration/config.yaml`. The worker's CLI authors, both CLIs may review, and `review_independence` is `persona`, since the orchestrator lets Claude serve Tier 0 only then. The API runners are left out: dispatch launches coding CLIs only, and the drive environment carries no API keys. The Codex list comes from the models the CLI reports today. On the Claude side, "older and cheaper" is better served by the smaller classes (Sonnet, Haiku) than by older Opus versions; I have no pricing data showing older Claude versions cost less on a subscription.
 
 Two cautions:
 
