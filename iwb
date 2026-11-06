@@ -507,6 +507,28 @@ def clone(repo, bot):
     return work, branch, sha
 
 
+MODEL_TIMEOUT = 1800       # seconds for one analysis or approval call
+
+
+def run_cli(cmd, stdin, cwd=None, timeout=MODEL_TIMEOUT):
+    """Run a model CLI in its own process group with file-backed output. subprocess.run's timeout kills only the
+    direct child: `codex` is a node wrapper whose native binary keeps the pipes open, so the call never returned.
+    On the timeout the whole group is killed and RuntimeError raised. Returns (exit code, stdout, stderr)."""
+    with tempfile.TemporaryFile("w+") as fin, tempfile.TemporaryFile("w+") as out, \
+            tempfile.TemporaryFile("w+") as err:
+        fin.write(stdin or "")
+        fin.seek(0)
+        p = subprocess.Popen(cmd, stdin=fin, stdout=out, stderr=err, text=True, cwd=cwd, start_new_session=True)
+        try:
+            p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_group(p)
+            raise RuntimeError(f"{cmd[0]} timed out after {timeout // 60} minutes")
+        out.seek(0)
+        err.seek(0)
+        return p.returncode, out.read(), err.read()
+
+
 def run_model(agent, prompt, stdin, cwd, model=None):
     """Run a model read-only (analysis model by default). Returns its final answer text, or raises RuntimeError."""
     m = model or analysis_model(agent)
@@ -514,16 +536,16 @@ def run_model(agent, prompt, stdin, cwd, model=None):
         cmd = ["claude", "-p", prompt, "--model", m["model"], "--effort", m["effort"], "--output-format", "text",
                "--no-session-persistence", "--strict-mcp-config", "--permission-mode", "dontAsk",
                "--allowedTools", "Read Grep Glob", "--disallowedTools", "Bash Edit Write NotebookEdit WebFetch WebSearch"]
-        r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, cwd=cwd, timeout=1800)
-        out = r.stdout
+        code, stdout, stderr = run_cli(cmd, stdin, cwd=cwd)
+        out = stdout
     else:
         outfile = Path(cwd).parent / "answer.md"
         cmd = ["codex", "exec", "-m", m["model"], "-c", f'model_reasoning_effort="{m["effort"]}"', "-s", "read-only",
                "--skip-git-repo-check", "--ephemeral", "-C", cwd, "-o", str(outfile), prompt]
-        r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=1800)
+        code, stdout, stderr = run_cli(cmd, stdin)
         out = outfile.read_text() if outfile.exists() else ""
-    if r.returncode != 0 or not out.strip():
-        raise RuntimeError(f"{agent} analysis failed (exit {r.returncode}): {(r.stderr or r.stdout).strip()[-300:]}")
+    if code != 0 or not out.strip():
+        raise RuntimeError(f"{agent} analysis failed (exit {code}): {(stderr or stdout).strip()[-300:]}")
     return out
 
 
