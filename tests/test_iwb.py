@@ -885,6 +885,37 @@ class Code(unittest.TestCase):
         self.assertEqual(policy["budget"]["max_cost_usd_total"], 5.0)
         self.assertEqual(self.state()["work"]["status"], "pr-open")
 
+    def test_bad_issue_cost_waits_without_posting(self):
+        # review of issue-worker-bots#26: a bad max_cost_usd_per_issue crashed the run after "Coding started",
+        # so the next pass blocked a valid plan as interrupted; it is now checked before anything is posted
+        self.approve_plan([REAL_TIER0_UNIT])
+        for bad in (None, "five", 0, -1, True, 1e309, 10 ** 9):
+            iwb.CONFIG.write_text(json.dumps({**self.PILOT, "max_cost_usd_per_issue": bad}))
+            with self.assertRaises(RuntimeError):
+                iwb.issue_cost()
+        posts = len(self.posts)
+        log = self.run_pass()
+        self.assertIn("max_cost_usd_per_issue must be a number", log)
+        self.assertEqual((len(self.posts), self.ecc_calls), (posts, []))
+        self.assertNotEqual(self.state()["work"].get("status"), "in-progress")
+
+    def test_run_uses_one_config_snapshot(self):
+        # review of issue-worker-bots#26: policy_args read config.json again, so an edit during the run could drop
+        # the policy (bringing back the Tier 0 failure) or change its budget
+        self.approve_plan([REAL_TIER0_UNIT])
+        self.changed = ["README.md", "skills/README.md"]
+        real = iwb.orchestrator_config
+        def edit_after(*a, **k):
+            out = real(*a, **k)
+            iwb.CONFIG.write_text(json.dumps({**self.PILOT, "max_cost_usd_per_issue": 50,
+                                              "ecc_config": {"policy_file": "~/p.json"}}))
+            return out
+        iwb.orchestrator_config = edit_after
+        self.addCleanup(setattr, iwb, "orchestrator_config", real)
+        self.run_pass()
+        self.assertEqual(self.policy_of(self.ecc_calls[3])["budget"]["max_cost_usd_total"], 5.0)
+        self.assertIn("5", self.ecc_calls[3][self.ecc_calls[3].index("--max-cost-usd") + 1])
+
     def test_codex_worker_authors_with_codex(self):
         self.approve_plan([REAL_TIER0_UNIT], agent="codex")
         self.run_pass()
