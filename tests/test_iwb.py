@@ -1392,6 +1392,17 @@ class DriveProcess(unittest.TestCase):
         self.assertLess(time.time() - start, 30)
         self.assertFalse(self.child_alive())
 
+    def test_stay_awake_holds_until_this_process_exits(self):
+        started = []
+        saved = iwb.subprocess.Popen, iwb.shutil.which
+        iwb.subprocess.Popen = lambda argv, **kw: started.append(argv)
+        iwb.shutil.which = lambda name: "/usr/bin/" + name
+        try:
+            iwb.stay_awake()
+        finally:
+            iwb.subprocess.Popen, iwb.shutil.which = saved
+        self.assertEqual(started, [["/usr/bin/caffeinate", "-i", "-w", str(iwb.os.getpid())]])
+
     def test_model_output_and_stdin(self):
         cli = Path(self.tmp.name, "cli")
         cli.write_text("#!/bin/sh\ncat\necho oops >&2\nexit 4\n")
