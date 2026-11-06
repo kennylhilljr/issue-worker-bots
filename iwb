@@ -1263,6 +1263,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo_filter=None)
 CODE_LIMIT = 1             # coding runs per pass
 IN_PROGRESS_LIMIT = 2      # issues being coded at once (DESIGN.md "Budgets and limits")
 DRIVE_TIMEOUT = 6 * 3600
+RUNNER_TIMEOUT = 3600      # hard ceiling per coding attempt; the orchestrator's budget.minutes is advisory only
 POLL = 30                  # seconds between checks for bot:stop and pause while drive runs
 KILL_GRACE = 30            # seconds between SIGTERM and SIGKILL for a stopped drive
 REQUIRED_RUNNERS = ("claude", "codex")   # the worker families: each unit's author and its reviewer from the other
@@ -1670,6 +1671,9 @@ def orchestrator_config(path, conf=None):
         raise RuntimeError(problem)
     if c.get("catalog") and not Path(c["catalog"]).is_file():
         c.pop("catalog")
+    # drive checks --max-hours only between steps and the orchestrator has no attempt timeout by default, so one
+    # long attempt could hold the serial code queue until DRIVE_TIMEOUT
+    c.setdefault("runner_timeout", RUNNER_TIMEOUT)
     Path(path).write_text(json.dumps(c, indent=1) + "\n")
     return path
 
