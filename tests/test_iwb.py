@@ -1606,6 +1606,65 @@ def orchestrator_modules():
 ORCH = orchestrator_modules()
 
 
+# Acceptance commands of a real plan (agent-control-plane-infra#22, orchestrator run
+# iwb.kennylhilljr.agent-control-plane-infra.22.20261106134041). The plan gate let the env wrapper through, the
+# orchestrator's gate refused it on all four attempts, and the run stopped with needs_owner (exit 3).
+REAL_WRAPPER_CMDS = ["env PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp python3 -m unittest discover -s tests -v",
+                     "python3 -B tests/run_cli_checks.py"]
+
+
+class GateWrappers(unittest.TestCase):
+    def test_real_env_wrapper_goes_back_to_the_planner(self):
+        problems = iwb.fixable_problems([unit("cli-error-envelopes", acceptance={"commands": REAL_WRAPPER_CMDS})])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("cli-error-envelopes: acceptance command runs env", problems[0])
+
+    def test_wrappers_and_variable_prefixes(self):
+        for cmd in ("bash -c 'python3 -m unittest'", "timeout 60 python3 -m pytest", "/usr/bin/env python3 t.py",
+                    "PYTHONPATH=src python3 -m unittest", "bash5.2 -c x", "xargs python3"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(iwb.gate_refusal(cmd))
+                self.assertEqual(len(iwb.fixable_problems([unit(acceptance={"commands": [cmd]})])), 1)
+        for cmd in ("python3 -m unittest discover -s tests", "uv run pytest -q", "gitleaks dir . --exit-code 1",
+                    "python3 -c 'import x'", "make check", ""):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(iwb.gate_refusal(cmd))
+
+    def test_shell_syntax_is_reported_once(self):
+        problems = iwb.fixable_problems([unit(acceptance={"commands": ["env X=1 python3 t.py && echo ok"]})])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("needs a shell", problems[0])
+
+
+def orchestrator_gate_policy():
+    """The sibling orchestrator's gate command policy, or None when it isn't checked out."""
+    import sys
+    src = Path(iwb.ECC).resolve().parent.parent / "src"
+    if sys.version_info < (3, 11) or not (src / "openclaw_ecc_orchestrator").is_dir():
+        return None
+    sys.path.insert(0, str(src))
+    try:
+        from openclaw_ecc_orchestrator.gates import runner
+    except ImportError:
+        return None
+    finally:
+        sys.path.remove(str(src))
+    return runner
+
+
+GATE_RUNNER = orchestrator_gate_policy()
+
+
+@unittest.skipUnless(GATE_RUNNER, "needs the sibling openclaw-ecc-orchestrator checkout and Python 3.11+")
+class GateWrappersMatchOrchestrator(unittest.TestCase):
+    def test_same_wrapper_list(self):
+        self.assertEqual(iwb.GATE_WRAPPERS, set(GATE_RUNNER.WRAPPERS))
+
+    def test_orchestrator_refuses_what_iwb_sends_back(self):
+        self.assertIsNotNone(GATE_RUNNER.check_command_policy(REAL_WRAPPER_CMDS[0].split()))
+        self.assertIsNone(GATE_RUNNER.check_command_policy(REAL_WRAPPER_CMDS[1].split()))
+
+
 @unittest.skipUnless(ORCH, "needs the sibling openclaw-ecc-orchestrator checkout and Python 3.11+")
 class OrchestratorRouting(unittest.TestCase):
     """iwb's policy against the orchestrator's own routing, with the real unit and certifications of

@@ -412,7 +412,8 @@ Read the code you need. Change nothing. Then decide one of three things.
    - "scope.files": the files the unit may change. Existing paths, or new files named explicitly.
    - "acceptance.commands": commands that run in this repository and pass only when the unit is done
      (use the repository's real test runner; look at how existing tests run). They run WITHOUT a shell:
-     no pipes, &&, ;, redirects, $(...), backticks or heredocs. To check text, add a small test file to the
+     no pipes, &&, ;, redirects, $(...), backticks or heredocs, no VAR=value prefixes and no wrappers such as
+     env, bash -c, timeout or xargs; set variables in the test itself. To check text, add a small test file to the
      unit's scope and run it, for example "python3 -m unittest tests.test_readme".
    - "capabilities": network false unless the coding step truly needs the internet; secrets always [].
    - "routing.initial_tier": 0 for mechanical, fully specified work; 1 for normal work; 2 for security,
@@ -931,14 +932,43 @@ def policy_violations(units, repo):
 
 
 SHELL_SYNTAX = re.compile(r"\||&&|;|>|<|\$\(|`|\n")
+# Programs the orchestrator's gate runner refuses as shells or command wrappers (WRAPPERS in
+# openclaw_ecc_orchestrator/gates/runner.py). iwb passes it no allow_wrappers, so each is refused at the gate.
+GATE_WRAPPERS = {
+    "sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "pdksh", "ash", "csh", "tcsh", "rbash", "yash", "elvish", "nu",
+    "xonsh", "pwsh", "powershell", "env", "xargs", "eval", "exec", "sudo", "doas", "su", "runuser", "pkexec", "nohup",
+    "time", "nice", "ionice", "command", "builtin", "busybox", "toybox", "timeout", "stdbuf", "setsid", "chroot",
+    "script", "watch", "parallel", "unbuffer", "flock", "chrt", "taskset", "caffeinate", "arch", "strace", "ltrace",
+    "xcrun", "sandbox-exec", "dtruss", "launchctl", "osascript"}
+
+
+def gate_refusal(cmd):
+    """Why the orchestrator's gate would refuse or fail to start `cmd` although it has no shell syntax, or None.
+    It runs the first word as the program, so a wrapper (`env X=1 python3 ...`) is refused and a `VAR=value`
+    prefix is looked up as a program and fails to spawn."""
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        return None
+    if not words:
+        return None
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
+        return "starts with a VAR=value setting, which only a shell understands"
+    prog = re.sub(r"[-_]?\d[\d.]*$", "", os.path.basename(words[0]).lower()) or words[0]
+    if prog in GATE_WRAPPERS:
+        return f"runs {prog}, a shell or command wrapper the orchestrator refuses"
+    return None
 
 
 def fixable_problems(units):
     """Problems the planner can fix: acceptance commands the orchestrator would refuse, because it runs
-    them without a shell, and a cost limit that would stop a unit before it starts. These send the plan back
-    for revision instead of blocking the issue."""
+    them without a shell or wrapper, and a cost limit that would stop a unit before it starts. These send the
+    plan back for revision instead of blocking the issue."""
+    cmds = [(u, c) for u in units for c in u["acceptance"]["commands"]]
     return [f"{u['id']}: acceptance command needs a shell, which the orchestrator doesn't use: {c[:100]}"
-            for u in units for c in u["acceptance"]["commands"] if SHELL_SYNTAX.search(c)] \
+            for u, c in cmds if SHELL_SYNTAX.search(c)] \
+        + [f"{u['id']}: acceptance command {gate_refusal(c)}: {c[:100]}"
+           for u, c in cmds if not SHELL_SYNTAX.search(c) and gate_refusal(c)] \
         + [cost_problem(u) for u in units if cost_problem(u)]
 
 
