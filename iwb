@@ -1665,6 +1665,37 @@ def orchestrator_config(path):
     return path
 
 
+CLI_MODELS = {   # DESIGN.md "Model choice": each worker's Tier 0, 1 and 2 coding model
+    "claude": {"economical": "haiku", "standard": "sonnet", "advanced": "opus"},
+    "codex": {"economical": "gpt-5.6-terra", "standard": "gpt-5.6-sol", "advanced": "gpt-6-astra"}}
+
+
+def orchestrator_policy(agent):
+    """The orchestrator policy for a run coded by `agent`'s worker. Without one the orchestrator has no model for
+    Tier 0: Claude serves it only through `cli_models` with `review_independence: persona`, Codex only through
+    `cli_models`, and the API runners only through `model_preferences`, which iwb can't use since dispatch
+    launches coding CLIs only. So every iwb run stopped with `no eligible certified runner for tier 0`. The worker
+    authors; both CLIs may review, the other one first, since the team review prefers another provider."""
+    cost = float(issue_cost())
+    return {"schema_version": "1.0", "high_risk_paths": [".orchestration/**"], "required_checks": [],
+            "protected_commands": ["git push*", "git reset --hard*", "rm -rf*", "git clean -fdx*"],
+            "allowed_providers": sorted(CLI_MODELS), "author_providers": [agent], "review_independence": "persona",
+            "budget": {"max_cost_usd_per_unit": cost, "max_cost_usd_total": cost,
+                       "max_minutes_per_unit": DRIVE_TIMEOUT // 60},
+            "cli_models": copy.deepcopy(CLI_MODELS)}
+
+
+def policy_args(d, repo, agent):
+    """`--policy-file` with iwb's policy for `agent`, or nothing when the repository has its own
+    `.orchestration/config.yaml` or config.json "ecc_config" names a `policy_file`; those win."""
+    own = Path(d) / ".orchestration" / "config.yaml"
+    if read_config().get("ecc_config", {}).get("policy_file") or own.exists():
+        return []
+    path = WORK_DIR / "repos" / f"{repo.replace('/', '__')}.policy.json"
+    path.write_text(json.dumps(orchestrator_policy(agent), indent=1) + "\n")
+    return ["--policy-file", str(path)]
+
+
 def stop_reason(repo, number):
     """Why a running drive must stop now, or None: the bots were paused, or the issue got bot:stop."""
     try:
@@ -1712,7 +1743,8 @@ def code_plan(key, entry, issue, state, since, ecc):
         plan = str(Path(d).parent / f"{Path(d).name}.plan.json")
         Path(plan).write_text(json.dumps({"units": units}, indent=1) + "\n")
         cfg = ["--config", str(ecc_cfg), "--repo", d, "--target-branch", branch,
-               "--state-dir", str(WORK_DIR / "ecc-state"), "--worktree-root", str(WORK_DIR / "worktrees")]
+               "--state-dir", str(WORK_DIR / "ecc-state"), "--worktree-root", str(WORK_DIR / "worktrees")] \
+            + policy_args(d, repo, agent)
         opts = {"env": drive_env()}    # no sandbox-exec: codex can't write under one (DESIGN.md "Safety")
         approve = ["review-plan", "--json", "--approve", "--operator", w["approver"], "--session", session, "--"]
         create = ["create-run", "--run-id", run_id, "--plan", plan] + cfg

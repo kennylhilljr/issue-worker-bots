@@ -140,6 +140,24 @@ def real_zero_cost_plan():
                  acceptance={"commands": ["python3 tests/test_ci_docs.py", "python3 -m unittest discover -s tests"]})]
 
 
+# The unit of a real plan (kennylhilljr/ecc-customization#24, orchestrator run
+# iwb.kennylhilljr.ecc-customization.24.20261106105438). iwb passed no orchestrator policy, so no runner had a
+# Tier 0 model and `ecc drive` stopped with no_progress: "runner_selected: no eligible certified runner for tier 0
+# (economical) as author" (exit 3). Every earlier iwb run died before a runner worked, too.
+REAL_TIER0_UNIT = {
+    "acceptance": {"commands": ["python3 lib/ecctools.py scan README.md skills/README.md", "git diff --check"]},
+    "budget": {"attempts": 2, "maximum_cost_usd": 1, "minutes": 15},
+    "capabilities": {"network": False, "secrets": []}, "depends_on": [],
+    "description": "Three documentation lines still assert that this repository holds the SDD reference documents, "
+                   "which commit 836e9fc removed. Edit only these three lines.",
+    "id": "docs-drop-sdd-claims", "provides": [], "requires": [], "risk": "low", "rollback": "Revert the commit.",
+    "routing": {"initial_tier": 0, "maximum_tier": 2, "reviewer_must_differ_from_author": True},
+    "schema_version": "1.0", "scope": {"files": ["README.md", "skills/README.md"]},
+    "title": "Remove SDD reference claims from README.md and skills/README.md", "traits": ["mechanical"]}
+# The runners bin/recertify-weekly certified for that run (cert-latest.json of 2026-11-04).
+REAL_CERTIFIED = ["claude", "codex", "gemini", "groq", "kimi"]
+
+
 def answer(obj):
     return "Here is my analysis.\n```json\n" + json.dumps(obj) + "\n```\n"
 
@@ -848,6 +866,41 @@ class Code(unittest.TestCase):
         self.run_pass()
         self.assertEqual(len(self.posts), 2)                            # nothing more until step 5
 
+    def policy_of(self, args):
+        return json.loads(Path(args[args.index("--policy-file") + 1]).read_text())
+
+    def test_run_gets_a_policy_with_a_tier0_model(self):
+        # regression: kennylhilljr/ecc-customization#24 got no policy, so no runner had a Tier 0 model
+        self.approve_plan([REAL_TIER0_UNIT])
+        self.changed = ["README.md", "skills/README.md"]
+        self.run_pass()
+        self.assertEqual(len(self.ecc_calls), 4)
+        for args in self.ecc_calls:                     # both reviews, create-run and drive
+            self.assertIn("--policy-file", args)
+        policy = self.policy_of(self.ecc_calls[3])
+        self.assertEqual((policy["author_providers"], policy["review_independence"]), (["claude"], "persona"))
+        self.assertEqual(policy["allowed_providers"], ["claude", "codex"])
+        self.assertEqual(policy["cli_models"]["claude"]["economical"], "haiku")
+        self.assertEqual(policy["cli_models"]["codex"]["economical"], "gpt-5.6-terra")
+        self.assertEqual(policy["budget"]["max_cost_usd_total"], 5.0)
+        self.assertEqual(self.state()["work"]["status"], "pr-open")
+
+    def test_codex_worker_authors_with_codex(self):
+        self.approve_plan([REAL_TIER0_UNIT], agent="codex")
+        self.run_pass()
+        self.assertEqual(self.policy_of(self.ecc_calls[1])["author_providers"], ["codex"])
+
+    def test_repository_or_config_policy_wins(self):
+        own = Path(self.tmp.name, "clone", ".orchestration", "config.yaml")
+        own.parent.mkdir(parents=True)
+        own.write_text("{}\n")
+        self.run_pass()
+        self.assertFalse(any("--policy-file" in a for a in self.ecc_calls))
+        own.unlink()
+        self.assertEqual(iwb.policy_args(own.parent.parent, "kennylhilljr/demo", "claude")[0], "--policy-file")
+        iwb.CONFIG.write_text(json.dumps({**self.PILOT, "ecc_config": {"policy_file": "~/p.json"}}))
+        self.assertEqual(iwb.policy_args(own.parent.parent, "kennylhilljr/demo", "claude"), [])
+
     def test_approved_zero_cost_plan_is_refused_before_create_run(self):
         # regression: issue-worker-bots#22 was approved with maximum_cost_usd 0, so `ecc drive` stopped with
         # needs_owner (exit 3) before any unit ran. The approval pins the plan, so iwb blocks it for a new plan.
@@ -1500,6 +1553,69 @@ class Policy(unittest.TestCase):
             with self.subTest(policy=policy):
                 iwb.CONFIG.write_text(json.dumps({"policy": {self.REPO: policy}}))
                 self.assertEqual(self.both_gates("src/app.py"), (True, True))
+
+
+def orchestrator_modules():
+    """The sibling orchestrator's schemas, selection and classify modules, or None when it isn't checked out."""
+    import sys
+    src = Path(iwb.ECC).resolve().parent.parent / "src"
+    if sys.version_info < (3, 11) or not (src / "openclaw_ecc_orchestrator").is_dir():
+        return None
+    sys.path.insert(0, str(src))
+    try:
+        from openclaw_ecc_orchestrator import schemas
+        from openclaw_ecc_orchestrator.routing import classify, selection
+    except ImportError:
+        return None
+    finally:
+        sys.path.remove(str(src))
+    return schemas, selection, classify
+
+
+ORCH = orchestrator_modules()
+
+
+@unittest.skipUnless(ORCH, "needs the sibling openclaw-ecc-orchestrator checkout and Python 3.11+")
+class OrchestratorRouting(unittest.TestCase):
+    """iwb's policy against the orchestrator's own routing, with the real unit and certifications of
+    kennylhilljr/ecc-customization#24."""
+
+    def setUp(self):
+        self.schemas, self.sel, self.classify = ORCH
+        self.saved = iwb.CONFIG
+        self.tmp = tempfile.TemporaryDirectory()
+        iwb.CONFIG = Path(self.tmp.name, "config.json")
+
+    def tearDown(self):
+        iwb.CONFIG = self.saved
+        self.tmp.cleanup()
+
+    def policy(self, agent):
+        return self.schemas.load_repository_policy(json.dumps(iwb.orchestrator_policy(agent)))
+
+    def test_without_a_policy_nothing_authors_tier0(self):
+        res = self.sel.select_runner(0, REAL_CERTIFIED, None, None, role="author", risk="low")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.reasons, ["no eligible certified runner for tier 0 (economical) as author"])
+
+    def test_policy_routes_every_tier_of_the_real_unit(self):
+        policy = self.policy("claude")
+        c = self.classify.classify(REAL_TIER0_UNIT, policy)
+        self.assertEqual((c.ok, c.chosen_tier, c.review_tier), (True, 0, 0))
+        for tier, model in enumerate(("haiku", "sonnet", "opus")):
+            res = self.sel.select_runner(tier, REAL_CERTIFIED, None, policy, role="author", risk=c.risk)
+            self.assertEqual((res.runner, res.model), ("claude", model), res.rejected)
+        # the team review tries a provider other than the author's first
+        for tier, model in enumerate(("gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra")):
+            res = self.sel.select_runner(tier, REAL_CERTIFIED, None, policy, role="review", risk=c.risk,
+                                         exclude_runners=["claude"])
+            self.assertEqual((res.runner, res.model), ("codex", model), res.rejected)
+        author = self.sel.select_runner(0, REAL_CERTIFIED, None, policy, role="author", risk=c.risk)
+        self.assertTrue(self.sel.select_reviewer(author, c, REAL_CERTIFIED, None, policy).ok)
+
+    def test_codex_worker_authors_tier0(self):
+        res = self.sel.select_runner(0, REAL_CERTIFIED, None, self.policy("codex"), role="author", risk="low")
+        self.assertEqual((res.runner, res.model), ("codex", "gpt-5.6-terra"))
 
 
 class TrustedPush(unittest.TestCase):
