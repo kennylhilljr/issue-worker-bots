@@ -125,6 +125,21 @@ def unit(uid="u1", **over):
     return u
 
 
+# The budgets of a real plan (issue-worker-bots#22, orchestrator run iwb.kennylhilljr.issue-worker-bots.22.20261106100523).
+# The planner copied the example unit's maximum_cost_usd 0, so `ecc drive` moved each unit to needs_user with
+# budget_exhausted before its first attempt and stopped with needs_owner (exit 3). All 7 iwb runs had the same 0.
+REAL_ZERO_BUDGET = {"attempts": 2, "maximum_cost_usd": 0, "minutes": 30}
+
+
+def real_zero_cost_plan():
+    return [unit("add-check-script", budget=dict(REAL_ZERO_BUDGET), risk="medium",
+                 scope={"files": ["scripts/check.py", "tests/test_check_script.py"]},
+                 acceptance={"commands": ["python3 tests/test_check_script.py", "python3 scripts/check.py"]}),
+            unit("document-ci-workflow", budget=dict(REAL_ZERO_BUDGET), risk="medium",
+                 depends_on=["add-check-script"], scope={"files": ["docs/ci.md", "README.md", "tests/test_ci_docs.py"]},
+                 acceptance={"commands": ["python3 tests/test_ci_docs.py", "python3 -m unittest discover -s tests"]})]
+
+
 def answer(obj):
     return "Here is my analysis.\n```json\n" + json.dumps(obj) + "\n```\n"
 
@@ -234,6 +249,27 @@ class Analyze(unittest.TestCase):
         self.run_pass()
         self.assertEqual(self.posts[-1][1], "bot:planned")
 
+    def test_planner_gets_a_real_per_unit_cost_limit(self):
+        # regression: the example unit said maximum_cost_usd 0, planners copied it, and every coding run stopped
+        # before its first attempt (issue-worker-bots#22)
+        self.assertGreater(iwb.EXAMPLE_UNIT["budget"]["maximum_cost_usd"], 0)
+        iwb.CONFIG.write_text(json.dumps({"max_cost_usd_per_issue": 8}))
+        prompts = []
+        iwb.run_model = lambda agent, prompt, stdin, cwd: prompts.append(prompt) or \
+            answer({"decision": "plan", "summary": "x", "units": [unit()]})
+        self.run_pass()
+        self.assertIn('"maximum_cost_usd": 8', prompts[0])
+        self.assertIn("must be\n     above 0", prompts[0])
+        self.assertIn("at most $8", prompts[0])
+        self.assertEqual(self.posts[-1][1], "bot:planned")
+
+    def test_zero_cost_plan_is_not_posted(self):
+        self.answers = [answer({"decision": "plan", "summary": "x", "units": real_zero_cost_plan()})]
+        log = self.run_pass()
+        self.assertIn("unit 'add-check-script' needs budget.maximum_cost_usd above 0, got 0", log)
+        self.assertEqual(self.posts, [])
+        self.assertEqual(self.state()["attempts"], 1)          # asked again next pass
+
     def test_model_failure_retries_after_an_hour(self):
         self.answers = [RuntimeError("usage limit")]
         log = self.run_pass()
@@ -247,6 +283,12 @@ class Analyze(unittest.TestCase):
                ({"decision": "plan", "summary": "", "units": [unit(), unit()]}, "not unique"),
                ({"decision": "plan", "summary": "", "units": [unit(depends_on=["ghost"])]}, "unknown units"),
                ({"decision": "plan", "summary": "", "units": [unit(scope={"files": []})]}, "scope.files"),
+               ({"decision": "plan", "summary": "", "units": real_zero_cost_plan()}, "maximum_cost_usd above 0"),
+               ({"decision": "plan", "summary": "", "units": [unit(budget={"attempts": 2, "minutes": 30})]},
+                "maximum_cost_usd above 0, got None"),
+               ({"decision": "plan", "summary": "", "units": [unit(budget={"attempts": 2, "minutes": 30,
+                                                                           "maximum_cost_usd": "5"})]},
+                "maximum_cost_usd above 0"),
                ({"decision": "maybe"}, "unknown decision")]
         for obj, why in bad:
             with self.subTest(why=why), self.assertRaisesRegex(ValueError, why):
@@ -641,6 +683,15 @@ class Approve(unittest.TestCase):
         self.assertIn("lint acceptance.command_path_missing", self.posts[-1][2])
         self.assertEqual(self.models, [])
 
+    def test_zero_cost_plan_goes_back_to_the_planner(self):
+        # a plan stored with maximum_cost_usd 0 before the fix is sent back, not reviewed or approved
+        self.plan(*real_zero_cost_plan())
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:planned")
+        self.assertIn("unit 'document-ci-workflow' needs budget.maximum_cost_usd above 0", self.posts[-1][2])
+        self.assertEqual(self.models, [])
+        self.assertNotIn("approve", json.dumps(self.entry().get("approval", {})))
+
     def test_command_screen_reads_programs_not_strings(self):
         self.assertIsNone(iwb.denied_command("python3 -c \"assert 'prbot git' in s\""))
         self.assertEqual(iwb.denied_command("python3 -m unittest && git push origin main"), "git push")
@@ -796,6 +847,33 @@ class Code(unittest.TestCase):
         self.assertEqual((w["status"], w["pr"]), ("pr-open", "https://github.com/kennylhilljr/demo/pull/9"))
         self.run_pass()
         self.assertEqual(len(self.posts), 2)                            # nothing more until step 5
+
+    def test_approved_zero_cost_plan_is_refused_before_create_run(self):
+        # regression: issue-worker-bots#22 was approved with maximum_cost_usd 0, so `ecc drive` stopped with
+        # needs_owner (exit 3) before any unit ran. The approval pins the plan, so iwb blocks it for a new plan.
+        units = real_zero_cost_plan()
+        self.approve_plan(units)
+        plan_file = Path(self.state()["plan_file"])
+        before = plan_file.read_text()
+        self.run_pass()
+        self.assertEqual(self.ecc_calls, [])                            # no create-run, no drive
+        self.assertEqual(self.labels(), ["bot:blocked"])
+        body = self.posts[0][2]
+        self.assertIn("`add-check-script`, `document-ci-workflow`", body)
+        self.assertIn("Remove `bot:blocked` to start again from analysis", body)
+        self.assertEqual(plan_file.read_text(), before)                # the approved plan is left as it was
+        e = self.state()
+        self.assertTrue(e["blocked"])
+        self.assertEqual(e["approval"]["plan_digest"], iwb.plan_digest(units))
+        self.assertEqual(self.events, ["blocked: kennylhilljr/demo#1"])
+        self.run_pass()
+        self.assertEqual(len(self.posts), 1)                            # quiet until Kenny removes bot:blocked
+
+    def test_drive_cost_cap_comes_from_config(self):
+        iwb.CONFIG.write_text(json.dumps({**self.PILOT, "max_cost_usd_per_issue": 8}))
+        self.run_pass()
+        drive = next(a for a in self.ecc_calls if a[0] == "drive")
+        self.assertEqual(drive[drive.index("--max-cost-usd") + 1], "8")
 
     def test_only_plans_approved_as_they_are_now(self):
         state = json.loads(iwb.STATE.read_text())
