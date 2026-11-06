@@ -94,6 +94,7 @@ This is what lets cheap models do the coding. A unit counts as clear when:
 - `lint-plan` passes for the whole plan;
 - every unit has at least one acceptance command;
 - every unit names the files it may change, and they exist or are explicitly new;
+- every unit has a `budget.maximum_cost_usd` above 0, since the orchestrator stops a unit whose cost has reached it and a unit starts at 0;
 - the analysis left no open questions;
 - the unit description says what to change, not only what is wrong.
 
@@ -136,6 +137,8 @@ The worker labels the issue `bot:in-progress` and starts an orchestrator run wit
 - **Orchestrator version.** `iwb` runs the orchestrator checkout next to it, or `ecc_path` in `config.json` (for example a worktree kept at `origin/main`). Before a run it fetches that checkout. When the checkout is on branch `main`, has no changes to tracked files and is strictly behind `origin/main`, it fast-forwards it (`git merge --ff-only`, hooks off) and logs it, so a merge to the orchestrator's main does not stall coding until someone pulls. Otherwise it skips the issue, the same quiet way, unless `HEAD` is `origin/main`. It never resets, stashes or switches branches there; Kenny's working checkout is often on a feature branch or has work in progress.
 - **Run.** The orchestrator routes each unit to the model for its tier, runs it in a worktree, runs the acceptance commands, escalates one tier on a real failure, and fast-forwards the `bot/` branch as units pass. The bots never call `ecc merge`, and nothing in the orchestrator pushes.
 - **Check and commit.** After the run `iwb` treats its clone, including everything under `.git` (hooks, config, includes), as the agents' work and never runs git there with a token. It creates a new bare repository and fetches the `bot/` branch into it with no token in the environment; git there reads no system or global config, runs no hooks, and refuses a branch that doesn't start at the default branch tip cloned before the run. In that copy `iwb` compares the result with the default branch. Any changed file outside the plan's scope or on a protected path blocks the issue, and nothing is pushed. A rename counts as both its old and its new path. Otherwise the result becomes one commit authored and committed by the worker bot (prbot's identity), and only then is a contents-write token requested, for a push to `https://github.com/<owner>/<repo>.git` (never a remote name) and the `bot/` branch only. A push to any other branch or repository is refused in code. The copy is deleted afterwards.
+
+Before `create-run`, an approved plan with a unit cost limit of 0 or none blocks the issue with that reason instead of starting a run that would stop at once with `needs_owner`. The plan file is not changed, since the approval digest covers it; removing `bot:blocked` replans the issue.
 
 A run that stops (`drive` exits non-zero: budget, no progress, needs an owner) blocks the issue with the orchestrator's reason, cut to 200 characters with anything shaped like a token removed. A pass that dies mid-run leaves `bot:in-progress` behind, and the next pass blocks the issue as interrupted rather than starting again.
 
@@ -201,6 +204,7 @@ Two cautions:
 | Coding runs per pass | 1 | The next approved plan waits for the next pass |
 | Analysis attempts per issue | 2 | Questions posted on the issue |
 | Cost per issue | `drive --max-cost-usd`, from `max_cost_usd_per_issue` in `config.json` (default $5) | Run stops, issue labeled `bot:blocked` with the reason |
+| Cost per unit | `budget.maximum_cost_usd` in the plan, above 0; the planner is told to use `max_cost_usd_per_issue` unless the unit is clearly smaller | Unit stops with `budget_exhausted`; a plan with 0 is sent back before review, or blocked before `create-run` if already approved |
 | Time per issue | `drive --max-hours` from the units' minutes; 6 hours hard timeout | Run stops, issue labeled `bot:blocked` with the reason |
 | Repair rounds after review | 1 | PR waits for Kenny |
 | Units per plan | 8 | Analysis is asked to split the issue into smaller issues |

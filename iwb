@@ -386,6 +386,7 @@ RETRY_AFTER = 3600        # seconds before retrying after a model failure (usage
 A_MARKER = "<!-- iwb:analysis -->"
 R_MARKER = "<!-- iwb:reply -->"
 PLANS_DIR = STATE.parent / "plans"
+MAX_COST_USD = 5          # drive --max-cost-usd per issue and the planner's per-unit limit; config.json "max_cost_usd_per_issue"
 UNIT_FIELDS = ("schema_version", "id", "title", "depends_on", "scope", "acceptance", "risk", "capabilities",
                "routing", "budget", "rollback")
 LABELS = {"bot:needs-info": ("FBCA04", "The worker bot has questions before it can plan"),
@@ -418,6 +419,10 @@ Read the code you need. Change nothing. Then decide one of three things.
      database, architecture, CI/workflow or other high-risk work. "maximum_tier": 2.
    - "traits": any of mechanical, fixture_generation, database, security, concurrency, architecture.
    - "risk": low, medium or high.
+   - "budget.maximum_cost_usd": the most the orchestrator may spend on this unit, in US dollars, over all its
+     attempts. It is a hard limit: a unit stops before its next attempt once its cost reaches it, so it must be
+     above 0 (0 means the unit never runs). The whole issue may spend at most {cost}; use {cost} unless the unit
+     is clearly small enough for less.
    Copy this unit shape exactly:
 {example}
 
@@ -435,12 +440,32 @@ EXAMPLE_UNIT = {
     "acceptance": {"commands": ["python3 -m unittest tests.test_parser"]}, "risk": "low",
     "capabilities": {"network": False, "secrets": []},
     "routing": {"initial_tier": 1, "maximum_tier": 2, "reviewer_must_differ_from_author": True},
-    "budget": {"attempts": 2, "minutes": 30, "maximum_cost_usd": 0}, "rollback": "Revert the commit.",
+    "budget": {"attempts": 2, "minutes": 30, "maximum_cost_usd": MAX_COST_USD}, "rollback": "Revert the commit.",
     "traits": [], "provides": [], "requires": []}
 
 
 def read_config():
     return json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+
+
+def issue_cost():
+    """The most one issue may spend, in US dollars: drive's --max-cost-usd and the planner's per-unit limit."""
+    return read_config().get("max_cost_usd_per_issue", MAX_COST_USD)
+
+
+def example_unit(cost):
+    """The unit shape the planner copies, with the issue's cost limit as its per-unit cost limit."""
+    return {**EXAMPLE_UNIT, "budget": {**EXAMPLE_UNIT["budget"], "maximum_cost_usd": cost}}
+
+
+def cost_problem(u):
+    """Why a unit's cost limit would stop it before its first attempt, or None. The orchestrator stops a unit once
+    its cost reaches budget.maximum_cost_usd, and a unit starts at 0, so 0 or no limit means it never runs."""
+    c = u.get("budget", {}).get("maximum_cost_usd") if isinstance(u.get("budget"), dict) else None
+    if isinstance(c, bool) or not isinstance(c, (int, float)) or c <= 0:
+        return (f"unit {u.get('id')!r} needs budget.maximum_cost_usd above 0, got {c!r}; the orchestrator stops a "
+                f"unit whose cost has reached this limit, so it would never run")
+    return None
 
 
 def analysis_model(agent):
@@ -522,6 +547,8 @@ def parse_answer(text):
             raise ValueError(f"unit {u.get('id')!r} is missing {', '.join(missing)}")
         if not u["scope"].get("files") or not u["acceptance"].get("commands"):
             raise ValueError(f"unit {u['id']!r} needs scope.files and acceptance.commands")
+        if cost_problem(u):
+            raise ValueError(cost_problem(u))
         unknown = [d for d in u["depends_on"] if d not in ids]
         if unknown:
             raise ValueError(f"unit {u['id']!r} depends on unknown units {unknown}")
@@ -726,8 +753,9 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo_filter=None)
         work = None
         try:
             work, branch, sha = clone(repo, bot)
-            prompt = ANALYSIS_PROMPT.format(repo=repo, branch=branch, sha=sha[:10],
-                                            example=json.dumps(EXAMPLE_UNIT, indent=1))
+            cost = issue_cost()
+            prompt = ANALYSIS_PROMPT.format(repo=repo, branch=branch, sha=sha[:10], cost=f"${cost}",
+                                            example=json.dumps(example_unit(cost), indent=1))
             answer = parse_answer(run_model(agent, prompt, text, f"{work}/repo"))
         except (RuntimeError, subprocess.SubprocessError, SystemExit) as e:
             entry["analysis_failed_at"] = time.time()
@@ -898,9 +926,11 @@ SHELL_SYNTAX = re.compile(r"\||&&|;|>|<|\$\(|`|\n")
 
 def fixable_problems(units):
     """Problems the planner can fix: acceptance commands the orchestrator would refuse, because it runs
-    them without a shell. These send the plan back for revision instead of blocking the issue."""
+    them without a shell, and a cost limit that would stop a unit before it starts. These send the plan back
+    for revision instead of blocking the issue."""
     return [f"{u['id']}: acceptance command needs a shell, which the orchestrator doesn't use: {c[:100]}"
-            for u in units for c in u["acceptance"]["commands"] if SHELL_SYNTAX.search(c)]
+            for u in units for c in u["acceptance"]["commands"] if SHELL_SYNTAX.search(c)] \
+        + [cost_problem(u) for u in units if cost_problem(u)]
 
 
 # Toolchain folders under the home folder that test runners read (uv, pip, npm, nvm, rustup and the like).
@@ -1226,7 +1256,6 @@ IN_PROGRESS_LIMIT = 2      # issues being coded at once (DESIGN.md "Budgets and 
 DRIVE_TIMEOUT = 6 * 3600
 POLL = 30                  # seconds between checks for bot:stop and pause while drive runs
 KILL_GRACE = 30            # seconds between SIGTERM and SIGKILL for a stopped drive
-MAX_COST_USD = 5           # drive --max-cost-usd per issue; config.json "max_cost_usd_per_issue"
 REQUIRED_RUNNERS = ("claude", "codex")   # the worker families: each unit's author and its reviewer from the other
 # The base environment the orchestrator's runners get (cli_adapters.py), plus what the claude and codex CLIs read
 # to find their own logins. Never tokens: SECRET_ENV names are dropped even from config.json "drive_env".
@@ -1659,6 +1688,16 @@ def code_plan(key, entry, issue, state, since, ecc):
     agent, w = entry["agent"], entry["work"]
     worker = WORKERS[agent]
     units = json.loads(Path(entry["plan_file"]).read_text())["units"]
+    free = [u["id"] for u in units if cost_problem(u)]
+    if free:                        # approval pins the plan file, so a plan with no cost budget needs a new plan
+        block(entry, worker, repo, number, issue["title"],
+              f"{W_MARKER}\nCoding not started: the approved plan gives "
+              + ", ".join(f"`{x}`" for x in free) + " a cost limit (`budget.maximum_cost_usd`) of 0 or none. "
+              f"The orchestrator stops a unit whose cost has reached its limit, so these units would stop before "
+              f"their first attempt and the run could only fail. The approval pins the plan, so it can't be fixed "
+              f"in place: Kenny, the issue needs a new plan.",
+              f"coding: units {', '.join(free)} have no cost budget (maximum_cost_usd 0)")
+        return
     run_id = f"iwb.{owner}.{name}.{number}.{time.strftime('%Y%m%d%H%M%S', time.gmtime())}"
     branch = f"bot/{number}-{slugify(issue['title'])}-{hashlib.sha256(run_id.encode()).hexdigest()[:6]}"
     session = f"iwb.{repo.replace('/', '.')}.{number}"
@@ -1681,7 +1720,7 @@ def code_plan(key, entry, issue, state, since, ecc):
         w["plan_sha256"] = review.get("plan_sha256")
         ecc_data(ecc, create + ["--yes", "--review-id", review["review_id"], "--json"], "create-run", **opts)
         hours = max(1, -(-sum(u["budget"]["minutes"] for u in units) // 60))
-        cost = read_config().get("max_cost_usd_per_issue", MAX_COST_USD)
+        cost = issue_cost()
         drive = ["drive", "--run-id", run_id, "--max-hours", str(hours), "--max-cost-usd", str(cost)] + cfg
         review = ecc_data(ecc, approve + drive, "review-plan drive", **opts)
         ecc_data(ecc, drive + ["--yes", "--review-id", review["review_id"], "--json"], "drive", DRIVE_TIMEOUT,
