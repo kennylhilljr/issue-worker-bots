@@ -676,6 +676,8 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo_filter=None)
             entry["attempts"] = 0
             entry.pop("analysis", None)
             entry.pop("work", None)
+            for k in ("revisions", "lint_revisions", "review_revisions"):
+                entry.pop(k, None)
         digest = issue_digest(issue)
         a = entry.get("analysis")
         if a:   # short commands get an answer, not another expensive analysis
@@ -1053,13 +1055,19 @@ def lint_findings(units, repo_dir, branch):
     return [f"lint {f['code']}: {f['message']}" for f in (out.get("data") or {}).get("findings", [])]
 
 
+def review_revisions(entry):
+    """Reviewer send-backs so far. An entry from before the split only has "revisions", read as reviewer ones."""
+    return entry.get("review_revisions", entry.get("revisions", 0))
+
+
 def send_back(entry, key, repo, number, worker, issue, digest, problems):
-    """Fixable problems go back to the planner once; a second time blocks the issue."""
+    """Fixable problems go back to the planner once; a second time blocks the issue. This budget is apart from
+    the reviewer's, so a plan that failed the gates once can still be revised once after review."""
     body = (f"{P_MARKER}\n### Plan needs changes before review\n\nThe orchestrator would refuse this plan:\n"
             + "".join(f"\n- {x}" for x in problems))
-    if entry.get("revisions", 0) < 1:
+    if entry.get("lint_revisions", 0) < 1:
         url = post(worker, repo, number, body + "\n\nThe planner will revise it.", "bot:planned")
-        entry["revisions"] = entry.get("revisions", 0) + 1
+        entry["lint_revisions"] = entry.get("lint_revisions", 0) + 1
         entry["approval"] = {"verdict": "revise", "level": "rule", "source_digest": digest,
                              "at": time.time(), "comment": url, "problems": problems}
         entry["replan"] = True
@@ -1191,9 +1199,10 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo_filter=None)
             entry["approval"] = {"verdict": "approve", "level": level, "plan_digest": plan_digest(units), "source_digest": digest,
                                  "approver": f"{slug}", "model": model["model"], "at": time.time(), "comment": url}
             log(f"{key}: approved by {slug} {url}")
-        elif v["verdict"] == "revise" and entry.get("revisions", 0) < 1:
+        elif v["verdict"] == "revise" and review_revisions(entry) < 1:
             url = post(reviewer, repo, number, body, "bot:planned")
-            entry["revisions"] = entry.get("revisions", 0) + 1
+            entry["review_revisions"] = review_revisions(entry) + 1
+            entry.pop("revisions", None)
             entry["approval"] = {"verdict": "revise", "source_digest": digest, "at": time.time(), "comment": url}
             entry["replan"] = True                    # the planner revises with the approver's comment as input
             entry.pop("handled_at", None)
@@ -1426,17 +1435,33 @@ def cert_problem(path, horizon):
 
 def orchestrator_drift():
     """Why the orchestrator checkout isn't at origin/main, or None. iwb runs whatever is checked out there, and
-    Kenny's working checkout may sit on a feature branch."""
+    Kenny's working checkout may sit on a feature branch. A clean main that is only behind is fast-forwarded."""
     repo = ecc_path().resolve().parent.parent
     git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, timeout=300)
     f = git("fetch", "-q", "origin")
     if f.returncode != 0:
         return f"could not fetch the orchestrator at {repo}: {f.stderr.strip()[-200:]}"
     head, main = (git("rev-parse", "--verify", "-q", ref).stdout.strip() for ref in ("HEAD", "origin/main"))
+    if main and head != main and fast_forwardable(git, head, main):
+        m = git("-c", "core.hooksPath=/dev/null", "merge", "-q", "--ff-only", main)
+        if m.returncode == 0:
+            log(f"orchestrator at {repo} fast-forwarded from {head[:10]} to origin/main ({main[:10]})")
+        else:
+            log(f"orchestrator at {repo} could not fast-forward: {m.stderr.strip()[-200:]}")
+        head = git("rev-parse", "--verify", "-q", "HEAD").stdout.strip()
     if not main or head != main:
         return (f"the orchestrator at {repo} is at {head[:10] or '?'}, not origin/main ({main[:10] or '?'}); "
                 f"update it or set ecc_path in config.json")
     return None
+
+
+def fast_forwardable(git, head, main):
+    """True when the orchestrator checkout is on branch main, has no changes to tracked files and is strictly
+    behind origin/main, so a fast-forward only adds commits. Anything else is left for a person: iwb never
+    resets, stashes or switches branches there."""
+    return (bool(head) and git("symbolic-ref", "-q", "--short", "HEAD").stdout.strip() == "main"
+            and git("status", "--porcelain", "--untracked-files=no").stdout.strip() == ""
+            and git("merge-base", "--is-ancestor", head, main).returncode == 0)
 
 
 def block(entry, bot, repo, number, title, body, problem):

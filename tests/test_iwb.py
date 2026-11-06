@@ -576,6 +576,47 @@ class Approve(unittest.TestCase):
         self.assertEqual(self.posts[-1][1], "bot:blocked")
         self.assertEqual(self.events, ["blocked: kennylhilljr/demo#1"])
 
+    def test_lint_send_back_leaves_the_reviewer_its_own_revision(self):
+        # regression: issue-worker-bots#15, a lint send-back used up the only revision, so the reviewer's
+        # revise on the fixed plan blocked the issue before the planner saw the changes
+        self.plan(code_unit())
+        self.lint = ["lint unit.overlapping_file_scope: x"]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:planned")
+        f = Path(self.entry()["plan_file"])
+        f.write_text(json.dumps({"units": [code_unit(files=["src/app.py", "tests/test_a.py"])]}))   # lint fixed
+        self.lint = []
+        self.verdicts = [{"verdict": "revise", "summary": "x", "changes": ["test the error path"]}]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:planned")                 # back to the planner, not blocked
+        self.assertTrue(self.entry()["replan"])
+        self.assertNotIn("blocked", self.entry())
+        f.write_text(json.dumps({"units": [code_unit(files=["src/app.py", "tests/test_b.py"])]}))
+        self.verdicts = [{"verdict": "revise", "summary": "x", "changes": ["still missing"]}]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:blocked")                 # a second reviewer revise still blocks
+        self.assertEqual(self.events, ["blocked: kennylhilljr/demo#1"])
+
+    def test_second_lint_send_back_blocks(self):
+        self.plan(code_unit())
+        self.lint = ["lint acceptance.command_path_missing: x"]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:planned")
+        f = Path(self.entry()["plan_file"])
+        f.write_text(json.dumps({"units": [code_unit(files=["src/app.py", "tests/test_a.py"])]}))
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:blocked")
+        self.assertEqual(self.models, [])
+
+    def test_old_revisions_count_as_a_reviewer_revision(self):
+        self.plan(code_unit())
+        state = json.loads(iwb.STATE.read_text())
+        state[self.KEY]["revisions"] = 1                                   # written before the split
+        iwb.STATE.write_text(json.dumps(state))
+        self.verdicts = [{"verdict": "revise", "summary": "x", "changes": ["more"]}]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:blocked")
+
     def test_green_before_the_change_turns_approve_into_revise(self):
         self.plan(code_unit())
         self.red = {"fix": {"runs": [{"command": "x", "exit": 0, "output": "OK"}], "red": False,
@@ -1200,6 +1241,86 @@ class OrchestratorDrift(unittest.TestCase):
         git("worktree", "add", "-q", "--detach", str(wt), "origin/main", cwd=orch)
         iwb.CONFIG.write_text(json.dumps({"ecc_path": str(wt / "bin" / "ecc")}))
         self.assertIsNone(iwb.orchestrator_drift())
+
+
+class OrchestratorFastForward(unittest.TestCase):
+    """A clean main that is only behind origin/main is fast-forwarded; anything else is refused as before."""
+
+    def setUp(self):
+        import subprocess
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run_git = lambda *a, cwd=None: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                                                      cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+        self.src, self.orch = Path(self.tmp.name, "origin"), Path(self.tmp.name, "orch")
+        self.src.mkdir()
+        self.run_git("init", "-q", "-b", "main", cwd=self.src)
+        Path(self.src, "bin").mkdir()
+        Path(self.src, "bin", "ecc").write_text("x\n")
+        self.run_git("add", "-A", cwd=self.src)
+        self.run_git("commit", "-qm", "init", cwd=self.src)
+        self.run_git("clone", "-q", str(self.src), str(self.orch))
+        saved = (iwb.ECC, iwb.CONFIG)
+        self.addCleanup(lambda: (setattr(iwb, "ECC", saved[0]), setattr(iwb, "CONFIG", saved[1])))
+        iwb.ECC, iwb.CONFIG = self.orch / "bin" / "ecc", Path(self.tmp.name, "config.json")
+        self.commit(self.src, "g", "next")                                  # origin moves on after the clone
+
+    def commit(self, repo, name, msg):
+        Path(repo, name).write_text(msg + "\n")
+        self.run_git("add", "-A", cwd=repo)
+        self.run_git("commit", "-qm", msg, cwd=repo)
+
+    def head(self, repo):
+        return self.run_git("rev-parse", "HEAD", cwd=repo)
+
+    def drift(self):
+        with redirect_stdout(io.StringIO()) as out:
+            r = iwb.orchestrator_drift()
+        return r, out.getvalue()
+
+    def test_clean_main_behind_is_fast_forwarded(self):
+        Path(self.orch, "notes.txt").write_text("untracked files don't count\n")
+        r, out = self.drift()
+        self.assertIsNone(r)
+        self.assertEqual(self.head(self.orch), self.head(self.src))
+        self.assertIn("fast-forwarded", out)
+        self.assertTrue(Path(self.orch, "notes.txt").exists())
+
+    def test_changed_tracked_file_is_refused(self):
+        before = self.head(self.orch)
+        Path(self.orch, "bin", "ecc").write_text("local edit\n")
+        r, _ = self.drift()
+        self.assertIn("not origin/main", r)
+        self.assertEqual(self.head(self.orch), before)
+        self.assertEqual(Path(self.orch, "bin", "ecc").read_text(), "local edit\n")
+
+    def test_staged_change_is_refused(self):
+        before = self.head(self.orch)
+        Path(self.orch, "new.txt").write_text("staged\n")
+        self.run_git("add", "new.txt", cwd=self.orch)
+        r, _ = self.drift()
+        self.assertIn("not origin/main", r)
+        self.assertEqual(self.head(self.orch), before)
+
+    def test_local_commits_on_main_are_refused(self):
+        self.commit(self.orch, "mine", "local")                            # diverged: not strictly behind
+        before = self.head(self.orch)
+        r, _ = self.drift()
+        self.assertIn("not origin/main", r)
+        self.assertEqual(self.head(self.orch), before)
+
+    def test_other_branch_behind_is_refused(self):
+        self.run_git("checkout", "-qb", "feature", cwd=self.orch)
+        before = self.head(self.orch)
+        r, _ = self.drift()
+        self.assertIn("not origin/main", r)
+        self.assertEqual(self.head(self.orch), before)
+        self.assertEqual(self.run_git("branch", "--show-current", cwd=self.orch), "feature")
+
+    def test_detached_head_is_refused(self):
+        self.run_git("checkout", "-q", "--detach", cwd=self.orch)
+        r, _ = self.drift()
+        self.assertIn("not origin/main", r)
 
 
 class StateFile(unittest.TestCase):
