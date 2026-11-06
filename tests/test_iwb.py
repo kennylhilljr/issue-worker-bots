@@ -5,6 +5,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+os.environ["PRBOT_PATH"] = str(ROOT / "tests" / "prbot_stub.py")   # no ../pr-review-bots needed
 loader = SourceFileLoader("iwb", str(ROOT / "iwb"))
 iwb = importlib.util.module_from_spec(importlib.util.spec_from_loader("iwb", loader))
 loader.exec_module(iwb)
