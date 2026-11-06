@@ -1381,6 +1381,34 @@ class DriveProcess(unittest.TestCase):
             iwb.run_ecc(["drive"], timeout=1, watch=lambda: None)
         self.assertFalse(self.child_alive())
 
+    def test_model_timeout_returns_even_when_a_grandchild_holds_stdout(self):
+        # like `codex`: a wrapper whose child inherits stdout and outlives it
+        cli = Path(self.tmp.name, "cli")
+        cli.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {self.pidfile}\nwait\n")
+        cli.chmod(0o755)
+        start = time.time()
+        with self.assertRaisesRegex(RuntimeError, "timed out"):
+            iwb.run_cli([str(cli)], "stdin", timeout=1)
+        self.assertLess(time.time() - start, 30)
+        self.assertFalse(self.child_alive())
+
+    def test_stay_awake_holds_until_this_process_exits(self):
+        started = []
+        saved = iwb.subprocess.Popen, iwb.shutil.which
+        iwb.subprocess.Popen = lambda argv, **kw: started.append(argv)
+        iwb.shutil.which = lambda name: "/usr/bin/" + name
+        try:
+            iwb.stay_awake()
+        finally:
+            iwb.subprocess.Popen, iwb.shutil.which = saved
+        self.assertEqual(started, [["/usr/bin/caffeinate", "-i", "-w", str(iwb.os.getpid())]])
+
+    def test_model_output_and_stdin(self):
+        cli = Path(self.tmp.name, "cli")
+        cli.write_text("#!/bin/sh\ncat\necho oops >&2\nexit 4\n")
+        cli.chmod(0o755)
+        self.assertEqual(iwb.run_cli([str(cli)], "hello\n", timeout=10), (4, "hello\n", "oops\n"))
+
 
 class OrchestratorDrift(unittest.TestCase):
     def test_only_origin_main_passes(self):
