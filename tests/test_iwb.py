@@ -855,7 +855,8 @@ class Code(unittest.TestCase):
         self.assertRegex(branch, r"^bot/1-add-retries-[0-9a-f]{6}$")
         self.assertRegex(create[create.index("--run-id") + 1], r"^iwb\.kennylhilljr\.demo\.1\.\d{14}$")
         self.assertEqual(self.ecc_calls[3][-3:-1], ["--review-id", "rev-3"])    # drive has its own approval
-        self.assertEqual(json.loads(Path(create[create.index("--config") + 1]).read_text()), iwb.ECC_DEFAULTS)
+        self.assertEqual(json.loads(Path(create[create.index("--config") + 1]).read_text()),
+                         {**iwb.ECC_DEFAULTS, "runner_timeout": iwb.RUNNER_TIMEOUT})
         self.assertEqual(self.pushed, [("claude-dev", "sha1", branch)])
         self.assertEqual(self.commits[0][0], "claude-dev")
         bot, branch, agent, body = self.prs[0]
@@ -1143,6 +1144,16 @@ class Code(unittest.TestCase):
         self.run_pass()
         self.assertEqual(self.ecc_calls, [])                                   # not retried within the hour
         self.assertIn("codex is not certified", iwb.cert_problem(iwb.ECC_DEFAULTS["certifications"], 3600))
+
+    def test_orchestrator_config_bounds_each_attempt(self):
+        # regression: budget.minutes is advisory and drive checks --max-hours only between steps, so with no
+        # runner_timeout one coding attempt ran past the drive's hour and held the serial code queue
+        path = Path(self.tmp.name, "ecc.json")
+        iwb.orchestrator_config(path, {})
+        self.assertEqual(json.loads(path.read_text())["runner_timeout"], iwb.RUNNER_TIMEOUT)
+        self.assertLessEqual(iwb.RUNNER_TIMEOUT, iwb.DRIVE_TIMEOUT)
+        iwb.orchestrator_config(path, {"ecc_config": {"runner_timeout": 600}})
+        self.assertEqual(json.loads(path.read_text())["runner_timeout"], 600)     # config.json still wins
 
     def test_orchestrator_not_at_origin_main_waits_without_posting(self):
         iwb.orchestrator_drift = lambda: "the orchestrator at /x is at abc, not origin/main (def)"

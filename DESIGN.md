@@ -205,7 +205,7 @@ Two cautions:
 | Analysis attempts per issue | 2 | Questions posted on the issue |
 | Cost per issue | `drive --max-cost-usd`, from `max_cost_usd_per_issue` in `config.json` (default $5) | Run stops, issue labeled `bot:blocked` with the reason |
 | Cost per unit | `budget.maximum_cost_usd` in the plan, above 0; the planner is told to use `max_cost_usd_per_issue` unless the unit is clearly smaller | Unit stops with `budget_exhausted`; a plan with 0 is sent back before review, or blocked before `create-run` if already approved |
-| Time per issue | `drive --max-hours` from the units' minutes; 6 hours hard timeout | Run stops, issue labeled `bot:blocked` with the reason |
+| Time per issue | `drive --max-hours` from the units' minutes (checked between steps); each coding attempt capped at 1 hour (`runner_timeout`, overridable in `ecc_config`); 6 hours hard timeout | Run stops, issue labeled `bot:blocked` with the reason |
 | Repair rounds after review | 1 | PR waits for Kenny |
 | Units per plan | 8 | Analysis is asked to split the issue into smaller issues |
 
