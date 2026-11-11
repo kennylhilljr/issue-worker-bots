@@ -3503,6 +3503,43 @@ class AutoMerge(unittest.TestCase):
         self.run_pass()
         self.assertEqual((self.gh_calls, self.posts), ([], []))
 
+    def code_drain(self, *numbers):
+        """`code --from-queue` with coding hand-offs for other issues of the repo, counting step 5's calls."""
+        q = Path(self.tmp.name, "queue-code")
+        q.mkdir(exist_ok=True)
+        Path(self.tmp.name, iwb.QUEUE_MARKER).touch()
+        for n in numbers:
+            (q / f"20261111T120000000Z-x-kennylhilljr__demo-issue-{n}-comment.json").write_text(json.dumps(
+                {"repo": "kennylhilljr/demo", "kind": "issue", "number": n, "event": "comment", "stage": "code",
+                 "version": 1}))
+        calls, review_prs, run_ecc = [], iwb.review_prs, iwb.run_ecc
+        iwb.review_prs = lambda keys, *a: calls.append(list(keys)) or review_prs(keys, *a)
+        iwb.run_ecc = self.fake_ecc
+        try:
+            with redirect_stdout(io.StringIO()):
+                iwb.main(["code", "--from-queue", str(q)])
+        finally:
+            iwb.review_prs, iwb.run_ecc = review_prs, run_ecc
+        return calls
+
+    def test_code_queue_drain_reviews_open_prs_of_other_issues(self):
+        # while queued coding runs hold work.lock, tick's full pass skips, so the drain must run step 5 itself
+        self.config(coding_live=True)
+        self.assertEqual(self.code_drain(2), [[self.KEY]])
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(self.work()["status"], "merged")
+
+    def test_code_queue_drain_runs_step_5_once(self):
+        self.config(coding_live=True)
+        self.assertEqual(self.code_drain(2, 3, 4), [[self.KEY]])    # once per drain, not once per hand-off
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_code_queue_drain_without_auto_merge_skips_step_5(self):
+        iwb.CONFIG.write_text(json.dumps({"coding_repos": ["kennylhilljr/demo"], "coding_live": True}))
+        iwb.prbot.gh_read = lambda args: self.fail(f"read {args} with auto_merge off")
+        self.assertEqual(self.code_drain(2), [])
+        self.assertEqual((self.gh_calls, self.posts), ([], []))
+
     def test_bot_stop_leaves_the_pr_alone(self):
         self.issue["labels"].append("bot:stop")
         self.run_pass()
