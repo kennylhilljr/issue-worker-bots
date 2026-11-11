@@ -670,14 +670,16 @@ def last_edited(repo, number):
 def needs_analysis(entry, comments, trusted, digest, edited_at=None):
     """Why this picked-up issue should be analyzed now, or None. A trusted comment after any bot answer
     (plan included) or an edit to the title or body brings the bot back. An analysis stored before digests were
-    (no "digest") is compared by `edited_at`, the body's last edit, and then gets the current digest."""
+    (no "digest") is compared by `edited_at`, the body's last edit, and then gets the current digest. The
+    "reason" and "replan" flags are only read here: a hold (per-pass limit) or a failed run must not lose them,
+    so they are cleared once an analysis has been posted."""
     if "agent" not in entry or entry.get("closed") or entry.get("blocked"):
         return None
     if (entry.get("work") or {}).get("status") in ("in-progress", "pushed") + PR_STATUSES:
         return None                       # coding started; the PR is where feedback goes now (step 5)
     a = entry.get("analysis")
     if a is None:
-        return entry.pop("reason", "new")
+        return entry.get("reason", "new")
     if entry.get("stale_plan"):
         return "plan out of date"         # the code queue found a newer comment or edit; only a new analysis clears it
     if a.get("digest") and a["digest"] != digest:
@@ -687,7 +689,7 @@ def needs_analysis(entry, comments, trusted, digest, edited_at=None):
             return "issue edited"
         a["digest"] = digest
     cutoff = max(a["at"], entry.get("handled_at", 0))
-    if entry.pop("replan", False):
+    if entry.get("replan"):
         return "replan requested"
     replies = [c for c in comments if c["user"] in trusted and iso_epoch(c["at"]) > cutoff]
     return f"reply after {a['decision']}" if replies else None
@@ -867,6 +869,8 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo_filter=None)
             write_atomic(plan_file, json.dumps({"units": answer["units"]}, indent=1) + "\n")
             entry["plan_file"] = str(plan_file)
         entry.pop("stale_plan", None)        # a fresh analysis replaces the out-of-date plan
+        entry.pop("reason", None)            # consumed only now: a held or failed analysis keeps them
+        entry.pop("replan", None)
         entry["analysis"] = {"decision": answer["decision"], "at": time.time(), "model": model, "comment": url,
                              "digest": digest}
         tell_openclaw(repo, number, issue["title"], slug, model, answer, url)
