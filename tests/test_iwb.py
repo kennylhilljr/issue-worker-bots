@@ -1,5 +1,5 @@
 """Tests for iwb intake. No network: GitHub reads and bot posts are faked. Run: python3 -m unittest discover -s tests"""
-import importlib.util, io, json, os, re, tempfile, time, unittest
+import importlib.util, io, json, os, re, shlex, tempfile, time, unittest
 from contextlib import redirect_stderr, redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -11,6 +11,255 @@ iwb = importlib.util.module_from_spec(importlib.util.spec_from_loader("iwb", loa
 loader.exec_module(iwb)
 
 OWNER = "kennylhilljr"
+
+
+class GuardedSubprocess:
+    """Delegate subprocess operations, allowing runner paths only in active fixture roots."""
+    CLI_NAMES = frozenset(("claude", "codex", "gh", "prbot"))
+
+    def __init__(self, delegate):
+        self._delegate = delegate
+        self._roots = {}
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
+
+    def register_root(self, root):
+        root = Path(root).resolve(strict=True)
+        if not root.is_dir():
+            raise ValueError(f"fixture root is not a directory: {root}")
+        token = object()
+        self._roots[token] = root
+        return lambda: self._roots.pop(token, None)
+
+    def _check_executable(self, executable, cwd):
+        if executable is None:
+            return
+        name = os.fsdecode(executable)
+        if name in self.CLI_NAMES:
+            raise AssertionError(f"unguarded CLI launch: {name} (bare name)")
+        path = Path(name)
+        if not path.is_absolute():
+            path = Path(os.fsdecode(cwd)) / path if cwd is not None else Path.cwd() / path
+        target = path.resolve()
+        if path.name not in self.CLI_NAMES and target.name not in self.CLI_NAMES:
+            return
+        if not any(root.is_dir() and root.resolve() == root and target.is_relative_to(root)
+                   for root in self._roots.values()):
+            raise AssertionError(f"unguarded CLI launch: {name} (outside active fixture roots)")
+
+    def _check(self, positional, keywords):
+        shell = keywords.get("shell", positional[8] if len(positional) > 8 else False)
+        # Shell programs can hide launches behind exec, substitutions, expansions,
+        # or compound commands. Token inspection cannot enforce this guard for
+        # arbitrary shell code; fixtures must launch executables with direct argv.
+        if shell:
+            raise AssertionError("unguarded CLI launch: shell=True is not allowed; use direct argv")
+        command = positional[0] if positional else keywords.get("args")
+        # run forwards its positional arguments to Popen, whose executable and cwd
+        # parameters occupy these slots. Inspect overrides as well as argv[0].
+        executable = keywords.get("executable", positional[2] if len(positional) > 2 else None)
+        cwd = keywords.get("cwd", positional[9] if len(positional) > 9 else None)
+        if isinstance(command, os.PathLike):
+            first = command
+        elif isinstance(command, (str, bytes)):
+            command = os.fsdecode(command)
+            # A string can itself be a path containing spaces; also inspect shell-style strings.
+            self._check_executable(command, cwd)
+            try:
+                words = shlex.split(command)
+            except ValueError:
+                words = [command]
+            first = words[0] if words else None
+        else:
+            first = command[0] if command else None
+        self._check_executable(first, cwd)
+        self._check_executable(executable, cwd)
+
+    def run(self, *args, **kwargs):
+        self._check(args, kwargs)
+        return self._delegate.run(*args, **kwargs)
+
+    def Popen(self, *args, **kwargs):
+        self._check(args, kwargs)
+        return self._delegate.Popen(*args, **kwargs)
+
+
+def setUpModule():
+    original = iwb.subprocess
+    unittest.addModuleCleanup(setattr, iwb, "subprocess", original)
+    iwb.subprocess = GuardedSubprocess(original)
+
+
+class SubprocessGuard(unittest.TestCase):
+    def setUp(self):
+        class RecordingDelegate:
+            sentinel = object()
+
+            def __init__(self):
+                self.calls = []
+
+            def run(self, *args, **kwargs):
+                self.calls.append(("run", args, kwargs))
+                return self.sentinel
+
+            def Popen(self, *args, **kwargs):
+                self.calls.append(("Popen", args, kwargs))
+                return self.sentinel
+
+        self.delegate = RecordingDelegate()
+        self.guard = GuardedSubprocess(self.delegate)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def assertBlocked(self, *args, **kwargs):
+        for method in (self.guard.run, self.guard.Popen):
+            with self.subTest(wrapper=method.__name__, args=args, kwargs=kwargs):
+                self.delegate.calls.clear()
+                with self.assertRaisesRegex(AssertionError, "unguarded CLI launch"):
+                    method(*args, **kwargs)
+                self.assertEqual(self.delegate.calls, [])
+
+    def assertForwarded(self, *args, **kwargs):
+        for name in ("run", "Popen"):
+            self.delegate.calls.clear()
+            self.assertIs(getattr(self.guard, name)(*args, **kwargs), self.delegate.sentinel)
+            self.assertEqual(self.delegate.calls, [(name, args, kwargs)])
+
+    def test_bare_names_ignore_fake_path(self):
+        self.addCleanup(self.guard.register_root(self.root))
+        for name in self.guard.CLI_NAMES:
+            script = self.root / name
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o755)
+            for command in (name, name + " --version", [name, "--version"], (Path(name),), name.encode()):
+                self.assertBlocked(command, env={"PATH": str(self.root)})
+                self.assertBlocked(args=command, env={"PATH": str(self.root)})
+
+    def test_external_and_unregistered_temporary_paths(self):
+        for name in self.guard.CLI_NAMES:
+            self.assertBlocked([f"/usr/local/bin/{name}"])
+            self.assertBlocked(args=[self.root / name])
+
+    def test_shell_launches_never_dispatch(self):
+        self.addCleanup(self.guard.register_root(self.root))
+        for name in self.guard.CLI_NAMES:
+            script = self.root / name
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o755)
+            for program in (
+                    f"{name} --version", f"exec {name} --version",
+                    f"true; {name} --version", f"true && {name} --version",
+                    f"echo $({name} --version)", f"echo `{name} --version`",
+                    f"runner={name}; $runner --version",
+                    f"/usr/local/bin/{name} --version",
+                    f"./{name} --version", f"{shlex.quote(str(script))} --version"):
+                for command in (program, program.encode(), [program], (program, "shell-name")):
+                    self.assertBlocked(command, shell=True, cwd=self.root, env={"PATH": str(self.root)})
+                    self.assertBlocked(args=command, shell=True, executable="/bin/sh")
+                    self.assertBlocked(command, -1, None, None, None, None, None, True, True, self.root)
+
+    def test_shell_policy_is_independent_of_command_text(self):
+        # Even harmless shell code is refused: no partial shell parser can safely
+        # determine all executables that an arbitrary shell program may launch.
+        self.assertBlocked("printf harmless", shell=True)
+        self.assertBlocked(["printf harmless"], shell=1)
+        self.assertForwarded(["printf", "harmless"], shell=False)
+        self.assertForwarded(["printf", "harmless"], -1, None, None, None, None, None, True, False)
+
+    def test_registered_scripts_and_unchanged_arguments(self):
+        self.addCleanup(self.guard.register_root(self.root))
+        for name in self.guard.CLI_NAMES:
+            script = self.root / name
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o755)
+            for command in ([script, "--version"], (str(script),), script, shlex.quote(str(script)) + " --version"):
+                self.assertForwarded(command, cwd=self.root, env={"PATH": ""}, text=True)
+                self.assertForwarded(args=command)
+        self.assertForwarded(["git", "status"], capture_output=True)
+        self.assertIs(self.guard.sentinel, self.delegate.sentinel)
+
+    def test_relative_paths_use_supplied_or_current_cwd(self):
+        self.addCleanup(self.guard.register_root(self.root))
+        for name in self.guard.CLI_NAMES:
+            self.assertForwarded([f"./{name}"], cwd=self.root)
+            self.assertBlocked([f"../{name}"], cwd=self.root)
+        previous = Path.cwd()
+        self.addCleanup(os.chdir, previous)
+        os.chdir(self.root)
+        self.assertForwarded(["./claude"])
+        self.assertForwarded(["./codex"], cwd=".")
+        self.assertBlocked(["./claude"], cwd="/")
+        self.assertForwarded(["./gh"], -1, None, None, None, None, None, True, False, self.root)
+
+    def test_executable_overrides(self):
+        self.addCleanup(self.guard.register_root(self.root))
+        for name in self.guard.CLI_NAMES:
+            for override in (name, Path("/usr/local/bin") / name):
+                self.assertBlocked(["harmless"], executable=override)
+                self.assertBlocked(["harmless"], -1, override)
+            self.assertForwarded(args=["harmless"], executable=self.root / name)
+            self.assertForwarded(["harmless"], -1, self.root / name)
+            self.assertBlocked([name], executable="/bin/echo")
+
+    def test_symlink_escapes_and_path_containment(self):
+        registered = self.root / "registered"
+        registered.mkdir()
+        sibling = self.root / "registered-sibling"
+        sibling.mkdir()
+        self.addCleanup(self.guard.register_root(registered))
+        for name in self.guard.CLI_NAMES:
+            outside = sibling / name
+            outside.write_text("#!/bin/sh\nexit 0\n")
+            (registered / name).symlink_to(outside)
+            self.assertBlocked([registered / name])
+            self.assertBlocked([outside])
+        (registered / "bin").symlink_to(sibling, target_is_directory=True)
+        self.assertBlocked([registered / "bin" / "claude"])
+        (registered / "alias").symlink_to(sibling / "codex")
+        self.assertBlocked([registered / "alias"])
+
+    def test_registration_cleanup_revokes_access(self):
+        unregister = self.guard.register_root(self.root)
+        self.assertForwarded([self.root / "claude"])
+        unregister()
+        unregister()  # fixture cleanup is safe after an early unregister
+        self.assertBlocked([self.root / "claude"])
+
+    def test_deleted_root_is_inactive(self):
+        self.addCleanup(self.guard.register_root(self.root))
+        self.tmp.cleanup()
+        self.assertBlocked([self.root / "codex"])
+
+    def test_roots_beneath_openclaw_are_allowed_only_when_registered(self):
+        root = self.root / ".openclaw" / "tmp"
+        root.mkdir(parents=True)
+        self.assertBlocked([root / "claude"])
+        self.addCleanup(self.guard.register_root(root))
+        self.assertForwarded([root / "claude"])
+        self.assertBlocked([root.parent / "codex"])
+
+    def test_module_proxy_leaves_shared_subprocess_and_replacements_alone(self):
+        import subprocess
+        self.assertIsNot(iwb.subprocess, subprocess)
+        self.assertIs(iwb.subprocess._delegate, subprocess)
+        for name in ("run", "Popen"):
+            original = getattr(subprocess, name)
+            guarded = getattr(iwb.subprocess, name)
+            try:
+                setattr(iwb.subprocess, name, lambda *a, **k: "fixture")
+                self.assertEqual(getattr(iwb.subprocess, name)(["claude"]), "fixture")
+                self.assertIs(getattr(subprocess, name), original)
+            finally:
+                setattr(iwb.subprocess, name, guarded)
+            with self.assertRaisesRegex(AssertionError, "unguarded CLI launch"):
+                getattr(iwb.subprocess, name)(["claude"])
+        self.assertIs(iwb.subprocess.TimeoutExpired, subprocess.TimeoutExpired)
+
+    def test_real_cli_version_is_guarded(self):
+        with self.assertRaisesRegex(AssertionError, "unguarded CLI launch: claude"):
+            iwb.cli_version("claude")
 
 
 def nested_sandbox_error():
@@ -620,6 +869,14 @@ class Approve(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        # Availability checks need python3, but must not discover the host's runners.
+        python = Path(self.tmp.name, "python3")
+        python.write_text("")
+        python.chmod(0o755)
+        saved_path = os.environ.get("PATH")
+        self.addCleanup(lambda: os.environ.pop("PATH", None) if saved_path is None
+                        else os.environ.__setitem__("PATH", saved_path))
+        os.environ["PATH"] = self.tmp.name
         names = ("STATE", "CONFIG", "clone", "run_model", "post", "red_check", "lint_findings")
         self.saved_iwb = {k: getattr(iwb, k) for k in names}
         self.saved = {k: getattr(iwb.prbot, k) for k in ("gh_read", "bot_config", "openclaw_attention", "load_config")}
@@ -858,6 +1115,12 @@ class Code(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(iwb.subprocess.register_root(self.tmp.name))
+        saved_path = iwb.os.environ.get("PATH")
+        self.addCleanup(lambda: iwb.os.environ.pop("PATH", None) if saved_path is None
+                        else iwb.os.environ.__setitem__("PATH", saved_path))
+        iwb.os.environ["PATH"] = self.tmp.name
         p = iwb.prbot
         self.saved = {k: getattr(p, k) for k in ("gh_read", "bot_config", "openclaw_attention", "load_config")}
         self.saved_iwb = {k: getattr(iwb, k) for k in (
@@ -903,7 +1166,6 @@ class Code(unittest.TestCase):
             setattr(iwb.prbot, k, v)
         for k, v in self.saved_iwb.items():
             setattr(iwb, k, v)
-        self.tmp.cleanup()
 
     def certify(self, expires="2099-01-01T00:00:00Z", runners=("claude", "codex", "groq")):
         """A cert-latest.json as bin/recertify-weekly writes it."""
@@ -1491,6 +1753,10 @@ class Code(unittest.TestCase):
         self.assertEqual(path[0], dirs[1])
         self.assertEqual(sorted(path), sorted(dirs + ["/usr/bin", "/bin"]))      # nothing added or lost
 
+    def test_cli_version_is_forbidden(self):
+        with self.assertRaisesRegex(AssertionError, "unguarded CLI launch: claude"):
+            iwb.cli_version("claude")
+
     def test_run_ecc_reads_the_json_envelope(self):
         script = Path(self.tmp.name, "ecc")
         script.write_text("#!/bin/sh\necho 'drive: FAILED' >&2\n"
@@ -1828,6 +2094,15 @@ REAL_WRAPPER_CMDS = ["env PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp p
 
 class GateWrappers(unittest.TestCase):
     def test_real_env_wrapper_goes_back_to_the_planner(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        python = Path(tmp.name, "python3")
+        python.write_text("")
+        python.chmod(0o755)
+        saved = os.environ.get("PATH")
+        self.addCleanup(lambda: os.environ.pop("PATH", None) if saved is None
+                        else os.environ.__setitem__("PATH", saved))
+        os.environ["PATH"] = tmp.name
         problems = iwb.fixable_problems([unit("cli-error-envelopes", acceptance={"commands": REAL_WRAPPER_CMDS})])
         self.assertEqual(len(problems), 1)
         self.assertIn("cli-error-envelopes: acceptance command runs env", problems[0])
