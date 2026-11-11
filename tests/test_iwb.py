@@ -3039,6 +3039,28 @@ class Queue(unittest.TestCase):
         ev = json.loads(handoff.read_text())
         self.assertEqual((ev["repo"], ev["number"], ev["event"], ev["stage"]), (self.REPO, 7, "sweep", "code"))
 
+    def test_a_sweep_adds_no_second_hand_off_while_one_waits(self):
+        # regression: an issue waiting on a usage reset got a new hand-off from every sweep, and the code queue
+        # deferred each one uncounted, so 1049 files for 17 issues piled up
+        iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
+        self.save({7: self.approved(7), 8: self.approved(8)})
+        self.sweep(self.REPO)
+        self.assertEqual(self.drain()[0], 0)
+        self.assertEqual(len(self.left(self.cq)), 2)
+        self.sweep(self.REPO)
+        self.assertEqual(self.drain()[0], 0)
+        self.assertEqual(len(self.left(self.cq)), 2)                 # still waiting in the code queue
+        self.cdeferred.mkdir()
+        waiting = next(f for f in self.cq.iterdir() if json.loads(f.read_text())["number"] == 7)
+        os.replace(waiting, self.cdeferred / waiting.name)           # the code queue deferred #7
+        self.sweep(self.REPO)
+        self.assertEqual(self.drain()[0], 0)
+        self.assertEqual((len(self.left(self.cq)), len(self.left(self.cdeferred))), (1, 1))
+        os.remove(next(self.cdeferred.iterdir()))                    # #7's hand-off was handled
+        self.sweep(self.REPO)
+        self.assertEqual(self.drain()[0], 0)
+        self.assertEqual(sorted(json.loads(f.read_text())["number"] for f in self.cq.iterdir()), [7, 8])
+
     def test_a_sweep_never_changes_the_outcome_of_queued_events(self):
         self.event(1)
         self.sweep(None)

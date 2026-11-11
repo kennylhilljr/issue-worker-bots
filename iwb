@@ -3035,12 +3035,33 @@ def iwb_event(repo, number, event):
                   "source": "iwb", "version": 1}
 
 
+def queued_hand_offs(code_q):
+    """The "owner/repo#n" keys that already have a hand-off waiting in the code queue or its deferred folder."""
+    keys = set()
+    for d in (code_q, sibling(code_q, "deferred")):
+        if d.is_symlink() or not d.is_dir():
+            continue
+        for f in d.iterdir():
+            try:
+                ev = read_event(f) if is_event_file(f) else None
+            except OSError:
+                continue
+            if ev and ev.get("number"):
+                keys.add(f"{ev['repo']}#{ev['number']}")
+    return keys
+
+
 def hand_off_ready(q, keys, handed):
     """Hand every issue in `keys` that is ready to code, has no outcome this run and wasn't handed off yet, to the
-    code queue. `keys` maps a state key to the (file name, event) to send."""
+    code queue. `keys` maps a state key to the (file name, event) to send. An issue whose hand-off still waits in
+    the code queue or its deferred folder gets no second one: every sweep would add another file per waiting issue."""
     state = read_state_file()
+    try:
+        queued = queued_hand_offs(sibling(q, "code"))
+    except OSError:
+        queued = set()
     for key, (name, ev) in keys.items():
-        if key in OUTCOME or key in handed:
+        if key in OUTCOME or key in handed or key in queued:
             continue
         try:
             if not needs_coding(state.get(key)):
