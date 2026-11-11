@@ -269,8 +269,8 @@ def choose_agent(issue, state):
     return "codex" if last == "claude" else "claude"   # alternate so neither subscription runs out first
 
 
-def run_gh_as(bot, repo, args):
-    env = dict(os.environ, GH_TOKEN=prbot.installation_token(bot, repo), PRBOT_ACTIVE=bot)
+def run_gh_as(bot, repo, args, permissions=None):
+    env = dict(os.environ, GH_TOKEN=prbot.installation_token(bot, repo, permissions), PRBOT_ACTIVE=bot)
     env.pop("GITHUB_TOKEN", None)
     r = subprocess.run([prbot._real_gh()] + args, env=env, capture_output=True, text=True)
     if r.returncode != 0:
@@ -2228,11 +2228,15 @@ def acceptance_check(repo, bot, branch, sha, commands):
     return all(r["exit"] == 0 for r in runs), runs
 
 
+MERGE_PERMISSIONS = {"contents": "write", "pull_requests": "write"}   # the default token is contents:read → 403
+
+
 def merge_pr(bot, repo, number, sha, title):
     """Squash-merge as the worker bot, only while the head is still `sha` (the API's form of gh's
     --match-head-commit). Returns the merge commit."""
     return run_gh_as(bot, repo, ["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/merge", "-f", "merge_method=squash",
-                                 "-f", f"sha={sha}", "-f", f"commit_title={title} (#{number})", "--jq", ".sha"])
+                                 "-f", f"sha={sha}", "-f", f"commit_title={title} (#{number})", "--jq", ".sha"],
+                     permissions=MERGE_PERMISSIONS)
 
 
 def needs_kenny(key, entry, why):

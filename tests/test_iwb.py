@@ -3360,7 +3360,7 @@ class AutoMerge(unittest.TestCase):
             return lines(self.statuses)
         raise AssertionError(f"unexpected gh read {args}")
 
-    def fake_run_gh_as(self, bot, repo, args):
+    def fake_run_gh_as(self, bot, repo, args, permissions=None):
         self.gh_calls.append((bot, args))
         return "c" * 40 if args[:3] == ["api", "-X", "PUT"] else "https://x/note"
 
@@ -3575,6 +3575,26 @@ class AutoMerge(unittest.TestCase):
         self.assert_needs_kenny("after the one repair round")
         self.run_pass()
         self.assertEqual((len(self.ecc_calls), len(self.posts)), (4, 1))
+
+    def test_merge_asks_for_a_token_that_can_write_contents(self):
+        # regression: run_gh_as minted the default contents:read token, so every merge PUT got
+        # "Resource not accessible by integration (HTTP 403)" and the PR retried forever
+        asked = []
+
+        def token(bot, repo, permissions=None):
+            asked.append(permissions)
+            raise RuntimeError("stop before gh runs")
+        saved = iwb.prbot.installation_token
+        self.addCleanup(setattr, iwb.prbot, "installation_token", saved)
+        iwb.prbot.installation_token = token
+        with self.assertRaises(RuntimeError):
+            self.saved_iwb["run_gh_as"]("codex-dev", "kennylhilljr/demo", ["api", "user"])
+        with self.assertRaises(RuntimeError):
+            iwb.merge_pr.__globals__["run_gh_as"] = self.saved_iwb["run_gh_as"]
+            iwb.merge_pr("codex-dev", "kennylhilljr/demo", 9, "a" * 40, "Add retries")
+        self.assertIsNone(asked[0])                                  # everything else keeps the default set
+        self.assertEqual(asked[1].get("contents"), "write")
+        self.assertEqual(asked[1].get("pull_requests"), "write")
 
     def test_clean_review_after_repair_merges(self):
         self.reviews = [review(HEAD, P2_FINDING)]
