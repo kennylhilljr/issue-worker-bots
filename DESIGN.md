@@ -206,6 +206,7 @@ Two cautions:
 | --- | --- | --- |
 | Issues being coded at once | 2 | Approved plans wait |
 | Coding runs per pass | 1 | The next approved plan waits for the next pass |
+| Analyses per pass | 1 | The next issue waits for the next pass and keeps why it needs one (a requested replan, a revise verdict, a reopen) until an analysis is posted |
 | Analysis attempts per issue | 2 | Questions posted on the issue |
 | Cost per issue | `drive --max-cost-usd`, from `max_cost_usd_per_issue` in `config.json` (default $5) | Run stops, issue labeled `bot:blocked` with the reason |
 | Cost per unit | `budget.maximum_cost_usd` in the plan, above 0; the planner is told to use `max_cost_usd_per_issue` unless the unit is clearly smaller | Unit stops with `budget_exhausted`; a plan with 0 is sent back before review, or blocked before `create-run` if already approved |

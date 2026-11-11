@@ -797,6 +797,46 @@ class Analyze(unittest.TestCase):
         self.assertNotIn("unrelated review bot note", self.prompts[1])
         self.assertNotIn("<!-- iwb:approval -->", self.prompts[1])
 
+    def set_entry(self, **kw):
+        state = json.loads(iwb.STATE.read_text())
+        state[self.KEY].update(kw)
+        iwb.STATE.write_text(json.dumps(state))
+
+    def test_a_replan_held_by_the_limit_runs_on_the_next_pass(self):
+        # regression: needs_analysis popped "replan" before the per-pass limit check, so a plan the approver sent
+        # back that was held by the limit was saved without the flag and sat on bot:planned forever
+        self.plan_first()
+        self.set_entry(replan=True)
+        log = self.run_pass(limit=0)
+        self.assertIn("analysis (replan requested) waits for the next pass", log)
+        self.assertTrue(self.state()["replan"])
+        self.answers = [answer({"decision": "plan", "summary": "v2", "units": [unit()]})]
+        log = self.run_pass()
+        self.assertIn("(replan requested)", log)
+        self.assertEqual(len(self.prompts), 2)
+        self.assertNotIn("replan", self.state())                     # consumed once the analysis was posted
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 2)
+
+    def test_a_replan_whose_analysis_failed_is_retried(self):
+        self.plan_first()
+        self.set_entry(replan=True)
+        self.answers = [RuntimeError("model outage")]
+        self.run_pass()
+        self.assertTrue(self.state()["replan"])
+        self.set_entry(analysis_failed_at=0)                           # the hour has passed
+        self.answers = [answer({"decision": "plan", "summary": "v2", "units": [unit()]})]
+        self.assertIn("(replan requested)", self.run_pass())
+
+    def test_a_reason_held_by_the_limit_survives(self):
+        self.set_entry(reason="reopened")
+        log = self.run_pass(limit=0)
+        self.assertIn("analysis (reopened) waits for the next pass", log)
+        self.assertEqual(self.state()["reason"], "reopened")
+        self.answers = [answer({"decision": "plan", "summary": "v1", "units": [unit()]})]
+        self.assertIn("(reopened)", self.run_pass())
+        self.assertNotIn("reason", self.state())
+
     def test_dry_run_posts_and_saves_nothing(self):
         self.answers = [answer({"decision": "plan", "summary": "x", "units": [unit()]})]
         log = self.run_pass(dry_run=True)
@@ -3595,13 +3635,13 @@ class CorruptState(unittest.TestCase):
         self.assertEqual([f.name for f in target.parent.iterdir()], ["x.json"])
 
 
-class GuardedSubprocess:
+class RealCliGuard:
     """Fails a test that would start gh, claude, codex or a networked git command for real."""
     REFUSED = {"gh", "claude", "codex"}
     NETWORK_GIT = {"clone", "fetch", "push", "ls-remote"}
 
     def __init__(self):
-        self.run, self.popen = iwb.subprocess.run, iwb.subprocess.Popen
+        self.saved = iwb.subprocess       # the module-wide GuardedSubprocess; wrapped, never modified
 
     def check(self, cmd):
         argv = [str(a) for a in (cmd if isinstance(cmd, (list, tuple)) else [cmd])]
@@ -3610,22 +3650,25 @@ class GuardedSubprocess:
             raise AssertionError(f"test started {' '.join(argv[:3])} for real")
 
     def __enter__(self):
-        guard = self
+        guard, outer = self, self.saved
 
-        def run(cmd, *a, **k):
-            guard.check(cmd)
-            return guard.run(cmd, *a, **k)
+        class Wrapped:
+            def __getattr__(self, name):
+                return getattr(outer, name)
 
-        class Popen(self.popen):
-            def __init__(self, cmd, *a, **k):
+            def run(self, cmd, *a, **k):
                 guard.check(cmd)
-                super().__init__(cmd, *a, **k)
+                return outer.run(cmd, *a, **k)
 
-        iwb.subprocess.run, iwb.subprocess.Popen = run, Popen
+            def Popen(self, cmd, *a, **k):
+                guard.check(cmd)
+                return outer.Popen(cmd, *a, **k)
+
+        iwb.subprocess = Wrapped()
         return self
 
     def __exit__(self, *exc):
-        iwb.subprocess.run, iwb.subprocess.Popen = self.run, self.popen
+        iwb.subprocess = self.saved
 
 
 HEAD = "a" * 40
@@ -3696,7 +3739,7 @@ class AutoMerge(unittest.TestCase):
         iwb.push_branch = lambda bot, repo, d, sha, branch, default: self.pushed.append((bot, sha, branch))
         self.units = [coding_unit()]
         self.save_entry()
-        self.guard = GuardedSubprocess().__enter__()
+        self.guard = RealCliGuard().__enter__()
 
     def tearDown(self):
         self.guard.__exit__()
