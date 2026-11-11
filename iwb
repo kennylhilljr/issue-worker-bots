@@ -2572,7 +2572,7 @@ def prs_to_review(state, conf):
     return keys
 
 
-def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None, review=True):
+def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None, review=True, intake_q=None):
     """Step 4b: code plans that step 4a approved, in repositories listed in config.json "coding_repos". Then
     step 5 for open PRs, unless `review` is False (a code-queue drain runs step 5 once, at its end)."""
     ecc = ecc or run_ecc
@@ -2658,7 +2658,7 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None, review=True):
             # Only "code" runs the coder and pushes. "interrupted" never resumes: it blocks the issue, and removing
             # bot:blocked clears the analysis, so the plan is analyzed again. "pr" opens the PR for a branch already
             # pushed; from then on feedback goes to the PR.
-            if step == "code" and not plan_still_current(key, entry, QUEUE_DIR):
+            if step == "code" and not plan_still_current(key, entry, intake_q or QUEUE_DIR):
                 continue                    # read again under work.lock: a newer comment or edit sends it back
             if step == "note":
                 try:
@@ -3177,11 +3177,13 @@ def cmd_code_drain(queue_dir):
     """`code --from-queue DIR`: step 4b for each issue handed off in DIR by the issue queue. Same folders and
     outcomes: DIR-deferred, DIR-rejected; a coding lock held elsewhere is an uncounted wait. cmd_code reads the
     issue again under work.lock before coding; if it changed since its plan was analyzed, the plan is marked
-    stale_plan, an event goes back to the issue queue (IWB_QUEUE_DIR), and the hand-off counts as handled."""
+    stale_plan, an event goes back to the originating issue queue (the code queue's sibling, or IWB_QUEUE_DIR
+    when the code queue is not named <intake>-code), and the hand-off counts as handled."""
     q = Path(queue_dir).expanduser()
     problem = drain_problem(q, CODE_QUEUE_DEFAULT)
     if problem:
         return refuse(problem)
+    intake_q = q.parent / q.name[: -len("-code")] if q.name.endswith("-code") else QUEUE_DIR
     entries = sorted(q.iterdir()) if q.is_dir() else []
     if not entries:
         return 0
@@ -3208,7 +3210,7 @@ def cmd_code_drain(queue_dir):
         return 0
     for key in groups:
         try:                              # cmd_code reads the issue again under work.lock before coding it
-            cmd_code(limit=CODE_LIMIT - SPENT["code"], only={key}, review=False)
+            cmd_code(limit=CODE_LIMIT - SPENT["code"], only={key}, review=False, intake_q=intake_q)
         except (Exception, SystemExit) as e:
             mark(key, "failed", f"coding hand-off failed: {e!r}")
     # Step 5 once for every open PR, not only the handed-off issues: while queued coding runs, tick's full cmd_code

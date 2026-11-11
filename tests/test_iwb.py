@@ -3270,6 +3270,22 @@ class QueueRealSteps(Queue):
         self.assertEqual(list(Path(self.tmp.name, ".tmp").iterdir()), [])
         self.assertIn("out of date (reply after plan)", out)
 
+    def test_a_stale_plan_goes_back_to_the_originating_intake_queue(self):
+        # regression: a code queue drained under the default QUEUE_DIR must send a stale-plan event back to its
+        # own sibling intake queue, not whatever folder the environment happens to default to
+        self.real_coding()
+        self.save({5: self.approved(5)})
+        self.code_event(5)
+        self.comments[5] = [{"user": OWNER, "body": "Wait, the API changed.", "at": "2026-11-03T14:00:00Z"}]
+        wrong = Path(self.tmp.name, "wrong-intake")
+        wrong.mkdir()
+        saved_q = iwb.QUEUE_DIR
+        self.addCleanup(lambda: setattr(iwb, "QUEUE_DIR", saved_q))
+        iwb.QUEUE_DIR = wrong
+        self.code_drain()
+        self.assertEqual(len(self.left(self.q)), 1)
+        self.assertEqual(self.left(wrong), [])
+
     def test_a_current_plan_is_coded_and_an_edited_issue_is_not(self):
         self.real_coding()
         self.save({5: self.approved(5)})
