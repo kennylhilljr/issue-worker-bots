@@ -1,5 +1,5 @@
 """Tests for iwb intake. No network: GitHub reads and bot posts are faked. Run: python3 -m unittest discover -s tests"""
-import importlib.util, io, json, os, tempfile, time, unittest
+import importlib.util, io, json, os, re, tempfile, time, unittest
 from contextlib import redirect_stderr, redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -771,7 +771,7 @@ class Code(unittest.TestCase):
         self.ecc_calls, self.ecc_results, self.ecc_opts, self.during_drive = [], {}, [], None
         self.changed = ["src/parser.py"]
         self.pushed, self.commits, self.prs = [], [], []
-        iwb.checkout = lambda repo, bot, branch: (str(Path(self.tmp.name, "clone")), "main", "base0")
+        iwb.checkout = lambda repo, bot, branch, *milestone: (str(Path(self.tmp.name, "clone")), "main", "base0")
         iwb.trusted_copy = lambda d, branch, base: str(Path(self.tmp.name, "trusted"))
         iwb.changed_files = lambda d, base, branch: self.changed
         iwb.commit_as = lambda bot, repo, d, base, branch, msg: self.commits.append((bot, msg)) or "sha1"
@@ -1915,6 +1915,22 @@ class Checkout(unittest.TestCase):
         self.assertEqual(sorted(files), ["a.py", "b.py"])
         self.assertEqual(iwb.scope_problems(files, [coding_unit(files=["a.py"])], "kennylhilljr/demo"),
                          ["`b.py` is outside the plan's scope"])
+        self.assertNotIn("milestone", team)                                         # no issue given
+
+        # regression (openclaw-ecc-orchestrator#26, #31, pr-review-bots#8): with no milestone in team.json the
+        # product owners saw "(none configured)" for exit criteria and gates and rejected every run
+        units = [{"id": "u1", "title": "Do x", "acceptance": {"commands": ["python3 -m unittest tests.t"]}},
+                 {"id": "u2", "title": "Do y", "acceptance": {"commands": ["python3 -m unittest tests.t", "make"]}}]
+        d, _, _ = iwb.checkout("kennylhilljr/demo", "claude-dev", "bot/1-y", "1", {"title": "X", "body": "Want x."},
+                               units)
+        m = json.loads(Path(d, ".orchestration/team.json").read_text())["milestone"]
+        self.assertEqual(m["gate_commands"], ["python3 -m unittest tests.t", "make"])   # each once, in plan order
+        doc = Path(d, m["docs"][0]["path"]).read_text()
+        for text in ("Want x.", "`u2`: Do y", "`make`"):
+            self.assertIn(text, doc)
+        # the orchestrator extracts the doc's sections by heading number (evidence.extract_sections)
+        self.assertEqual(re.findall(r"^#{1,4}\s+(\d+(?:\.\d+)*)\.?\s", doc, re.M), m["docs"][0]["sections"])
+        self.assertEqual(git("status", "--porcelain", cwd=d), "")                  # the doc stays out of git too
 
     def test_renaming_a_protected_file_into_scope_is_refused(self):
         # regression: `git diff --name-only` listed only the new name of a rename, so moving .env into a file the
