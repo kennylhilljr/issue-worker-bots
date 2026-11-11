@@ -68,9 +68,10 @@ flowchart LR
     APPROVE --> RUN["Orchestrator run, cheapest fitting model"]
     RUN --> PR["Draft PR by the worker bot"]
     PR --> REVIEW["Cross-review by the other agent"]
-    REVIEW --> FIX["One repair round on P1 or P2 findings"]
-    FIX --> MERGE["Kenny merges"]
-    REVIEW --> MERGE
+    REVIEW --> FIX["One repair round on P0-P2 findings"]
+    FIX --> REVIEW
+    REVIEW --> MERGE["Gated squash merge by iwb"]
+    REVIEW --> KENNY["Otherwise: bot:needs-kenny"]
 ```
 
 ### 1. Intake
@@ -119,9 +120,9 @@ On approval, the approver records it the way the orchestrator already expects: `
 
 Why this is safe without a person in the loop:
 
-- The bots never merge into a default branch. `drive` does merge units, but only locally, into the `bot/` branch of `iwb`'s own clone; the orchestrator pushes nothing. Work reaches GitHub only as a draft PR on a `bot/` branch, pushed by `iwb` as the worker bot.
+- The bots never push to a default branch except via a gated squash merge of a reviewed bot PR (step 6). `drive` does merge units, but only locally, into the `bot/` branch of `iwb`'s own clone; the orchestrator pushes nothing. Work reaches GitHub only as a draft PR on a `bot/` branch, pushed by `iwb` as the worker bot.
 - Every PR gets a second cross-family review, of the code this time.
-- Kenny merges. Nothing reaches a default branch without him.
+- Nothing reaches a default branch unless the gate in step 6 passes: a clean cross-review of the exact head commit, the acceptance commands passing on a fresh clone of it, no protected path, no failing check. Everything else waits for Kenny.
 - Kenny can stop anything at any time: `bot:stop` on an issue or PR stops it at the next pass, and `"paused": true` in `config.json` stops every worker.
 
 ### 5. Coding
@@ -132,7 +133,7 @@ The worker labels the issue `bot:in-progress` and starts an orchestrator run wit
 
 - **Where.** A fresh clone of the target repository that `iwb` owns, under `~/.local/state/issue-worker-bots/repos/`, never one of Kenny's checkouts. The branch `bot/<issue-number>-<slug>-<attempt>` is created at the default branch's tip and is the run's target branch. `<attempt>` is a short hash of the run id (`iwb.<owner>.<repo>.<n>.<UTC time>`), so a retry never collides with an earlier run or branch. The orchestrator's state and worktrees live under the same directory, so these runs never contend with Kenny's own orchestrator runs.
 - **Approval record.** The approval is recorded the way the orchestrator expects, with the approving review bot as operator: `ecc review-plan --json --approve --operator <review bot> --session iwb.<owner>.<repo>.<n> -- create-run --run-id <id> --plan <file> <config flags>`, then `ecc create-run ... --yes --review-id <id>`. The record is bound to the hash of that exact command plan, expires after an hour and is used once. `drive` is gated the same way and gets its own record right before it runs.
-- **Merge approval.** If the repository has no `.orchestration/team.json`, `iwb` writes one with `"merge_approval": "agents"` into its clone, kept out of git. Without it the orchestrator would wait for a person to approve each merge into the `bot/` branch; the plan approver already stands in for that, and Kenny still merges the PR. The same file turns off the architect's milestone-start plan check (`roles.architect.when` without `milestone_start`): the plan approver already red-checked the plan, and an architect that could not answer stopped the drive with `no_architect`. It also names the milestone for the product owners who accept the run at milestone end: the goal is the issue and the exit criteria are the units' acceptance commands, written to `.orchestration/milestone.md` (also kept out of git) and run again on the result as the milestone gates. With no milestone they saw `(none configured)` and rejected every run. It also turns off the orchestrator's practices pass (`"learning": {"enabled": false}`): the delivery lead would merge lessons into `AGENTS.md`, `CLAUDE.md`, `.agents/skills/**` and `.agents/LESSONS.md` on the `bot/` branch, outside every plan's scope, and the scope check after the run refused it (openclaw-ecc-orchestrator#27). A repository's own `team.json` is used as it is, except that `iwb` turns the practices pass off in its clone too (marked skip-worktree, so it stays out of git).
+- **Merge approval.** If the repository has no `.orchestration/team.json`, `iwb` writes one with `"merge_approval": "agents"` into its clone, kept out of git. Without it the orchestrator would wait for a person to approve each merge into the `bot/` branch; the plan approver already stands in for that, and the PR itself still goes through step 6's merge gate. The same file turns off the architect's milestone-start plan check (`roles.architect.when` without `milestone_start`): the plan approver already red-checked the plan, and an architect that could not answer stopped the drive with `no_architect`. It also names the milestone for the product owners who accept the run at milestone end: the goal is the issue and the exit criteria are the units' acceptance commands, written to `.orchestration/milestone.md` (also kept out of git) and run again on the result as the milestone gates. With no milestone they saw `(none configured)` and rejected every run. It also turns off the orchestrator's practices pass (`"learning": {"enabled": false}`): the delivery lead would merge lessons into `AGENTS.md`, `CLAUDE.md`, `.agents/skills/**` and `.agents/LESSONS.md` on the `bot/` branch, outside every plan's scope, and the scope check after the run refused it (openclaw-ecc-orchestrator#27). A repository's own `team.json` is used as it is, except that `iwb` turns the practices pass off in its clone too (marked skip-worktree, so it stays out of git).
 - **Runners.** The run gets an orchestrator config with the runner certifications and model catalog (`ecc_config` in `config.json` overrides them). Without certifications no runner can be assigned, so before labeling anything `iwb` reads them the way the orchestrator does and checks that `claude` and `codex` (`ecc_runners` in `config.json`) are certified and that no certified runner expires within the 6-hour run timeout. Certifications expire weekly; a run started just before would lose runners half way. If they fall short, the issue is skipped with a log line and tried again an hour later, with no label or comment.
 - **Orchestrator version.** `iwb` runs the orchestrator checkout next to it, or `ecc_path` in `config.json` (for example a worktree kept at `origin/main`). Before a run it fetches that checkout. When the checkout is on branch `main`, has no changes to tracked files and is strictly behind `origin/main`, it fast-forwards it (`git merge --ff-only`, hooks off) and logs it, so a merge to the orchestrator's main does not stall coding until someone pulls. Otherwise it skips the issue, the same quiet way, unless `HEAD` is `origin/main`. It never resets, stashes or switches branches there; Kenny's working checkout is often on a feature branch or has work in progress.
 - **Run.** The orchestrator routes each unit to the model for its tier, runs it in a worktree, runs the acceptance commands, escalates one tier on a real failure, and fast-forwards the `bot/` branch as units pass. The bots never call `ecc merge`, and nothing in the orchestrator pushes.
@@ -152,9 +153,9 @@ The pushed branch is saved in `state.json` as soon as the push succeeds, and the
 
 When the commit is pushed, the worker opens a draft PR with `Closes #<n>`, the label `agent:claude` or `agent:codex`, and the plan's units. It marks the PR ready, labels the issue `bot:pr-open`, and the `pr-review-bots` watcher sends the PR to the other agent for review within 5 minutes.
 
-If the review raises P1 or P2 findings, the worker runs one repair round. Each finding becomes a unit with the finding as its instructions and the failing case as its acceptance check, which is exactly the clear kind of work a cheap model can do. After that round, or if findings remain, the PR waits for Kenny.
+If the review raises P0, P1 or P2 findings, the worker runs one repair round. Each finding becomes a unit with the finding as its instructions and a test for the failing case it describes as part of the work (the plan's acceptance commands must still pass), at the same tier as the plan units it names, which is exactly the clear kind of work a cheap model can do. The round starts from the PR head and is pushed as one more commit by the worker bot to the same `bot/` branch; `prbot` reviews the new head. After that round, if findings remain, or if anything else fails, the issue gets `bot:needs-kenny` with a one-paragraph reason and the PR waits for Kenny.
 
-Merging stays with Kenny.
+Merging (decided 2026-11-11, behind `"auto_merge": true` in `config.json`, off by default): a worker's PR is squash-merged by `iwb`, as the worker bot and only while its head is the reviewed commit, when all of these hold: it is the worker bot's own non-draft PR from a `bot/` branch and GitHub can merge it cleanly; the latest cross-review by the other agent's review bot reviewed the head commit and has no P0, P1 or P2 findings (P3 findings pass and are listed in the merge comment); the plan's acceptance commands and the repository's `test_commands` pass on a fresh clone of the head (none determinable means no merge); no changed file is a protected path; and no check run or commit status on the head is failing or pending. The merge uses the API's `sha` check (the same as `gh pr merge --match-head-commit`), so a push after the review can't slip in. After the merge the issue gets a comment and `bot:done`. At most one merge per pass, and a repair round counts as the pass's coding run.
 
 ## Coming back to an issue
 
@@ -169,10 +170,11 @@ The bots look at every open issue they picked up on each 5-minute pass; there ar
 | `bot:blocked` removed by Kenny | Label gone | Retry from analysis |
 | `bot:stop` added | Label | Stop at once: cancel any run, comment, take no further action until it is removed |
 | A trusted comment that mentions the worker bot | `@claude-dev-gh` or `@codex-dev-gh` plus a command: `replan`, `stop`, `switch codex`, `status` | Runs the command |
-| P1 or P2 findings on the worker's PR | `prbot review` findings (already sent to OpenClaw) | One repair round (step 6) |
+| P0-P2 findings on the worker's PR | The cross-review bot's latest review of the head commit | One repair round (step 6); after it, `bot:needs-kenny` |
+| A clean review of the worker's PR head | The cross-review bot's latest review, P3 findings allowed | Gated squash merge (step 6), or `bot:needs-kenny` with the reason |
 | CI failing on the worker's PR | Check runs on the PR head | One fix round, with the failing log as the instructions |
 | The worker's PR closed without merging | PR state | Comment on the issue, `bot:blocked`, OpenClaw attention |
-| The worker's PR merged | PR state | Comment, `bot:done`, nothing further |
+| The worker's PR merged (by `iwb` or Kenny) | PR state | Comment, `bot:done`, nothing further |
 | No reply to questions | 7 days after the questions | One reminder; after 14 days `bot:stale`, and the bot stops |
 
 What never brings a bot back: comments from accounts that are not trusted, the bots' own comments, other bots' comments except reviews on the worker's PR, and reactions.
@@ -213,13 +215,13 @@ Two cautions:
 
 ## Status labels
 
-`bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bot:approved`, `bot:in-progress`, `bot:pr-open`, `bot:done`, `bot:blocked`, `bot:stale`, and `bot:stop` (set by Kenny). Each change also posts a one-line comment from the worker bot, so the issue timeline tells the story.
+`bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bot:approved`, `bot:in-progress`, `bot:pr-open`, `bot:needs-kenny`, `bot:done`, `bot:blocked`, `bot:stale`, and `bot:stop` (set by Kenny). Each change also posts a one-line comment from the worker bot, so the issue timeline tells the story.
 
 ## Safety
 
 - Only issues opened or labeled by Kenny are worked on.
 - Analysis runs read-only. Coding runs only in repositories listed in `coding_repos`, inside orchestrator worktrees of `iwb`'s own clone, never on `main` or a checkout Kenny uses. Before anything is pushed, the run's actual changes are checked against the plan's scope and the protected paths.
-- Workers never merge, never push to the default branch, and never change repository settings, secrets or workflows. Changes to `.github/workflows`, secrets, credentials and deploy configuration are refused by the policy gate; no agent can approve them.
+- Workers never push to the default branch except via a gated squash merge of a reviewed bot PR (step 6), and never change repository settings, secrets or workflows. Changes to `.github/workflows`, secrets, credentials and deploy configuration are refused by the policy gate; no agent can approve them.
 - Tokens come from `prbot`: one hour, one repository, never printed or saved.
 - The orchestrator and the runner CLIs get a scrubbed environment: the base names the orchestrator's runners use (`PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `TMPDIR`, `TERM`, uv's cache settings) plus `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the XDG folders, which the CLIs use to find their own logins. No `GH_TOKEN`, `GITHUB_TOKEN`, `PRBOT_*` or other tokens; `drive_env` in `config.json` can add a name, never one of those. The run pushes nothing, so it needs no GitHub credentials.
 - `drive` does not run under `sandbox-exec`. It was tried on 2026-10-30 with a profile that allowed writes only to the issue's checkout, the orchestrator's state and worktrees, the CLIs' config and cache folders, and temp. Claude Code worked under it. Codex did not: its own `workspace-write` sandbox rejected every write, even inside the allowed checkout, and the same command with the same scrubbed environment worked without the outer profile. The orchestrator routes units to both CLIs, so the outer sandbox would break Codex units. Writes are limited instead by each CLI's own sandbox (Codex `workspace-write`, Claude Code `acceptEdits` with an allowlist of edit tools) and by the scope check before anything is pushed.
@@ -304,7 +306,7 @@ A new repository, `issue-worker-bots`, holds the intake watcher, the analysis pr
 2. Intake watcher with the opener and label rules, posting only the "picked up" comment. Run it for a few days.
 3. Analysis step that posts questions or a plan, with no coding yet. Check plan quality on real issues.
 4. Clarity, policy and red-check gates, agentic clarification and plan approval, then orchestrator runs and draft PRs on one low-risk repository. Gates and approval are step 4a, on main behind `approval_live`; coding and PRs are step 4b, behind `coding_live`, piloted on `kennylhilljr/ecc-customization`. Agentic clarification is not built yet.
-5. Review hand-off and the repair round.
+5. Review hand-off, the repair round and the gated merge (built; on with `auto_merge`).
 6. Turn on more repositories, then measure escalation rates and adjust the model table.
 
 ## Decisions (2026-10-29)

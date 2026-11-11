@@ -3217,3 +3217,400 @@ class CorruptState(unittest.TestCase):
         iwb.write_atomic(target, '{"units": []}\n')
         self.assertEqual(target.read_text(), '{"units": []}\n')
         self.assertEqual([f.name for f in target.parent.iterdir()], ["x.json"])
+
+
+class GuardedSubprocess:
+    """Fails a test that would start gh, claude, codex or a networked git command for real."""
+    REFUSED = {"gh", "claude", "codex"}
+    NETWORK_GIT = {"clone", "fetch", "push", "ls-remote"}
+
+    def __init__(self):
+        self.run, self.popen = iwb.subprocess.run, iwb.subprocess.Popen
+
+    def check(self, cmd):
+        argv = [str(a) for a in (cmd if isinstance(cmd, (list, tuple)) else [cmd])]
+        prog = os.path.basename(argv[0]) if argv else ""
+        if prog in self.REFUSED or prog == "git" and self.NETWORK_GIT & set(argv[1:]):
+            raise AssertionError(f"test started {' '.join(argv[:3])} for real")
+
+    def __enter__(self):
+        guard = self
+
+        def run(cmd, *a, **k):
+            guard.check(cmd)
+            return guard.run(cmd, *a, **k)
+
+        class Popen(self.popen):
+            def __init__(self, cmd, *a, **k):
+                guard.check(cmd)
+                super().__init__(cmd, *a, **k)
+
+        iwb.subprocess.run, iwb.subprocess.Popen = run, Popen
+        return self
+
+    def __exit__(self, *exc):
+        iwb.subprocess.run, iwb.subprocess.Popen = self.run, self.popen
+
+
+HEAD = "a" * 40
+REPAIRED = "b" * 40
+
+
+def review(sha, text="No findings worth reporting.", user="codex-pr-gh[bot]", n=1):
+    return {"user": user, "url": f"https://github.com/kennylhilljr/demo/pull/9#pullrequestreview-{n}",
+            "body": f"### Codex review\n\n_Cross-review: claude wrote this PR._\n\n{text}\n\n"
+                    f"<sub>Reviewed commit `{sha[:10]}` · posted by {user}</sub>\n"}
+
+
+P2_FINDING = ("- **P2 — `src/parser.py:12`: an empty line crashes `parse`.** `parse('')` raises IndexError; "
+              "return [] for empty input.")
+P3_FINDING = "- **P3 — `src/parser.py:30`: the docstring says list, the function returns a tuple.**"
+
+
+class AutoMerge(unittest.TestCase):
+    """Step 5: the gated merge and the one repair round. GitHub, the orchestrator and git are faked."""
+    KEY = "kennylhilljr/demo#1"
+    BRANCH = "bot/1-add-retries-abc123"
+    PR = "https://github.com/kennylhilljr/demo/pull/9"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        p = iwb.prbot
+        self.saved = {k: getattr(p, k) for k in ("gh_read", "bot_config", "openclaw_attention", "load_config")}
+        self.saved_iwb = {k: getattr(iwb, k) for k in (
+            "STATE", "CONFIG", "WORK_DIR", "QUEUE_DIR", "post", "run_gh_as", "checkout_pr", "trusted_copy",
+            "changed_files", "commit_as", "push_branch", "acceptance_check", "ECC_DEFAULTS", "orchestrator_drift",
+            "drive_env")}
+        iwb.STATE = Path(self.tmp.name, "state.json")
+        iwb.CONFIG = Path(self.tmp.name, "config.json")
+        iwb.WORK_DIR = Path(self.tmp.name, "work")
+        iwb.QUEUE_DIR = Path(self.tmp.name, "queue")
+        self.config()
+        iwb.ECC_DEFAULTS = {"certifications": str(Path(self.tmp.name, "cert-latest.json"))}
+        Path(iwb.ECC_DEFAULTS["certifications"]).write_text(json.dumps({"results": [
+            {"record": {"runner": r, "status": "certified", "expires_at": "2099-01-01T00:00:00Z"}}
+            for r in ("claude", "codex")]}))
+        iwb.orchestrator_drift = lambda: None
+        iwb.drive_env = lambda: {"PATH": "/usr/bin:/bin"}     # the real one runs claude --version and codex --version
+        p.load_config = lambda: {"claude-dev": {"owner": OWNER, "slug": "claude-dev-gh"},
+                                 "codex-dev": {"owner": OWNER, "slug": "codex-dev-gh"}}
+        p.bot_config = lambda bot: {"slug": {"claude": "claude-pr-gh", "codex": "codex-pr-gh"}.get(bot, bot + "-gh")}
+        self.events = []
+        p.openclaw_attention = lambda r, d: self.events.append(r) or True
+        p.gh_read = self.fake_gh
+        self.issue = {"state": "open", "title": "Add retries", "body": "Retry twice.", "labels": ["bot:pr-open"]}
+        self.pr = {"number": 9, "title": "Add retries", "state": "open", "merged": False, "draft": False,
+                   "user": "claude-dev-gh[bot]", "head": self.BRANCH, "sha": HEAD, "mergeable": True,
+                   "mergeable_state": "clean", "merge_commit_sha": None}
+        self.reviews = [review(HEAD)]
+        self.files = [{"file": "src/parser.py", "old": ""}]
+        self.checks, self.statuses = [], []
+        self.posts, self.gh_calls, self.accepted, self.pushed, self.ecc_calls = [], [], [], [], []
+        iwb.post = lambda bot, repo, n, body, label: self.posts.append((bot, label, body)) or f"https://x/c{len(self.posts)}"
+        iwb.run_gh_as = self.fake_run_gh_as
+        self.accept = (True, [{"command": "python3 -m unittest", "exit": 0, "output": "OK"}])
+        iwb.acceptance_check = lambda repo, bot, branch, sha, cmds: self.accepted.append((bot, branch, sha, cmds)) \
+            or self.accept
+        self.checkouts = []
+        iwb.checkout_pr = lambda repo, bot, branch, sha, n, issue, units: self.checkouts.append((branch, sha)) \
+            or (str(Path(self.tmp.name, "clone")), "main", sha)
+        iwb.trusted_copy = lambda d, branch, base: str(Path(self.tmp.name, "trusted"))
+        iwb.changed_files = lambda d, base, ref: ["src/parser.py"]
+        iwb.commit_as = lambda bot, repo, d, base, ref, msg: REPAIRED
+        iwb.push_branch = lambda bot, repo, d, sha, branch, default: self.pushed.append((bot, sha, branch))
+        self.units = [coding_unit()]
+        self.save_entry()
+        self.guard = GuardedSubprocess().__enter__()
+
+    def tearDown(self):
+        self.guard.__exit__()
+        for k, v in self.saved.items():
+            setattr(iwb.prbot, k, v)
+        for k, v in self.saved_iwb.items():
+            setattr(iwb, k, v)
+        self.tmp.cleanup()
+
+    def config(self, **extra):
+        iwb.CONFIG.write_text(json.dumps({"coding_repos": ["kennylhilljr/demo"], "auto_merge": True, **extra}))
+
+    def save_entry(self, **work):
+        f = Path(self.tmp.name, "plan.json")
+        f.write_text(json.dumps({"units": self.units}))
+        digest = iwb.plan_digest(self.units)
+        iwb.STATE.write_text(json.dumps({self.KEY: {
+            "agent": "claude", "plan_file": str(f), "analysis": {"decision": "plan", "at": 1},
+            "approval": {"verdict": "approve", "plan_digest": digest, "approver": "codex-pr-gh", "at": 1000.0},
+            "work": {"status": "pr-open", "plan_digest": digest, "approver": "codex-pr-gh", "branch": self.BRANCH,
+                     "default": "main", "pr": self.PR, **work}}}))
+
+    def fake_gh(self, args):
+        path = args[1]
+        lines = lambda xs: "\n".join(json.dumps(x) for x in xs)
+        if path == "repos/kennylhilljr/demo/issues/1":
+            return json.dumps(self.issue)
+        if path == "repos/kennylhilljr/demo/pulls/9":
+            return json.dumps(self.pr)
+        if path.startswith("repos/kennylhilljr/demo/pulls/9/reviews"):
+            return lines(self.reviews)
+        if path.startswith("repos/kennylhilljr/demo/pulls/9/files"):
+            return lines(self.files)
+        if "/check-runs" in path:
+            return lines(self.checks)
+        if path.endswith("/status"):
+            return lines(self.statuses)
+        raise AssertionError(f"unexpected gh read {args}")
+
+    def fake_run_gh_as(self, bot, repo, args):
+        self.gh_calls.append((bot, args))
+        return "c" * 40 if args[:3] == ["api", "-X", "PUT"] else "https://x/note"
+
+    def fake_ecc(self, args, timeout=900, **kw):
+        self.ecc_calls.append(args)
+        if args[0] == "review-plan":
+            return 0, {"ok": True, "data": {"review_id": f"rev-{len(self.ecc_calls)}", "plan_sha256": "f00d"}}, ""
+        return 0, {"ok": True, "data": {}}, ""
+
+    def run_pass(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            iwb.cmd_code(ecc=self.fake_ecc)
+        return out.getvalue()
+
+    def work(self):
+        return json.loads(iwb.STATE.read_text())[self.KEY]["work"]
+
+    def merges(self):
+        return [a for _, a in self.gh_calls if a[:3] == ["api", "-X", "PUT"]]
+
+    def labels(self):
+        return [label for _, label, _ in self.posts]
+
+    def assert_needs_kenny(self, why):
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.labels(), ["bot:needs-kenny"])
+        self.assertIn(why, self.posts[0][2])
+        self.assertEqual(self.work()["status"], "needs-kenny")
+        self.assertEqual(self.events, [f"needs-kenny: {self.KEY}"])
+
+    def test_clean_review_merges(self):
+        self.run_pass()
+        self.assertEqual(self.accepted, [("claude-dev", self.BRANCH, HEAD, ["python3 -m unittest"])])
+        merge, = self.merges()
+        self.assertEqual(merge[3], "repos/kennylhilljr/demo/pulls/9/merge")
+        self.assertIn("merge_method=squash", merge)
+        self.assertIn(f"sha={HEAD}", merge)                     # only while the head is the reviewed commit
+        self.assertEqual(self.gh_calls[0][0], "claude-dev")     # as the worker bot
+        self.assertEqual(self.labels(), ["bot:done"])
+        w = self.work()
+        self.assertEqual((w["status"], w["merge_sha"]), ("merged", "c" * 40))
+        self.run_pass()
+        self.assertEqual(len(self.merges()), 1)                 # merged once, then left alone
+
+    def test_only_p3_findings_merge_and_are_mentioned(self):
+        self.reviews = [review(HEAD, P3_FINDING)]
+        self.run_pass()
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(self.labels(), ["bot:done"])
+        self.assertIn("Minor (P3)", self.posts[0][2])
+        self.assertIn("docstring says list", self.posts[0][2])
+
+    def test_p2_finding_blocks_the_merge(self):
+        self.reviews = [review(HEAD, P2_FINDING + "\n" + P3_FINDING)]
+        self.run_pass()
+        self.assertEqual((self.merges(), self.accepted), ([], []))
+        self.assertNotIn("bot:done", self.labels())
+
+    def test_review_of_an_older_commit_waits(self):
+        self.reviews = [review("d" * 40)]
+        log = self.run_pass()
+        self.assertEqual((self.merges(), self.accepted, self.posts), ([], [], []))
+        self.assertIn("no review of the head commit", log)
+        self.assertEqual(self.work()["status"], "pr-open")
+
+    def test_only_the_cross_reviewer_counts(self):
+        self.reviews = [review(HEAD, user="claude-pr-gh[bot]"), review(HEAD, user="claude[bot]")]
+        self.run_pass()
+        self.assertEqual((self.merges(), self.posts), ([], []))
+
+    def test_protected_path_blocks(self):
+        self.files = [{"file": "src/parser.py", "old": ""}, {"file": ".github/workflows/ci.yml", "old": ""}]
+        self.run_pass()
+        self.assert_needs_kenny(".github/workflows/ci.yml")
+        self.assertEqual(self.accepted, [])
+
+    def test_renamed_from_protected_path_blocks(self):
+        self.files = [{"file": "src/env.txt", "old": "config/.env"}]
+        self.run_pass()
+        self.assert_needs_kenny("config/.env")
+
+    def test_failing_test_command_blocks(self):
+        self.accept = (False, [{"command": "python3 -m unittest", "exit": 1, "output": "FAILED (failures=1)"}])
+        self.run_pass()
+        self.assert_needs_kenny("`python3 -m unittest` fails on the head")
+        self.assertEqual(len(self.accepted), 1)
+
+    def test_repo_test_command_from_config_runs_too(self):
+        self.config(test_commands={"kennylhilljr/demo": ["make check"]})
+        self.run_pass()
+        self.assertEqual(self.accepted[0][3], ["python3 -m unittest", "make check"])
+
+    def test_no_test_command_blocks(self):
+        self.units = [coding_unit()]
+        self.units[0]["acceptance"]["commands"] = []
+        self.save_entry()
+        self.run_pass()
+        self.assert_needs_kenny("no acceptance or test command")
+        self.assertEqual(self.accepted, [])
+
+    def test_not_mergeable_blocks(self):
+        self.pr.update(mergeable=False, mergeable_state="dirty")
+        self.run_pass()
+        self.assert_needs_kenny("can't merge cleanly")
+        self.assertEqual(self.accepted, [])
+
+    def test_unknown_mergeability_waits(self):
+        self.pr.update(mergeable=None, mergeable_state="unknown")
+        self.run_pass()
+        self.assertEqual((self.merges(), self.posts), ([], []))
+        self.assertEqual(self.work()["status"], "pr-open")
+
+    def test_failing_check_blocks_and_pending_waits(self):
+        self.checks = [{"name": "build", "status": "in_progress", "conclusion": None}]
+        self.run_pass()
+        self.assertEqual((self.merges(), self.posts), ([], []))
+        self.checks = [{"name": "build", "status": "completed", "conclusion": "failure"}]
+        self.run_pass()
+        self.assert_needs_kenny("`build`")
+
+    def test_failing_commit_status_blocks(self):
+        self.statuses = [{"name": "ci/legacy", "state": "error"}]
+        self.run_pass()
+        self.assert_needs_kenny("`ci/legacy`")
+
+    def test_pr_from_another_author_or_draft_goes_to_kenny(self):
+        self.pr["user"] = "kennylhilljr"
+        self.run_pass()
+        self.assert_needs_kenny("not the worker bot's own")
+
+    def test_draft_goes_to_kenny(self):
+        self.pr["draft"] = True
+        self.run_pass()
+        self.assert_needs_kenny("draft")
+
+    def test_auto_merge_off_leaves_prs_alone(self):
+        iwb.CONFIG.write_text(json.dumps({"coding_repos": ["kennylhilljr/demo"]}))
+        iwb.prbot.gh_read = lambda args: self.fail(f"read {args} with auto_merge off")
+        self.run_pass()
+        self.assertEqual((self.gh_calls, self.posts), ([], []))
+
+    def test_bot_stop_leaves_the_pr_alone(self):
+        self.issue["labels"].append("bot:stop")
+        self.run_pass()
+        self.assertEqual((self.gh_calls, self.posts, self.accepted), ([], [], []))
+
+    def test_repair_round_runs_once_then_needs_kenny(self):
+        self.reviews = [review(HEAD, P2_FINDING)]
+        self.run_pass()
+        # one repair round on the same branch, starting at the reviewed head
+        self.assertEqual(self.checkouts, [(self.BRANCH, HEAD)])
+        ops = [a[0] if a[0] != "review-plan" else "review-plan " + a[a.index("--") + 1] for a in self.ecc_calls]
+        self.assertEqual(ops, ["review-plan create-run", "create-run", "review-plan drive", "drive"])
+        create = self.ecc_calls[1]
+        self.assertEqual(create[create.index("--target-branch") + 1], self.BRANCH)
+        repair, = json.loads(Path(create[create.index("--plan") + 1]).read_text())["units"]
+        self.assertEqual(repair["id"], "repair-1")
+        self.assertIn("an empty line crashes", repair["description"])
+        self.assertEqual(repair["acceptance"]["commands"], ["python3 -m unittest"])
+        self.assertEqual(repair["routing"]["initial_tier"], self.units[0]["routing"]["initial_tier"])
+        self.assertEqual(self.pushed, [("claude-dev", REPAIRED, self.BRANCH)])
+        self.assertEqual(self.merges(), [])
+        w = self.work()
+        self.assertEqual((w["status"], w["repair"]["status"], w["repair"]["sha"]), ("pr-open", "pushed", REPAIRED))
+        self.assertTrue(any("Repair round started" in a[-1] for _, a in self.gh_calls))
+        # the new head isn't reviewed yet: wait, and never repair again
+        self.pr["sha"] = REPAIRED
+        self.run_pass()
+        self.assertEqual((len(self.ecc_calls), self.posts), (4, []))
+        # the review of the new head still has a P2: Kenny's
+        self.reviews.append(review(REPAIRED, P2_FINDING, n=2))
+        self.run_pass()
+        self.assertEqual(len(self.ecc_calls), 4)
+        self.assert_needs_kenny("after the one repair round")
+        self.run_pass()
+        self.assertEqual((len(self.ecc_calls), len(self.posts)), (4, 1))
+
+    def test_clean_review_after_repair_merges(self):
+        self.reviews = [review(HEAD, P2_FINDING)]
+        self.run_pass()
+        self.pr["sha"] = REPAIRED
+        self.reviews.append(review(REPAIRED, n=2))
+        self.run_pass()
+        self.assertEqual(len(self.ecc_calls), 4)
+        self.assertIn(f"sha={REPAIRED}", self.merges()[0])
+        self.assertEqual(self.accepted[0][2], REPAIRED)
+        self.assertEqual(self.work()["status"], "merged")
+
+    def test_failed_repair_round_goes_to_kenny(self):
+        self.reviews = [review(HEAD, P2_FINDING)]
+        iwb.changed_files = lambda d, base, ref: [".github/workflows/ci.yml"]
+        self.run_pass()
+        self.assertEqual(self.pushed, [])
+        self.assert_needs_kenny("the repair round failed")
+        self.assertEqual(self.work()["repair"]["status"], "failed")
+
+    def test_repair_round_waits_for_the_coding_limit(self):
+        self.reviews = [review(HEAD, P2_FINDING)]
+        with redirect_stdout(io.StringIO()):
+            iwb.cmd_code(ecc=self.fake_ecc, limit=0)
+        self.assertEqual((self.ecc_calls, self.posts), ([], []))
+        self.assertNotIn("repair", self.work())
+
+    def test_unseparable_blocking_review_goes_to_kenny(self):
+        self.reviews = [review(HEAD, "| Priority | Where |\n| --- | --- |\n| P1 | src/parser.py |")]
+        self.run_pass()
+        self.assertEqual(self.ecc_calls, [])
+        self.assert_needs_kenny("could not separate the findings")
+
+    def test_pr_merged_by_kenny_is_done(self):
+        self.pr.update(state="closed", merged=True, merge_commit_sha="e" * 40)
+        self.run_pass()
+        self.assertEqual((self.merges(), self.labels()), ([], ["bot:done"]))
+        self.assertEqual(self.work()["status"], "merged")
+
+    def test_needs_kenny_stops_coding_and_analysis(self):
+        self.pr.update(mergeable=False, mergeable_state="dirty")
+        self.run_pass()
+        entry = json.loads(iwb.STATE.read_text())[self.KEY]
+        self.assertFalse(iwb.needs_coding(entry))
+        self.assertIsNone(iwb.needs_analysis(entry, [], {OWNER}, "x"))
+
+
+class ReviewFindings(unittest.TestCase):
+    def test_list_items_headings_and_fences(self):
+        body = review(HEAD, "Overall fine.\n\n" + P2_FINDING + "\n  more detail\n" + P3_FINDING + "\n\n---\n\n"
+                      "### P1 — `a.py` line 3 — drops errors\n\n```sh\n- P2 not a finding inside a fence\n```\n"
+                      "Fix it.\n\n### Observation\nnot a finding")["body"]
+        found = iwb.review_findings(body)
+        self.assertEqual([p for p, _ in found], ["P2", "P3", "P1"])
+        self.assertIn("more detail", found[0][1])
+        self.assertIn("Fix it.", found[2][1])
+        self.assertNotIn("Observation", found[2][1])
+        self.assertNotIn("Reviewed commit", found[2][1])
+
+    def test_no_findings(self):
+        self.assertEqual(iwb.review_findings(review(HEAD)["body"]), [])
+
+
+class AcceptanceRun(unittest.TestCase):
+    def test_failing_command_on_the_head_fails(self):
+        need_sandbox_exec(self)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp, "repo")
+            repo.mkdir()
+            run = lambda *a: iwb.subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)
+            run("init", "-q")
+            (repo / "ok.py").write_text("print('ok')\n")
+            run("add", ".")
+            run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x")
+            runs = iwb.run_acceptance(["python3 ok.py", "python3 -c 'import sys; sys.exit(3)'"], str(repo))
+        self.assertEqual([r["exit"] for r in runs], [0, 3])
