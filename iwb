@@ -1419,6 +1419,53 @@ class Stopped(Exception):
     """Kenny stopped a running drive (bot:stop or paused). Not a failure: the issue stays resumable."""
 
 
+# A runner CLI out of credits fails every attempt in seconds; the orchestrator sees only runner_exit_1, spends the
+# unit's attempts and stops with needs_owner. Nothing about the plan is wrong, so iwb waits instead of blocking.
+QUOTA_RX = re.compile(r"(?i)(?:you(?:'|’)ve hit your usage limit|usage limit reached|insufficient_quota|"
+                      r"exceeded your current quota|credit balance is too low)[^\"\n]{0,200}")
+RESET_RX = re.compile(r"try again at ([A-Z][a-z]{2}) (\d{1,2})(?:st|nd|rd|th)?, (\d{4}),? (\d{1,2}:\d{2} ?[AP]M)")
+QUOTA_MAX_WAIT = 7 * 86400   # never trust a parsed reset time further out than this
+
+
+def quota_reset(text, now=None):
+    """When the runner says its limit resets (its message gives local time), kept between RETRY_AFTER and
+    QUOTA_MAX_WAIT from now; RETRY_AFTER from now when it names no time."""
+    now = time.time() if now is None else now
+    m = RESET_RX.search(text)
+    at = now + RETRY_AFTER
+    if m:
+        try:
+            at = time.mktime(time.strptime(f"{m[1]} {m[2]} {m[3]} {m[4].replace(' ', '')}", "%b %d %Y %I:%M%p"))
+        except (ValueError, OverflowError):
+            pass
+    return min(max(at, now + RETRY_AFTER), now + QUOTA_MAX_WAIT)
+
+
+def runner_quota(run_id):
+    """(runner, message, resets at) when an attempt of the run failed on a runner's usage limit, else None. The
+    orchestrator writes each attempt's output to <state dir>/logs/<run id>/<unit>-attemptN.log and the runner's
+    argv next to it in .status.json."""
+    d = WORK_DIR / "ecc-state" / "logs" / run_id
+    try:
+        logs = sorted(d.glob("*-attempt*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    for f in logs:
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        m = QUOTA_RX.search(text)
+        if not m:
+            continue
+        try:
+            runner = Path(json.loads(f.with_suffix(".status.json").read_text())["argv"][0]).name
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            runner = None
+        return runner, short(m[0]), quota_reset(m[0])
+    return None
+
+
 def ecc_path():
     """The orchestrator CLI: config.json "ecc_path" (for example a worktree kept at origin/main), else ECC."""
     p = read_config().get("ecc_path")
@@ -1928,6 +1975,21 @@ def code_plan(key, entry, issue, state, since, ecc):
         log(f"{key}: coding stopped: {e}")
         return
     except (WorkError, RuntimeError, subprocess.SubprocessError, SystemExit, OSError, KeyError) as e:
+        quota = runner_quota(run_id) if isinstance(e, WorkError) else None
+        if quota:
+            runner, msg, until = quota
+            runner = runner or agent
+            state["_runner_quota"] = {**(state.get("_runner_quota") or {}), runner: until}
+            w.update(status="quota", at=time.time(), problem=f"{runner} usage limit")
+            when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(until))
+            try:
+                post(worker, repo, number, f"{W_MARKER}\nCoding paused: the `{runner}` runner hit its usage limit "
+                     f"(run `{run_id}`): {msg}\n\nNothing was pushed and the approved plan stands. Coding starts "
+                     f"again from it after {when}.", "bot:approved")
+            except RuntimeError as err:
+                log(f"{key}: could not post the usage-limit note: {err}")
+            mark(key, "waiting", f"coding paused: {runner} usage limit until {when}")
+            return
         block(entry, worker, repo, number, issue["title"], f"{W_MARKER}\nCoding stopped: {short(e)}",
               f"coding: {short(e, 300)}")
         return
@@ -2078,6 +2140,11 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
             if not step:
                 continue
             if step == "code":
+                until = (state.get("_runner_quota") or {}).get(entry.get("agent"), 0)
+                if until > time.time():         # the runner that would author this plan is out of credits
+                    mark(key, "waiting", f"coding waits for the {entry.get('agent')} usage limit to reset at "
+                         f"{time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(until))}")
+                    continue
                 busy = sum(1 for e in state.values() if isinstance(e, dict) and not e.get("blocked")
                            and (e.get("work") or {}).get("status") == "in-progress")
                 if runs >= limit:

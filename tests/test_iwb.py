@@ -1117,6 +1117,54 @@ class Code(unittest.TestCase):
         self.assertIn("`.env` is a protected path", self.posts[-1][2])
         self.assertEqual((self.pushed, self.commits), ([], []))
 
+    def test_runner_usage_limit_waits_for_the_reset_instead_of_blocking(self):
+        # regression: on 2026-11-11 the codex login ran out of credits; every attempt failed in seconds with
+        # "You've hit your usage limit", drive stopped with needs_owner and five codex issues were blocked in 15 min
+        self.approve_plan([coding_unit()], agent="codex")
+        self.ecc_results["drive"] = (3, {"ok": False, "data": {"stop": "needs_owner"}, "checks": []})
+        def out_of_credits():
+            run_id = self.ecc_calls[-1][self.ecc_calls[-1].index("--run-id") + 1]
+            d = iwb.WORK_DIR / "ecc-state" / "logs" / run_id
+            d.mkdir(parents=True)
+            (d / "u1-attempt1.status.json").write_text(json.dumps({"argv": ["codex", "exec"], "exit_code": 1}))
+            (d / "u1-attempt1.log").write_text(
+                '[stdout] {"type":"turn.failed","error":{"message":"You’ve hit your usage limit. Visit '
+                'https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Nov 12th, 2099 '
+                '11:21 PM."}}\n')
+        self.during_drive = out_of_credits
+        log = self.run_pass()
+        self.assertEqual(self.labels(), ["bot:in-progress", "bot:approved"])
+        self.assertIn("usage limit", self.posts[-1][2])
+        self.assertEqual((self.events, self.pushed), ([], []))
+        e = json.loads(iwb.STATE.read_text())
+        self.assertFalse(e[self.KEY].get("blocked"))
+        self.assertEqual(e[self.KEY]["work"]["status"], "quota")
+        until = e["_runner_quota"]["codex"]
+        self.assertLessEqual(until, time.time() + iwb.QUOTA_MAX_WAIT + 5)   # 2099 is clamped
+        self.assertGreater(until, time.time() + iwb.RETRY_AFTER - 5)
+        self.assertIn("coding paused: codex usage limit", log)
+        calls = len(self.ecc_calls)
+        self.approve_plan([coding_unit()], key="kennylhilljr/demo#2")     # a claude issue is not held back
+        self.during_drive = None
+        self.ecc_results.pop("drive")
+        log = self.run_pass()
+        self.assertIn("demo#1: coding waits for the codex usage limit", log)
+        self.assertEqual(self.state("kennylhilljr/demo#2")["work"]["status"], "pr-open")
+        self.assertEqual(len(self.ecc_calls), calls + 4)
+        e = json.loads(iwb.STATE.read_text())
+        e["_runner_quota"]["codex"] = time.time() - 1                   # the limit has reset
+        iwb.STATE.write_text(json.dumps(e))
+        self.run_pass()
+        self.assertEqual(self.state()["work"]["status"], "pr-open")
+
+    def test_quota_reset_time(self):
+        now = time.mktime(time.strptime("2026-11-11 10:46", "%Y-%m-%d %H:%M"))
+        at = iwb.quota_reset("try again at Nov 12th, 2026 11:21 PM.", now)
+        self.assertEqual(time.strftime("%Y-%m-%d %H:%M", time.localtime(at)), "2026-11-12 23:21")
+        self.assertEqual(iwb.quota_reset("no time given", now), now + iwb.RETRY_AFTER)
+        self.assertEqual(iwb.quota_reset("try again at Nov 11th, 2026 10:50 AM", now), now + iwb.RETRY_AFTER)
+        self.assertIsNone(iwb.runner_quota("no-such-run"))
+
     def test_missing_certifications_waits_without_posting(self):
         # regression: without certifications the orchestrator assigns no runner, so drive would fail after the
         # issue was already labeled bot:in-progress; iwb now checks before posting anything
