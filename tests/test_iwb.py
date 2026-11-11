@@ -1423,8 +1423,18 @@ class DriveProcess(unittest.TestCase):
         try:
             iwb.os.kill(int(self.pidfile.read_text()), 0)
             return True
+        except (FileNotFoundError, ValueError):
+            return False            # killed before it wrote the pid: the child it started is in the killed group
         except ProcessLookupError:
             return False
+
+    def test_child_alive_is_false_when_the_pid_was_never_written(self):
+        # a loaded machine can kill the stand-in before `echo $!` runs; that failed the suite in a coding run (#41)
+        start = time.time()
+        self.assertFalse(self.child_alive())
+        self.pidfile.write_text("")
+        self.assertFalse(self.child_alive())
+        self.assertLess(time.time() - start, 30)
 
     def test_bot_stop_kills_the_whole_process_group(self):
         asked = []
