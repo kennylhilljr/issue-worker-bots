@@ -2084,11 +2084,29 @@ def code_plan(key, entry, issue, state, since, ecc):
     finish_pr(key, entry, issue, state, since)
 
 
+def repo_checks_config(d, ecc_cfg):
+    """`ecc_cfg`, or a copy beside the clone `d` with the repository's own `.orchestration/ecc.json` repo_checks
+    when config.json sets none. The orchestrator takes the policy (and its required_checks) from the repository's
+    `.orchestration/config.yaml` but gate commands only from --config, so a required check came with no command,
+    its gate was "missing" on every attempt and the unit could never pass (research-mcp#1)."""
+    cfg = json.loads(Path(ecc_cfg).read_text())
+    try:
+        own = json.loads((Path(d) / ".orchestration" / "ecc.json").read_text()).get("repo_checks")
+    except (OSError, ValueError, AttributeError):
+        own = None
+    if cfg.get("repo_checks") or not isinstance(own, dict):
+        return ecc_cfg
+    path = Path(d).parent / f"{Path(d).name}.ecc.json"
+    path.write_text(json.dumps({**cfg, "repo_checks": own}, indent=1) + "\n")
+    return path
+
+
 def drive_units(ecc, d, repo, number, agent, units, branch, run_id, approver, conf, cost, ecc_cfg):
     """The orchestrator run in iwb's clone `d`: review-plan --approve with `approver` as operator, create-run, then
     the same pair for drive, with `branch` as the target. Returns the plan's sha256 as the orchestrator saw it."""
     plan = str(Path(d).parent / f"{Path(d).name}.plan.json")
     Path(plan).write_text(json.dumps({"units": units}, indent=1) + "\n")
+    ecc_cfg = repo_checks_config(d, ecc_cfg)
     cfg = ["--config", str(ecc_cfg), "--repo", d, "--target-branch", branch,
            "--state-dir", str(WORK_DIR / "ecc-state"), "--worktree-root", str(WORK_DIR / "worktrees")] \
         + policy_args(d, repo, agent, conf, cost)
