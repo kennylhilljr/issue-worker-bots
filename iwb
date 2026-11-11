@@ -2465,8 +2465,30 @@ def needs_coding(entry):
     return not (w.get("plan_digest") == ap["plan_digest"] and w.get("status") in PR_STATUSES + ("blocked",))
 
 
-def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
-    """Step 4b: code plans that step 4a approved, in repositories listed in config.json "coding_repos"."""
+def prs_to_review(state, conf):
+    """The issues step 5 looks at: an open PR for the plan step 4a approved as it is now, with auto_merge on and
+    the repository in coding_repos. The one rule for cmd_code and for the end of a code-queue drain."""
+    if conf.get("auto_merge") is not True:
+        return []
+    coding, keys = set(conf.get("coding_repos", [])), []
+    for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
+        if not isinstance(entry, dict) or entry.get("blocked") or entry.get("closed") or entry.get("stale_plan") \
+                or (entry.get("analysis") or {}).get("decision") != "plan":
+            continue
+        try:
+            ap, _ = approved_plan(entry)
+        except PLAN_ERRORS:
+            continue                        # cmd_code reports it
+        w = entry.get("work") or {}
+        if ap and w.get("plan_digest") == ap["plan_digest"] and w.get("status") == "pr-open" and w.get("pr") \
+                and key.rsplit("#", 1)[0] in coding:
+            keys.append(key)
+    return keys
+
+
+def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None, review=True):
+    """Step 4b: code plans that step 4a approved, in repositories listed in config.json "coding_repos". Then
+    step 5 for open PRs, unless `review` is False (a code-queue drain runs step 5 once, at its end)."""
     ecc = ecc or run_ecc
     conf = read_config()
     if conf.get("paused"):
@@ -2486,7 +2508,7 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
         return 0
     state, since = load_state()
     coding = set(conf.get("coding_repos", []))
-    runs, prs = 0, []
+    runs = 0
     try:
         for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
             if only is not None and key not in only:
@@ -2506,10 +2528,6 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
             w = entry.get("work") or {}
             current = w.get("plan_digest") == ap["plan_digest"]
             repo, number = key.rsplit("#", 1)
-            if current and w.get("status") == "pr-open" and w.get("pr") and conf.get("auto_merge") is True \
-                    and repo in coding:
-                prs.append(key)             # step 5, after the coding below: review, one repair round, merge
-                continue
             if current and w.get("status") in PR_STATUSES + ("blocked",):
                 continue                    # waiting for step 5 or for Kenny
             if repo not in coding:
@@ -2581,7 +2599,9 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
             except (RuntimeError, subprocess.SubprocessError, SystemExit, OSError) as e:
                 entry["work_failed_at"] = time.time()
                 mark(key, "failed", f"{step} could not run; retrying in {RETRY_AFTER // 60} minutes: {e}")
-        runs = review_prs(prs, state, since, ecc, dry_run, runs, limit, conf)
+        if review:                          # step 5, after the coding above: review, one repair round, merge
+            prs = [k for k in prs_to_review(state, conf) if only is None or k in only]
+            runs = review_prs(prs, state, since, ecc, dry_run, runs, limit, conf)
     finally:
         if not dry_run:
             save_state(state, since)
@@ -3102,9 +3122,17 @@ def cmd_code_drain(queue_dir):
         return 0
     for key in groups:
         try:                              # cmd_code reads the issue again under work.lock before coding it
-            cmd_code(limit=CODE_LIMIT - SPENT["code"], only={key})
+            cmd_code(limit=CODE_LIMIT - SPENT["code"], only={key}, review=False)
         except (Exception, SystemExit) as e:
             mark(key, "failed", f"coding hand-off failed: {e!r}")
+    # Step 5 once for every open PR, not only the handed-off issues: while queued coding runs, tick's full cmd_code
+    # finds work.lock held and skips, so without this pass no PR would ever be reviewed or merged.
+    try:
+        prs = set(prs_to_review(read_state_file(), read_config()))
+        if prs:                           # cmd_code selects them again under work.lock
+            cmd_code(limit=CODE_LIMIT - SPENT["code"], only=prs)
+    except (Exception, SystemExit) as e:
+        log(f"code queue: step 5 failed: {e!r}")
     return settle(groups, deferred, rejected, "code queue")
 
 
