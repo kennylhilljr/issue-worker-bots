@@ -2325,6 +2325,46 @@ def merge_pr(bot, repo, number, sha, title):
                      permissions=MERGE_PERMISSIONS)
 
 
+def landed(key, entry):
+    """Whether someone finished the issue while iwb worked on its PR: ("merged", merge commit) when the PR is
+    merged, ("closed", "") when the issue is closed, else None. A read that fails counts as None."""
+    repo, number = key.rsplit("#", 1)
+    n = int(entry["work"]["pr"].rstrip("/").rsplit("/", 1)[1])
+    try:
+        pr = gh_json(["api", f"repos/{repo}/pulls/{n}", "--jq", "{merged, merge_commit_sha}"])[0]
+        if pr.get("merged"):
+            return "merged", pr.get("merge_commit_sha") or ""
+        issue = gh_json(["api", f"repos/{repo}/issues/{number}", "--jq", "{state}"])[0]
+    except (SystemExit, KeyError, IndexError, ValueError):
+        return None
+    return ("closed", "") if issue.get("state") == "closed" else None
+
+
+def mark_landed(key, entry, how, sha):
+    """Done without iwb: a merged PR gets status merged and bot:done; a closed issue is left closed, as intake
+    leaves it. Neither gets a repair round or bot:needs-kenny."""
+    repo, number = key.rsplit("#", 1)
+    w = entry["work"]
+    w.pop("problem", None)
+    if how == "closed":
+        entry["closed"] = True
+        log(f"{key}: the issue was closed; leaving {w['pr']} alone")
+        return
+    w.update(status="merged", merge_sha=sha, merged_at=time.time())
+    w["comment"] = post(WORKERS[entry["agent"]], repo, number, f"{W_MARKER}\n{w['pr']} was merged.", "bot:done")
+    log(f"{key}: PR merged by someone else {w['pr']}")
+
+
+def kenny_unless_landed(key, entry, why):
+    """needs_kenny, unless the PR was merged or the issue closed meanwhile (a repair or acceptance run takes
+    minutes, and Kenny may merge by hand while it runs)."""
+    done = landed(key, entry)
+    if done:
+        mark_landed(key, entry, *done)
+    else:
+        needs_kenny(key, entry, why)
+
+
 def needs_kenny(key, entry, why):
     """Leave the PR for Kenny: bot:needs-kenny on the issue with one paragraph saying why, and tell OpenClaw."""
     repo, number = key.rsplit("#", 1)
@@ -2417,7 +2457,7 @@ def repair_round(key, entry, issue, state, since, ecc, review, findings, sha):
         return
     except (WorkError, RuntimeError, subprocess.SubprocessError, SystemExit, OSError, KeyError) as e:
         w["repair"].update(status="failed", problem=short(e, 300))
-        needs_kenny(key, entry, f"the repair round failed ({short(e)})")
+        kenny_unless_landed(key, entry, f"the repair round failed ({short(e)})")
         return
     w["repair"].update(status="pushed", sha=new, done_at=time.time())
     try:
@@ -2439,8 +2479,12 @@ def merge_now(key, entry, facts, review, minor, commands):
         return
     if not ok:
         bad = next(r for r in runs if r["exit"] != 0)
-        needs_kenny(key, entry, f"`{short(bad['command'], 120)}` fails on the head `{pr['sha'][:10]}` (exit "
+        kenny_unless_landed(key, entry, f"`{short(bad['command'], 120)}` fails on the head `{pr['sha'][:10]}` (exit "
                                 f"{bad['exit']}: {short(bad['output'], 200)})")
+        return
+    done = landed(key, entry)
+    if done:
+        mark_landed(key, entry, *done)
         return
     merged = merge_pr(worker, repo, pr["number"], pr["sha"], pr["title"])
     w.update(status="merged", merge_sha=merged, merged_at=time.time())
@@ -2476,6 +2520,8 @@ def review_prs(keys, state, since, ecc, dry_run, runs, limit, conf):
             mark(key, "deferred", f"could not read the PR {w['pr']}; will retry: {e!r}")
             continue
         action, detail = pr_gate(entry, facts, repo, worker_login, reviewer_login)
+        if issue["state"] != "open" and action != "merged":     # done by hand: no repair, merge or hand-off
+            action, detail = "issue-closed", ""
         if dry_run:
             log(f"{key}: PR {w['pr']}: would {action}")
             continue
@@ -2483,9 +2529,9 @@ def review_prs(keys, state, since, ecc, dry_run, runs, limit, conf):
             if action == "wait":
                 log(f"{key}: PR waits: {detail}")
             elif action == "merged":
-                w.update(status="merged", merge_sha=detail, merged_at=time.time())
-                w["comment"] = post(worker, repo, number, f"{W_MARKER}\n{w['pr']} was merged.", "bot:done")
-                log(f"{key}: PR merged by someone else {w['pr']}")
+                mark_landed(key, entry, "merged", detail)
+            elif action == "issue-closed":
+                mark_landed(key, entry, "closed", "")
             elif action == "closed":
                 w.update(status="pr-closed", at=time.time())
                 log(f"{key}: PR closed without merging {w['pr']}")
