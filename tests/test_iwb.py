@@ -1669,6 +1669,26 @@ class GateWrappers(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(iwb.gate_refusal(cmd))
 
+    def test_program_missing_from_the_coding_path_goes_back_to_the_planner(self):
+        # regression (openclaw-ecc-orchestrator#28, run iwb.kennylhilljr.openclaw-ecc-orchestrator.28.20261108095208):
+        # the plan ran python3.11, which the launchd PATH lacks; every gate failed with spawn_failed and three units
+        # used up their attempts
+        with tempfile.TemporaryDirectory() as bin_dir:
+            Path(bin_dir, "python3").write_text("")
+            Path(bin_dir, "python3").chmod(0o755)
+            saved = os.environ["PATH"]
+            os.environ["PATH"] = bin_dir
+            try:
+                problems = iwb.fixable_problems([unit("add-plan-lint-skill", acceptance={"commands": [
+                    "python3.11 -m unittest tests.test_plan_lint_script", "python3 -m unittest tests.t",
+                    "scripts/check.sh", "env python3.11 t.py"]})])
+            finally:
+                os.environ["PATH"] = saved
+        self.assertEqual(len(problems), 2)                     # env is reported as a wrapper, not twice
+        self.assertIn("add-plan-lint-skill: acceptance command runs python3.11, which is not on the coding PATH",
+                      problems[1])
+        self.assertIn("runs env", problems[0])
+
     def test_shell_syntax_is_reported_once(self):
         problems = iwb.fixable_problems([unit(acceptance={"commands": ["env X=1 python3 t.py && echo ok"]})])
         self.assertEqual(len(problems), 1)
