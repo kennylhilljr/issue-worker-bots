@@ -28,7 +28,11 @@
   iwb code [--dry-run]
       Step 4b: for one plan that step 4a approved, in a repository listed in config.json "coding_repos": an
       orchestrator run in iwb's own clone, one commit by the worker bot on bot/<n>-<slug>-<attempt>, and a draft PR marked
-      ready (bot:in-progress, then bot:pr-open). Never merges. In tick only when "coding_live" is true.
+      ready (bot:in-progress, then bot:pr-open). In tick only when "coding_live" is true.
+      Step 5, when config.json "auto_merge" is true: for each open worker PR, one repair round on P0-P2 findings in
+      the other agent's cross-review, then a squash merge as the worker bot (bot:done) only when the review of the
+      head is clean (P3 allowed), its acceptance commands pass on a fresh clone of the head, no protected path
+      changed, no check fails and GitHub can merge it cleanly; anything else gets bot:needs-kenny.
   iwb analyze [--dry-run] [--limit N]
       Step 3: for each picked-up issue (or one where the owner answered the bot's questions), run the
       worker's strongest model read-only on a fresh clone and post either questions (bot:needs-info) or
@@ -395,7 +399,9 @@ LABELS = {"bot:needs-info": ("FBCA04", "The worker bot has questions before it c
           "bot:no-code": ("D4C5F9", "The worker bot found no code change to make"),
           "bot:approved": ("1D76DB", "The other agent approved the plan"),
           "bot:in-progress": ("5319E7", "The worker bot is coding the approved plan"),
-          "bot:pr-open": ("0052CC", "The worker bot opened a pull request")}
+          "bot:pr-open": ("0052CC", "The worker bot opened a pull request"),
+          "bot:needs-kenny": ("D93F0B", "The worker bot's pull request waits for Kenny"),
+          "bot:done": ("0E8A16", "The worker bot's pull request was merged")}
 
 ANALYSIS_PROMPT = """You are the analysis step of an automated worker for the GitHub repository {repo}.
 The repository is checked out read-only in the current directory at {branch} ({sha}).
@@ -642,7 +648,7 @@ def needs_analysis(entry, comments, trusted, digest, edited_at=None):
     (no "digest") is compared by `edited_at`, the body's last edit, and then gets the current digest."""
     if "agent" not in entry or entry.get("closed") or entry.get("blocked"):
         return None
-    if (entry.get("work") or {}).get("status") in ("in-progress", "pushed", "pr-open"):
+    if (entry.get("work") or {}).get("status") in ("in-progress", "pushed") + PR_STATUSES:
         return None                       # coding started; the PR is where feedback goes now (step 5)
     a = entry.get("analysis")
     if a is None:
@@ -1290,7 +1296,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo_filter=None)
                         f"{'documentation' if all(is_docs_unit(u) for u in units) else 'a small mechanical change'}, "
                         f"low risk and tier 0 or 1, and the plan passes the policy gate and `lint-plan`, so `{slug}` "
                         f"approved it without a model review. The pull request still gets a full cross-review "
-                        f"before Kenny merges it.")
+                        f"before it can merge.")
                 if dry_run:
                     log(f"{key}: would approve by rule (no model)")
                     continue
@@ -1354,6 +1360,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo_filter=None)
 # ---------- step 4b: coding the approved plan and opening the PR ----------
 
 CODE_LIMIT = 1             # coding runs per pass
+PR_STATUSES = ("pr-open", "needs-kenny", "merged", "pr-closed")   # work statuses once the PR exists (step 5)
 IN_PROGRESS_LIMIT = 2      # issues being coded at once (DESIGN.md "Budgets and limits")
 DRIVE_TIMEOUT = 6 * 3600
 RUNNER_TIMEOUT = 3600      # hard ceiling per coding attempt; the orchestrator's budget.minutes is advisory only
@@ -1699,7 +1706,7 @@ def checkout(repo, bot, branch, number=None, issue=None, units=()):
     team = d / ".orchestration" / "team.json"
     if not team.exists():
         # the plan approver stands in for Kenny: the orchestrator's agents approve merges into the bot branch of
-        # this clone. Kenny still merges the PR. Kept out of git so it never reaches the PR. The plan was already
+        # this clone. The PR still goes through step 5's merge gate. Kept out of git so it never reaches the PR. The plan was already
         # red-checked and approved by the other worker family, so the architect's milestone-start plan check is
         # skipped: it repeated that review, and when no architect answered it stopped the drive (no_architect).
         team.parent.mkdir(exist_ok=True)
@@ -1937,7 +1944,6 @@ def code_plan(key, entry, issue, state, since, ecc):
         return
     run_id = f"iwb.{owner}.{name}.{number}.{time.strftime('%Y%m%d%H%M%S', time.gmtime())}"
     branch = f"bot/{number}-{slugify(issue['title'])}-{hashlib.sha256(run_id.encode()).hexdigest()[:6]}"
-    session = f"iwb.{repo.replace('/', '.')}.{number}"
     wslug = prbot.bot_config(worker)["slug"]
     url = post(worker, repo, number, f"{W_MARKER}\nPlan approved by `{w['approver']}`. Coding started on "
                f"`{branch}` (orchestrator run `{run_id}`).", "bot:in-progress")
@@ -1946,22 +1952,8 @@ def code_plan(key, entry, issue, state, since, ecc):
     log(f"{key}: coding started, run {run_id}")
     try:
         d, default, base = checkout(repo, worker, branch, number, issue, units)
-        plan = str(Path(d).parent / f"{Path(d).name}.plan.json")
-        Path(plan).write_text(json.dumps({"units": units}, indent=1) + "\n")
-        cfg = ["--config", str(ecc_cfg), "--repo", d, "--target-branch", branch,
-               "--state-dir", str(WORK_DIR / "ecc-state"), "--worktree-root", str(WORK_DIR / "worktrees")] \
-            + policy_args(d, repo, agent, conf, cost)
-        opts = {"env": drive_env()}    # no sandbox-exec: codex can't write under one (DESIGN.md "Safety")
-        approve = ["review-plan", "--json", "--approve", "--operator", w["approver"], "--session", session, "--"]
-        create = ["create-run", "--run-id", run_id, "--plan", plan] + cfg
-        review = ecc_data(ecc, approve + create, "review-plan create-run", **opts)
-        w["plan_sha256"] = review.get("plan_sha256")
-        ecc_data(ecc, create + ["--yes", "--review-id", review["review_id"], "--json"], "create-run", **opts)
-        hours = max(1, -(-sum(u["budget"]["minutes"] for u in units) // 60))
-        drive = ["drive", "--run-id", run_id, "--max-hours", str(hours), "--max-cost-usd", str(cost)] + cfg
-        review = ecc_data(ecc, approve + drive, "review-plan drive", **opts)
-        ecc_data(ecc, drive + ["--yes", "--review-id", review["review_id"], "--json"], "drive", DRIVE_TIMEOUT,
-                 watch=lambda: stop_reason(repo, number), **opts)
+        w["plan_sha256"] = drive_units(ecc, d, repo, number, agent, units, branch, run_id, w["approver"], conf, cost,
+                                       ecc_cfg)
         sha = publish(worker, repo, d, base, branch, default, units, f"{issue['title']} (#{number})\n\nCloses "
                       f"#{number}. Planned by {wslug}, approved by {w['approver']}, orchestrator run {run_id}.")
     except Stopped as e:
@@ -1996,12 +1988,37 @@ def code_plan(key, entry, issue, state, since, ecc):
     rows = "\n".join(f"| `{u['id']}` | {u['title']} | {u['routing']['initial_tier']} |" for u in units)
     body = (f"Closes #{number}\n\nPlanned by `{wslug}` ({entry['analysis'].get('comment', '')}), approved by "
             f"`{w['approver']}` ({w.get('approval_comment', '')}), coded by orchestrator run `{run_id}`.\n\n"
-            f"| Unit | What | Tier |\n| --- | --- | --- |\n{rows}\n\nKenny merges; the bots never do.")
+            f"| Unit | What | Tier |\n| --- | --- | --- |\n{rows}\n\niwb squash-merges this PR only when the cross-review "
+            f"of its head has no P0-P2 findings, the acceptance commands pass on the head, no protected path is "
+            f"changed and no check fails; otherwise Kenny decides.")
     entry.setdefault("branches", []).append({"branch": branch, "sha": sha, "run_id": run_id,
                                              "plan_digest": w["plan_digest"], "at": time.time()})
     w.update(status="pushed", default=default, pr_body=body)
     save_state(state, since)        # pushed: a retry opens the PR from this branch and never pushes again
     finish_pr(key, entry, issue, state, since)
+
+
+def drive_units(ecc, d, repo, number, agent, units, branch, run_id, approver, conf, cost, ecc_cfg):
+    """The orchestrator run in iwb's clone `d`: review-plan --approve with `approver` as operator, create-run, then
+    the same pair for drive, with `branch` as the target. Returns the plan's sha256 as the orchestrator saw it."""
+    plan = str(Path(d).parent / f"{Path(d).name}.plan.json")
+    Path(plan).write_text(json.dumps({"units": units}, indent=1) + "\n")
+    cfg = ["--config", str(ecc_cfg), "--repo", d, "--target-branch", branch,
+           "--state-dir", str(WORK_DIR / "ecc-state"), "--worktree-root", str(WORK_DIR / "worktrees")] \
+        + policy_args(d, repo, agent, conf, cost)
+    opts = {"env": drive_env()}    # no sandbox-exec: codex can't write under one (DESIGN.md "Safety")
+    session = f"iwb.{repo.replace('/', '.')}.{number}"
+    approve = ["review-plan", "--json", "--approve", "--operator", approver, "--session", session, "--"]
+    create = ["create-run", "--run-id", run_id, "--plan", plan] + cfg
+    review = ecc_data(ecc, approve + create, "review-plan create-run", **opts)
+    plan_sha = review.get("plan_sha256")
+    ecc_data(ecc, create + ["--yes", "--review-id", review["review_id"], "--json"], "create-run", **opts)
+    hours = max(1, -(-sum(u["budget"]["minutes"] for u in units) // 60))
+    drive = ["drive", "--run-id", run_id, "--max-hours", str(hours), "--max-cost-usd", str(cost)] + cfg
+    review = ecc_data(ecc, approve + drive, "review-plan drive", **opts)
+    ecc_data(ecc, drive + ["--yes", "--review-id", review["review_id"], "--json"], "drive", DRIVE_TIMEOUT,
+             watch=lambda: stop_reason(repo, number), **opts)
+    return plan_sha
 
 
 def finish_pr(key, entry, issue, state, since):
@@ -2039,6 +2056,362 @@ def finish_pr(key, entry, issue, state, since):
         mark(key, "failed", f"could not label the issue bot:pr-open; retrying in {RETRY_AFTER // 60} minutes: {e}")
         return
     w.update(status="pr-open", done_at=time.time())
+
+
+# ---------- step 5: the cross-review, one repair round, and the gated merge ----------
+# config.json "auto_merge": true turns it on (off by default). In each coding pass, for every issue whose PR is open,
+# iwb reads the PR and decides (pr_gate): merge it as the worker bot, run one repair round on P0-P2 findings, wait
+# (no review of the head yet, checks pending, mergeability unknown), or hand it to Kenny (bot:needs-kenny).
+
+MERGE_LIMIT = 1            # merges (each with its acceptance run) per pass
+ACCEPT_TIMEOUT = 900       # seconds for one acceptance command on the PR head
+REVIEWED = re.compile(r"Reviewed commit `([0-9a-f]{7,40})`")    # prbot's review footer
+BLOCKING = re.compile(r"\bP[0-2]\b")                            # prbot counts P1 and P2; P0 is worse still
+FINDING_START = re.compile(r"^\s{0,3}(?:[-*+]|\d+[.)]|#{1,6})?\s*(?:\*\*|__)?\s*\[?(P[0-3])\b")
+FINDING_END = re.compile(r"^(?:#{1,6}\s|\s{0,3}(?:-{3,}|\*{3,})\s*$|\s*<sub>|[-*+]\s|\d+[.)]\s)")
+CHECK_OK = ("success", "neutral", "skipped")
+
+
+def review_findings(body):
+    """[(priority, text)] for each finding in a review: a list item, numbered item, heading or bold line that
+    starts with its priority label (P0 to P3), up to the next item, heading, rule or prbot's footer."""
+    out, cur, fence = [], None, False
+    for line in (body or "").splitlines():
+        if line.lstrip().startswith("```"):
+            fence = not fence
+        m = None if fence else FINDING_START.match(line)
+        if m:
+            cur = [m.group(1), [line]]
+            out.append(cur)
+        elif cur and not fence and FINDING_END.match(line):
+            cur = None
+        elif cur:
+            cur[1].append(line)
+    return [(p, "\n".join(lines).strip()) for p, lines in out]
+
+
+def pr_facts(repo, url):
+    """What the gate needs to know about a PR, read from GitHub. SystemExit when a read fails."""
+    n = int(url.rstrip("/").rsplit("/", 1)[1])
+    pr = gh_json(["api", f"repos/{repo}/pulls/{n}", "--jq",
+                  "{number, title, state, merged, draft, user: .user.login, head: .head.ref, sha: .head.sha, "
+                  "mergeable, mergeable_state, merge_commit_sha}"])[0]
+    if pr["state"] != "open":
+        return {"pr": pr}
+    reviews = gh_json(["api", f"repos/{repo}/pulls/{n}/reviews?per_page=100", "--paginate",
+                       "--jq", '.[] | {user: .user.login, body: (.body // ""), url: .html_url}'])
+    files = gh_json(["api", f"repos/{repo}/pulls/{n}/files?per_page=100", "--paginate",
+                     "--jq", '.[] | {file: .filename, old: (.previous_filename // "")}'])
+    checks = gh_json(["api", f"repos/{repo}/commits/{pr['sha']}/check-runs?per_page=100", "--paginate",
+                      "--jq", ".check_runs[] | {name, status, conclusion}"])
+    checks += [{"name": s["name"], "status": "completed" if s["state"] != "pending" else "pending",
+                "conclusion": s["state"]}
+               for s in gh_json(["api", f"repos/{repo}/commits/{pr['sha']}/status",
+                                 "--jq", ".statuses[] | {name: .context, state}"])]
+    return {"pr": pr, "reviews": reviews, "files": [x for f in files for x in (f["file"], f["old"]) if x],
+            "checks": checks}
+
+
+def pr_gate(entry, facts, repo, worker_login, reviewer_login):
+    """What to do with a worker's open PR: ("merged" | "closed" | "wait" | "kenny", why), ("repair", (review,
+    findings)), or ("accept", (review, P3 findings)) when everything but the acceptance run on the head passed."""
+    w, pr = entry["work"], facts["pr"]
+    if pr.get("merged"):
+        return "merged", pr.get("merge_commit_sha") or ""
+    if pr["state"] != "open":
+        return "closed", "the PR was closed without merging"
+    if pr["user"] != worker_login or pr["head"] != w.get("branch") or not BOT_BRANCH.match(pr["head"]):
+        return "kenny", (f"the PR is not the worker bot's own `bot/` branch PR (opened by `{pr['user']}` from "
+                         f"`{pr['head']}`, expected `{worker_login}` from `{w.get('branch')}`)")
+    if pr.get("draft"):
+        return "kenny", "the PR was turned back into a draft"
+    sha = pr["sha"]
+    review = next((r for r in reversed(facts["reviews"]) if r["user"] == reviewer_login), None)
+    m = REVIEWED.search(review["body"]) if review else None
+    if not m or not sha.startswith(m.group(1)):
+        return "wait", f"no review of the head commit `{sha[:10]}` by `{reviewer_login}` yet"
+    findings = review_findings(review["body"])
+    serious = [f for f in findings if f[0] != "P3"]
+    if serious or BLOCKING.search(review["body"]):
+        if (w.get("repair") or {}).get("status") is not None:
+            return "kenny", (f"the review of `{sha[:10]}` still has P0-P2 findings after the one repair round "
+                             f"({review.get('url', '')})")
+        if not serious:
+            return "kenny", (f"the review of `{sha[:10]}` mentions P0-P2 but iwb could not separate the findings "
+                             f"for a repair round ({review.get('url', '')})")
+        return "repair", (review, serious)
+    rules = path_rules(repo)
+    bad = [f for f in facts["files"] if protected(f, rules)]
+    if bad:
+        return "kenny", "the PR changes protected paths: " + ", ".join(f"`{f}`" for f in sorted(set(bad)))
+    failing = [c["name"] for c in facts["checks"] if c["status"] == "completed" and c["conclusion"] not in CHECK_OK]
+    if failing:
+        return "kenny", "checks fail on the head: " + ", ".join(f"`{c}`" for c in failing)
+    if any(c["status"] != "completed" for c in facts["checks"]):
+        return "wait", "checks are still running on the head"
+    if pr.get("mergeable") is None or pr.get("mergeable_state") in (None, "unknown"):
+        return "wait", "GitHub is still working out whether the PR can merge"
+    if not pr.get("mergeable") or pr.get("mergeable_state") != "clean":
+        return "kenny", f"GitHub says the PR can't merge cleanly (mergeable state `{pr.get('mergeable_state')}`)"
+    return "accept", (review, [f for f in findings if f[0] == "P3"])
+
+
+def acceptance_commands(entry, repo, conf):
+    """The commands that must pass on the PR head: every unit's acceptance commands from the approved plan and the
+    repair round, then config.json "test_commands" for the repository. Empty means none could be determined."""
+    units = []
+    try:
+        units = json.loads(Path(entry["plan_file"]).read_text())["units"]
+    except PLAN_ERRORS:
+        pass
+    units += (entry["work"].get("repair") or {}).get("units") or []
+    cmds = [c for u in units for c in (u.get("acceptance") or {}).get("commands") or []]
+    own = (conf.get("test_commands") or {}).get(repo) or []
+    cmds += [own] if isinstance(own, str) else own
+    return list(dict.fromkeys(c for c in cmds if isinstance(c, str) and c.strip()))
+
+
+def head_clone(repo, bot, branch, sha):
+    """A fresh shallow clone of the PR branch with a read-only token that stays in the environment (never in the
+    clone's config). Returns (work dir, repo dir), or None when the branch has moved past `sha`."""
+    work = tempfile.mkdtemp(prefix="iwb-accept-")
+    env = prbot.git_env(token=prbot.installation_token(bot, repo, permissions={"contents": "read"}))
+    subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", branch, f"https://github.com/{repo}.git",
+                    f"{work}/repo"], env=env, check=True, capture_output=True, timeout=600)
+    got = subprocess.run(["git", "-C", f"{work}/repo", "rev-parse", "HEAD"], capture_output=True, text=True).stdout
+    if got.strip() != sha:
+        shutil.rmtree(work, ignore_errors=True)
+        return None
+    return work, f"{work}/repo"
+
+
+def run_acceptance(commands, repo_dir):
+    """Run each command on the committed tree, as the red check does (sandboxed, no network, no shell, the tree
+    reset between commands). Returns [{command, exit, output}]."""
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tempfile.gettempdir(), "LANG": "en_US.UTF-8",
+           "PYTHONDONTWRITEBYTECODE": "1"}
+    profile = sandbox_profile(str(Path(repo_dir).resolve().parent))
+    runs = []
+    for c in commands:
+        try:
+            reset_to_base(repo_dir)
+            r = subprocess.run(["sandbox-exec", "-p", profile] + shlex.split(c), cwd=repo_dir, env=env,
+                               capture_output=True, text=True, timeout=ACCEPT_TIMEOUT)
+            runs.append({"command": c, "exit": r.returncode, "output": (r.stdout + r.stderr)[-1500:]})
+        except subprocess.TimeoutExpired:
+            runs.append({"command": c, "exit": None, "output": f"timed out after {ACCEPT_TIMEOUT}s"})
+        except (ValueError, OSError) as e:
+            runs.append({"command": c, "exit": None, "output": f"could not run: {e}"})
+    reset_to_base(repo_dir)
+    return runs
+
+
+def acceptance_check(repo, bot, branch, sha, commands):
+    """The acceptance commands on a fresh clone of the PR head: (True, runs), (False, runs), or (None, []) when the
+    branch moved meanwhile."""
+    got = head_clone(repo, bot, branch, sha)
+    if got is None:
+        return None, []
+    try:
+        runs = run_acceptance(commands, got[1])
+    finally:
+        shutil.rmtree(got[0], ignore_errors=True)
+    return all(r["exit"] == 0 for r in runs), runs
+
+
+def merge_pr(bot, repo, number, sha, title):
+    """Squash-merge as the worker bot, only while the head is still `sha` (the API's form of gh's
+    --match-head-commit). Returns the merge commit."""
+    return run_gh_as(bot, repo, ["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/merge", "-f", "merge_method=squash",
+                                 "-f", f"sha={sha}", "-f", f"commit_title={title} (#{number})", "--jq", ".sha"])
+
+
+def needs_kenny(key, entry, why):
+    """Leave the PR for Kenny: bot:needs-kenny on the issue with one paragraph saying why, and tell OpenClaw."""
+    repo, number = key.rsplit("#", 1)
+    w, worker = entry["work"], WORKERS[entry["agent"]]
+    url = post(worker, repo, number, f"{W_MARKER}\nThe pull request {w['pr']} waits for Kenny: {why}. iwb merges a "
+               f"worker's PR only when the cross-review of its head has no P0-P2 findings (after at most one repair "
+               f"round), the acceptance commands pass on the head, no protected path is changed, no check fails and "
+               f"GitHub can merge it cleanly. Nothing more happens here until Kenny merges or closes it.",
+               "bot:needs-kenny")
+    w.update(status="needs-kenny", at=time.time(), comment=url, problem=short(why, 300))
+    prbot.openclaw_attention(f"needs-kenny: {key}", {"url": w["pr"], "problem": short(why, 300)})
+    log(f"{key}: PR waits for Kenny ({short(why, 160)}) {url}")
+
+
+def repair_units(findings, units):
+    """One orchestrator unit per finding (DESIGN.md step 6): the finding is the instructions, a test for the failing
+    case it describes is part of the work, and the plan's acceptance commands must still pass. Each unit keeps the
+    tier of the plan units whose files the finding names (all of them when it names none), and runs after the
+    previous one, since they share the plan's files."""
+    scope = list(dict.fromkeys(f for u in units for f in u["scope"]["files"]))
+    commands = list(dict.fromkeys(c for u in units for c in u["acceptance"]["commands"]))
+    out = []
+    for i, (prio, text) in enumerate(findings, 1):
+        hit = [u for u in units if any(f in text for f in u["scope"]["files"])] or units
+        tier = max(u["routing"]["initial_tier"] for u in hit)
+        top = max(u["routing"].get("maximum_tier", tier) for u in hit)
+        out.append({**copy.deepcopy(hit[0]), "id": f"repair-{i}", "title": f"Fix review finding {i} ({prio})",
+                    "description": (f"A cross-review of this pull request raised the finding below. Fix exactly what it "
+                                    f"describes and nothing else. Add or extend a test that fails on the case the "
+                                    f"finding describes and passes after the fix.\n\n{text}"),
+                    "depends_on": [f"repair-{i - 1}"] if i > 1 else [], "scope": {"files": scope},
+                    "acceptance": {"commands": commands},
+                    "routing": {**hit[0]["routing"], "initial_tier": tier, "maximum_tier": max(top, tier)},
+                    "traits": [], "provides": [], "requires": []})
+    return out
+
+
+def checkout_pr(repo, bot, branch, sha, number, issue, units):
+    """iwb's clone (see `checkout`) with the bot branch at the PR head `sha`, so the repair run starts there."""
+    d, default, _ = checkout(repo, bot, branch, number, issue, units)
+    env = prbot.git_env(token=prbot.installation_token(bot, repo, permissions={"contents": "read"}))
+    subprocess.run(["git", "-C", d, "fetch", "-q", "--no-tags", f"https://github.com/{repo}.git",
+                    f"refs/heads/{branch}"], env=env, check=True, capture_output=True, timeout=900)
+    got = subprocess.run(["git", "-C", d, "rev-parse", "FETCH_HEAD"], capture_output=True, text=True).stdout.strip()
+    if got != sha:
+        raise WorkError(f"the PR branch moved from `{sha[:10]}` to `{got[:10]}` before the repair round started")
+    subprocess.run(["git", "-C", d, "branch", "-f", branch, sha], check=True, capture_output=True)
+    return d, default, sha
+
+
+def repair_round(key, entry, issue, state, since, ecc, review, findings, sha):
+    """The one repair round: the findings as orchestrator units on the PR branch, pushed as one more commit by the
+    worker bot; prbot then reviews the new head. A failure leaves the PR for Kenny."""
+    repo, number = key.rsplit("#", 1)
+    owner, name = repo.split("/")
+    w, agent = entry["work"], entry["agent"]
+    worker = WORKERS[agent]
+    units = repair_units(findings, json.loads(Path(entry["plan_file"]).read_text())["units"])
+    problems = policy_violations(units, repo)
+    if problems:
+        needs_kenny(key, entry, "the repair round would break the policy gate: " + "; ".join(problems))
+        return
+    (WORK_DIR / "repos").mkdir(parents=True, exist_ok=True)
+    conf = read_config()
+    cost = issue_cost(conf)
+    ecc_cfg = orchestrator_config(WORK_DIR / "repos" / f"{repo.replace('/', '__')}.ecc.json", conf)
+    drift = orchestrator_drift()
+    if drift:
+        raise RuntimeError(drift)
+    run_id = f"iwb.{owner}.{name}.{number}.repair.{time.strftime('%Y%m%d%H%M%S', time.gmtime())}"
+    w["repair"] = {"status": "running", "from": sha, "run_id": run_id, "review": review.get("url", ""),
+                   "findings": len(findings), "units": units, "at": time.time()}
+    save_state(state, since)        # the round is spent from here on: it never runs twice for this PR
+    try:
+        run_gh_as(worker, repo, ["issue", "comment", number, "-R", repo, "--body",
+                                 f"{W_MARKER}\nRepair round started on {w['pr']} for {len(findings)} P0-P2 finding"
+                                 f"{'s' if len(findings) != 1 else ''} in {review.get('url', 'the review')} "
+                                 f"(run `{run_id}`)."])
+    except RuntimeError as e:
+        log(f"{key}: could not post the repair note: {e}")
+    log(f"{key}: repair round started, run {run_id}")
+    try:
+        d, default, base = checkout_pr(repo, worker, w["branch"], sha, number, issue, units)
+        drive_units(ecc, d, repo, number, agent, units, w["branch"], run_id, w["approver"], conf, cost, ecc_cfg)
+        new = publish(worker, repo, d, base, w["branch"], default, units,
+                      f"Repair round for the review of {w['pr']} (#{number})\n\nOrchestrator run {run_id}.")
+    except Stopped as e:
+        w["repair"].update(status="stopped", problem=str(e))
+        log(f"{key}: repair round stopped: {e}")
+        return
+    except (WorkError, RuntimeError, subprocess.SubprocessError, SystemExit, OSError, KeyError) as e:
+        w["repair"].update(status="failed", problem=short(e, 300))
+        needs_kenny(key, entry, f"the repair round failed ({short(e)})")
+        return
+    w["repair"].update(status="pushed", sha=new, done_at=time.time())
+    try:
+        run_gh_as(worker, repo, ["issue", "comment", number, "-R", repo, "--body",
+                                 f"{W_MARKER}\nRepair round pushed `{new[:10]}` to {w['pr']}; it merges once the "
+                                 f"new head's review is clean and its checks pass, otherwise it waits for Kenny."])
+    except RuntimeError as e:
+        log(f"{key}: could not post the repair note: {e}")
+    log(f"{key}: repair round pushed {new[:10]}")
+
+
+def merge_now(key, entry, facts, review, minor, commands):
+    """Run the acceptance commands on the head, then squash-merge and label the issue bot:done."""
+    repo, number = key.rsplit("#", 1)
+    w, worker, pr = entry["work"], WORKERS[entry["agent"]], facts["pr"]
+    ok, runs = acceptance_check(repo, worker, pr["head"], pr["sha"], commands)
+    if ok is None:
+        log(f"{key}: the PR head moved during the acceptance run; checking again next pass")
+        return
+    if not ok:
+        bad = next(r for r in runs if r["exit"] != 0)
+        needs_kenny(key, entry, f"`{short(bad['command'], 120)}` fails on the head `{pr['sha'][:10]}` (exit "
+                                f"{bad['exit']}: {short(bad['output'], 200)})")
+        return
+    merged = merge_pr(worker, repo, pr["number"], pr["sha"], pr["title"])
+    w.update(status="merged", merge_sha=merged, merged_at=time.time())
+    note = (" Minor (P3) findings left for later: " + "; ".join(short(t.splitlines()[0], 160) for _, t in minor)
+            + ".") if minor else ""
+    try:
+        w["comment"] = post(worker, repo, number, f"{W_MARKER}\nMerged {w['pr']} (squash `{merged[:10]}`): the "
+                            f"review of `{pr['sha'][:10]}` ({review.get('url', '')}) has no P0-P2 findings and "
+                            f"{len(commands)} acceptance command{'s' if len(commands) != 1 else ''} passed on it."
+                            f"{note}", "bot:done")
+    except RuntimeError as e:
+        log(f"{key}: merged, but could not label the issue bot:done: {e}")
+    log(f"{key}: merged {w['pr']} as {merged[:10]}")
+
+
+def review_prs(keys, state, since, ecc, dry_run, runs, limit, conf):
+    """Step 5 for the issues in `keys`, whose PRs are open: see pr_gate. A repair round counts as a coding run
+    against `limit`; merges have MERGE_LIMIT. Returns the coding runs so far."""
+    merges = 0
+    for key in keys:
+        entry = state[key]
+        repo, number = key.rsplit("#", 1)
+        w, worker = entry["work"], WORKERS[entry["agent"]]
+        try:
+            issue = gh_json(["api", f"repos/{repo}/issues/{number}", "--jq",
+                             "{state, title, body, labels: [.labels[].name]}"])[0]
+            if "bot:stop" in issue["labels"]:
+                continue
+            facts = pr_facts(repo, w["pr"])
+            worker_login = prbot.bot_config(worker)["slug"] + "[bot]"
+            reviewer_login = prbot.bot_config(REVIEW_BOTS[APPROVERS[entry["agent"]]])["slug"] + "[bot]"
+        except (SystemExit, KeyError, IndexError, ValueError) as e:
+            mark(key, "deferred", f"could not read the PR {w['pr']}; will retry: {e!r}")
+            continue
+        action, detail = pr_gate(entry, facts, repo, worker_login, reviewer_login)
+        if dry_run:
+            log(f"{key}: PR {w['pr']}: would {action}")
+            continue
+        try:
+            if action == "wait":
+                log(f"{key}: PR waits: {detail}")
+            elif action == "merged":
+                w.update(status="merged", merge_sha=detail, merged_at=time.time())
+                w["comment"] = post(worker, repo, number, f"{W_MARKER}\n{w['pr']} was merged.", "bot:done")
+                log(f"{key}: PR merged by someone else {w['pr']}")
+            elif action == "closed":
+                w.update(status="pr-closed", at=time.time())
+                log(f"{key}: PR closed without merging {w['pr']}")
+            elif action == "kenny":
+                needs_kenny(key, entry, detail)
+            elif action == "repair":
+                if runs >= limit:
+                    mark(key, "held", f"repair round waits for the next pass (limit {limit})")
+                    continue
+                runs += 1
+                SPENT["code"] += 1
+                repair_round(key, entry, issue, state, since, ecc, *detail, facts["pr"]["sha"])
+            elif action == "accept":
+                commands = acceptance_commands(entry, repo, conf)
+                if not commands:
+                    needs_kenny(key, entry, "no acceptance or test command could be determined for the head")
+                elif merges >= MERGE_LIMIT:
+                    mark(key, "held", f"merge waits for the next pass (limit {MERGE_LIMIT})")
+                else:
+                    merges += 1
+                    merge_now(key, entry, facts, *detail, commands)
+        except (RuntimeError, subprocess.SubprocessError, SystemExit, OSError) as e:
+            mark(key, "failed", f"PR step ({action}) could not run; retrying next pass: {e}")
+        save_state(state, since)
+    return runs
 
 
 def work_lock(name="work.lock"):
@@ -2080,7 +2453,7 @@ def needs_coding(entry):
     if not ap:
         return False
     w = entry.get("work") or {}
-    return not (w.get("plan_digest") == ap["plan_digest"] and w.get("status") in ("pr-open", "blocked"))
+    return not (w.get("plan_digest") == ap["plan_digest"] and w.get("status") in PR_STATUSES + ("blocked",))
 
 
 def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
@@ -2104,7 +2477,7 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
         return 0
     state, since = load_state()
     coding = set(conf.get("coding_repos", []))
-    runs = 0
+    runs, prs = 0, []
     try:
         for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
             if only is not None and key not in only:
@@ -2123,9 +2496,13 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
                 continue
             w = entry.get("work") or {}
             current = w.get("plan_digest") == ap["plan_digest"]
-            if current and w.get("status") in ("pr-open", "blocked"):
-                continue                    # waiting for step 5 or for Kenny
             repo, number = key.rsplit("#", 1)
+            if current and w.get("status") == "pr-open" and w.get("pr") and conf.get("auto_merge") is True \
+                    and repo in coding:
+                prs.append(key)             # step 5, after the coding below: review, one repair round, merge
+                continue
+            if current and w.get("status") in PR_STATUSES + ("blocked",):
+                continue                    # waiting for step 5 or for Kenny
             if repo not in coding:
                 step = None if entry.get("coding_note") == ap["plan_digest"] else "note"
             elif current and w.get("status") == "in-progress":
@@ -2195,6 +2572,7 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None):
             except (RuntimeError, subprocess.SubprocessError, SystemExit, OSError) as e:
                 entry["work_failed_at"] = time.time()
                 mark(key, "failed", f"{step} could not run; retrying in {RETRY_AFTER // 60} minutes: {e}")
+        runs = review_prs(prs, state, since, ecc, dry_run, runs, limit, conf)
     finally:
         if not dry_run:
             save_state(state, since)
