@@ -1394,6 +1394,30 @@ class Code(unittest.TestCase):
         iwb.CONFIG.write_text(json.dumps({**self.PILOT, "ecc_config": {"policy_file": "~/p.json"}}))
         self.assertEqual(iwb.policy_args(own.parent.parent, "kennylhilljr/demo", "claude"), [])
 
+    def test_repository_gate_commands_reach_the_orchestrator(self):
+        # regression: research-mcp#1's own policy required `unit-tests`, but its command lives in the repository's
+        # .orchestration/ecc.json and iwb's --config had none, so the gate was "missing" on every attempt and the
+        # drive stopped with needs_owner
+        own = Path(self.tmp.name, "clone", ".orchestration")
+        own.mkdir(parents=True)
+        (own / "config.yaml").write_text(json.dumps({"required_checks": ["unit-tests"]}) + "\n")
+        checks = {"required": ["unit-tests"], "commands": {"unit-tests": "uv run pytest -q"}}
+        (own / "ecc.json").write_text(json.dumps({"repo": "~/x", "repo_checks": checks}) + "\n")
+        self.approve_plan([REAL_TIER0_UNIT])
+        self.changed = ["README.md", "skills/README.md"]
+        self.run_pass()
+        self.assertEqual(len(self.ecc_calls), 4)
+        for args in self.ecc_calls:                     # both reviews, create-run and drive
+            cfg = json.loads(Path(args[args.index("--config") + 1]).read_text())
+            self.assertEqual(cfg["repo_checks"], checks)
+            self.assertIn("certifications", cfg)                         # iwb's own keys are kept
+        shared = iwb.WORK_DIR / "repos" / "kennylhilljr__demo.ecc.json"
+        self.assertNotIn("repo_checks", json.loads(shared.read_text()))  # the per-repo config is not rewritten
+        mine = {"required": ["lint"], "commands": {"lint": "ruff check"}}
+        path = Path(self.tmp.name, "conf.json")
+        path.write_text(json.dumps({"repo_checks": mine}))
+        self.assertEqual(iwb.repo_checks_config(own.parent, path), path)    # config.json repo_checks still win
+
     def test_approved_zero_cost_plan_is_refused_before_create_run(self):
         # regression: issue-worker-bots#22 was approved with maximum_cost_usd 0, so `ecc drive` stopped with
         # needs_owner (exit 3) before any unit ran. The approval pins the plan, so iwb blocks it for a new plan.
