@@ -1983,6 +1983,9 @@ class Checkout(unittest.TestCase):
         # regression (ecc-customization#14): the architect's milestone-start plan check stopped the drive with
         # no_architect; the plan was already red-checked and approved by the other worker family
         self.assertNotIn("milestone_start", team["roles"]["architect"]["when"])
+        # regression (openclaw-ecc-orchestrator#27): the practices pass merged .agents/LESSONS.md into the bot
+        # branch, outside the plan's scope, and publish refused the run
+        self.assertIs(team["learning"]["enabled"], False)
         self.assertEqual(git("status", "--porcelain", cwd=d), "")                  # and team.json stays out of git
         git("checkout", "-q", "bot/1-x", cwd=d)          # what the orchestrator's merge queue does
         Path(d, "a.py").write_text("y\n")
@@ -2009,6 +2012,38 @@ class Checkout(unittest.TestCase):
         # the orchestrator extracts the doc's sections by heading number (evidence.extract_sections)
         self.assertEqual(re.findall(r"^#{1,4}\s+(\d+(?:\.\d+)*)\.?\s", doc, re.M), m["docs"][0]["sections"])
         self.assertEqual(git("status", "--porcelain", cwd=d), "")                  # the doc stays out of git too
+
+    def test_repository_team_file_gets_learning_off(self):
+        # regression (openclaw-ecc-orchestrator#27): a repository's own team.json wins, but its practices pass
+        # would still write practice files outside the plan's scope, so iwb's clone turns it off
+        import subprocess
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        src = Path(tmp.name, "src")
+        git = lambda *a, cwd=src: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd,
+                                                 check=True, capture_output=True, text=True).stdout.strip()
+        src.mkdir()
+        git("init", "-q", "-b", "main")
+        Path(src, ".orchestration").mkdir()
+        Path(src, ".orchestration/team.json").write_text(json.dumps(
+            {"merge_approval": "agents", "learning": {"enabled": True, "ledger": "LESSONS.md"}}))
+        git("add", "-A")
+        git("commit", "-qm", "init")
+        saved = {k: getattr(iwb.prbot, k) for k in ("git_env", "installation_token", "gh_read")}
+        saved_dir = iwb.WORK_DIR
+        self.addCleanup(lambda: [setattr(iwb.prbot, k, v) for k, v in saved.items()])
+        self.addCleanup(lambda: setattr(iwb, "WORK_DIR", saved_dir))
+        iwb.WORK_DIR = Path(tmp.name, "work")
+        iwb.prbot.installation_token = lambda *a, **k: "tok"
+        iwb.prbot.gh_read = lambda args: json.dumps({"b": "main"})
+        iwb.prbot.git_env = lambda token=None, identity=None: dict(
+            __import__("os").environ, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0=f"url.{src}.insteadOf",
+            GIT_CONFIG_VALUE_0="https://github.com/kennylhilljr/demo.git")
+        d, _, _ = iwb.checkout("kennylhilljr/demo", "claude-dev", "bot/1-x")
+        team = json.loads(Path(d, ".orchestration/team.json").read_text())
+        self.assertEqual(team["learning"], {"enabled": False, "ledger": "LESSONS.md"})
+        self.assertEqual(team["merge_approval"], "agents")                         # the rest is the repository's
+        self.assertEqual(git("status", "--porcelain", cwd=d), "")                  # the edit stays out of git
 
     def test_renaming_a_protected_file_into_scope_is_refused(self):
         # regression: `git diff --name-only` listed only the new name of a rename, so moving .env into a file the

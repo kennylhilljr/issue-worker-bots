@@ -1346,7 +1346,12 @@ SECRET_ENV = re.compile(r"^(GH_|GITHUB_|PRBOT_)|TOKEN|SECRET|PASSWORD|CREDENTIAL
 ALWAYS_BLOCKED = (".github/workflows/**", "**/.env*", "**/*.pem", "**/*.key", "**/secrets/**")
 SEED_POLICY = {"kennylhilljr/ecc-customization": ["bootstrap.sh", "stack.conf", "machine/**"]}
 W_MARKER = "<!-- iwb:work -->"
-TEAM = {"merge_approval": "agents", "roles": {"architect": {"when": ["contract_units", "milestone_end"]}}}
+# The orchestrator's practices pass (team.json "learning") has the delivery lead merge lessons into AGENTS.md,
+# CLAUDE.md, .agents/skills and .agents/LESSONS.md on the run's target branch. Those files are outside every plan's
+# scope, so publish refused the whole run (openclaw-ecc-orchestrator#27). iwb's runs keep it off.
+NO_LEARNING = {"enabled": False}
+TEAM = {"merge_approval": "agents", "roles": {"architect": {"when": ["contract_units", "milestone_end"]}},
+        "learning": NO_LEARNING}
 ECC = Path(os.environ.get("IWB_ECC", ROOT.parent / "openclaw-ecc-orchestrator" / "bin" / "ecc"))
 WORK_DIR = Path(os.environ.get("IWB_WORK", Path.home() / ".local" / "state" / "issue-worker-bots"))
 ECC_DEFAULTS = {   # the orchestrator assigns no runner without certifications, so drive needs these
@@ -1635,7 +1640,26 @@ def checkout(repo, bot, branch, number=None, issue=None, units=()):
         team.write_text(json.dumps(cfg) + "\n")
         with open(d / ".git" / "info" / "exclude", "a") as f:
             f.write(f"\n/.orchestration/team.json\n/{MILESTONE_DOC}\n")
+    else:
+        no_learning(d, team)
     return str(d), default, base
+
+
+def no_learning(d, team):
+    """The repository's own team.json, with the practices pass turned off (NO_LEARNING) in iwb's clone only:
+    skip-worktree keeps the edit out of git status, and the orchestrator commits only in its unit worktrees. A file
+    that isn't a JSON object is left alone; the orchestrator refuses it before anything runs."""
+    try:
+        cfg = json.loads(team.read_text())
+    except ValueError:
+        return
+    if not isinstance(cfg, dict):
+        return
+    own = cfg.get("learning")
+    cfg["learning"] = {**(own if isinstance(own, dict) else {}), **NO_LEARNING}
+    team.write_text(json.dumps(cfg, indent=1) + "\n")
+    subprocess.run(["git", "-C", str(d), "update-index", "--skip-worktree", ".orchestration/team.json"],
+                   check=True, capture_output=True)
 
 
 # After a run, iwb's clone and everything in its .git (hooks, config, includes) is the agents' work and is never
