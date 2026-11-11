@@ -13,6 +13,33 @@ loader.exec_module(iwb)
 OWNER = "kennylhilljr"
 
 
+def nested_sandbox_error():
+    """Why red_check's sandbox-exec cannot run here, or None. Inside another macOS sandbox (a Codex
+    workspace-write run) sandbox_apply fails with exit 71, so a red-check test would pass or fail for that
+    reason alone and not for what it checks."""
+    try:
+        r = iwb.subprocess.run(["sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"],
+                               capture_output=True, text=True, timeout=30)
+    except (OSError, iwb.subprocess.TimeoutExpired) as e:
+        return f"sandbox-exec unavailable: {e}"
+    return None if r.returncode == 0 else f"sandbox-exec exit {r.returncode}: {r.stderr.strip()[:200]}"
+
+
+def need_sandbox_exec(case):
+    error = nested_sandbox_error()
+    if error:
+        case.skipTest(f"needs sandbox-exec outside another sandbox ({error})")
+
+
+def home_tmpdir(case):
+    """A temporary folder in the real home folder, which the red-check profile must keep unreadable and
+    unwritable. Skips when this run itself may not write there (a Codex workspace-write sandbox)."""
+    try:
+        return tempfile.TemporaryDirectory(dir=Path.home())
+    except PermissionError as e:
+        case.skipTest(f"cannot create a fixture in the home folder here: {e}")
+
+
 def issue(n, user=OWNER, labels=(), assignees=(), title="t"):
     return {"number": n, "title": title, "user": {"login": user},
             "labels": [{"name": l} for l in labels], "assignees": [{"login": a, "type": t} for a, t in assignees]}
@@ -477,7 +504,8 @@ class RedCheckReview(unittest.TestCase):
     def test_cannot_read_files_in_the_home_folder(self):
         # P1: a model-written command could print a private key, fail on purpose and pass the red check,
         # and its output went to the approver model.
-        with tempfile.TemporaryDirectory(dir=Path.home()) as home_tmp, tempfile.TemporaryDirectory() as work:
+        need_sandbox_exec(self)
+        with home_tmpdir(self) as home_tmp, tempfile.TemporaryDirectory() as work:
             secret = Path(home_tmp, "id_test")
             secret.write_text("SECRET-VALUE")
             repo = Path(work, "repo")
@@ -489,6 +517,7 @@ class RedCheckReview(unittest.TestCase):
 
     def test_each_command_starts_from_the_base_tree(self):
         # P2: a first command created a file and failed; a later `test -f` then passed although it fails on base.
+        need_sandbox_exec(self)     # otherwise every command exits 71 and the test passes for nothing
         with tempfile.TemporaryDirectory() as work:
             repo = Path(work, "repo")
             repo.mkdir()
@@ -717,8 +746,11 @@ class Approve(unittest.TestCase):
 
 
 class RedCheckSandbox(unittest.TestCase):
+    def setUp(self):
+        need_sandbox_exec(self)
+
     def test_runs_without_a_shell_and_cannot_write_outside_the_clone(self):
-        with tempfile.TemporaryDirectory(dir=Path.home()) as home_tmp, tempfile.TemporaryDirectory() as work:
+        with home_tmpdir(self) as home_tmp, tempfile.TemporaryDirectory() as work:
             repo = Path(work, "repo")
             repo.mkdir()
             outside = Path(home_tmp, "escaped.txt")
@@ -729,6 +761,32 @@ class RedCheckSandbox(unittest.TestCase):
             self.assertNotEqual(r["runs"][1]["exit"], 0)
             self.assertFalse(outside.exists())
             self.assertTrue(r["red"])
+
+
+class SandboxedTestRun(unittest.TestCase):
+    """Inside a Codex workspace-write sandbox the red-check tests skip instead of failing the suite."""
+
+    def test_a_nested_sandbox_skips_red_check_tests(self):
+        saved = iwb.subprocess.run
+        iwb.subprocess.run = lambda *a, **k: iwb.subprocess.CompletedProcess(
+            a[0], 71, "", "sandbox-exec: sandbox_apply: Operation not permitted\n")
+        try:
+            self.assertIn("exit 71", nested_sandbox_error())
+            with self.assertRaises(unittest.SkipTest):
+                need_sandbox_exec(self)
+        finally:
+            iwb.subprocess.run = saved
+
+    def test_an_unwritable_home_folder_skips_instead_of_erroring(self):
+        saved = tempfile.mkdtemp
+        def denied(*a, **k):
+            raise PermissionError(1, "Operation not permitted", k.get("dir"))
+        tempfile.mkdtemp = denied
+        try:
+            with self.assertRaises(unittest.SkipTest):
+                home_tmpdir(self)
+        finally:
+            tempfile.mkdtemp = saved
 
 
 def coding_unit(uid="u1", files=("src/parser.py",)):
