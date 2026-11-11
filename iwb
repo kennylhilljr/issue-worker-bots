@@ -558,36 +558,61 @@ def run_model(agent, prompt, stdin, cwd, model=None):
 
 def parse_answer(text):
     """The answer as a dict, or raises ValueError with the reason it is unusable."""
-    blocks = re.findall(r"```json\s*(\{.*?\})\s*```", text, re.S)
+    blocks = re.findall(r"```json\s*([\[{].*?[\]}])\s*```", text, re.S)
     raw = blocks[-1] if blocks else text[text.find("{"):text.rfind("}") + 1]
     try:
         a = json.loads(raw)
     except ValueError:
         raise ValueError("the answer has no readable JSON object")
+    if not isinstance(a, dict):
+        raise ValueError("the answer is not a JSON object")
     if a.get("decision") == "no_change":
         if not a.get("summary"):
             raise ValueError("decision is no_change but no reason was given")
         return a
     if a.get("decision") == "questions":
-        if not a.get("questions"):
-            raise ValueError("decision is questions but no questions were given")
+        if not isinstance(a.get("summary"), str):
+            raise ValueError("decision is questions but summary is missing or not a string")
+        questions = a.get("questions")
+        if not isinstance(questions, list) or not 1 <= len(questions) <= 5 \
+                or not all(isinstance(q, str) for q in questions):
+            raise ValueError("decision is questions but questions is not a non-empty list of at most 5 strings")
         return a
     if a.get("decision") != "plan":
         raise ValueError(f"unknown decision {a.get('decision')!r}")
-    units = a.get("units") or []
+    if not isinstance(a.get("summary"), str):
+        raise ValueError("decision is plan but summary is missing or not a string")
+    units = a.get("units")
+    if not isinstance(units, list):
+        raise ValueError("units must be a list")
     if not 1 <= len(units) <= 8:
         raise ValueError(f"a plan needs 1 to 8 units, got {len(units)}")
+    for u in units:
+        uid = u.get("id") if isinstance(u, dict) else None
+        if not isinstance(u, dict):
+            raise ValueError(f"unit {uid!r} must be an object")
+        missing = [f for f in UNIT_FIELDS if f not in u]
+        if missing:
+            raise ValueError(f"unit {uid!r} is missing {', '.join(missing)}")
+        if not isinstance(u["id"], str) or not u["id"]:
+            raise ValueError(f"unit {uid!r} id must be a non-empty string")
+        if not isinstance(u["title"], str) or not u["title"]:
+            raise ValueError(f"unit {uid!r} title must be a non-empty string")
+        if not isinstance(u["depends_on"], list) or not all(isinstance(d, str) for d in u["depends_on"]):
+            raise ValueError(f"unit {uid!r} depends_on must be a list of strings")
+        if not isinstance(u["scope"], dict) or not isinstance(u["scope"].get("files"), list) \
+                or not u["scope"]["files"] or not all(isinstance(f, str) and f for f in u["scope"]["files"]):
+            raise ValueError(f"unit {uid!r} scope.files must be a non-empty list of non-empty strings")
+        if not isinstance(u["acceptance"], dict) or not isinstance(u["acceptance"].get("commands"), list) \
+                or not u["acceptance"]["commands"] \
+                or not all(isinstance(c, str) and c for c in u["acceptance"]["commands"]):
+            raise ValueError(f"unit {uid!r} acceptance.commands must be a non-empty list of non-empty strings")
+        if cost_problem(u):
+            raise ValueError(cost_problem(u))
     ids = [u.get("id") for u in units]
     if len(set(ids)) != len(ids):
         raise ValueError("unit ids are not unique")
     for u in units:
-        missing = [f for f in UNIT_FIELDS if f not in u]
-        if missing:
-            raise ValueError(f"unit {u.get('id')!r} is missing {', '.join(missing)}")
-        if not u["scope"].get("files") or not u["acceptance"].get("commands"):
-            raise ValueError(f"unit {u['id']!r} needs scope.files and acceptance.commands")
-        if cost_problem(u):
-            raise ValueError(cost_problem(u))
         unknown = [d for d in u["depends_on"] if d not in ids]
         if unknown:
             raise ValueError(f"unit {u['id']!r} depends on unknown units {unknown}")
@@ -795,7 +820,13 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo_filter=None)
             cost = issue_cost()
             prompt = ANALYSIS_PROMPT.format(repo=repo, branch=branch, sha=sha[:10], cost=f"${cost}",
                                             example=json.dumps(example_unit(cost), indent=1))
-            answer = parse_answer(run_model(agent, prompt, text, f"{work}/repo"))
+            raw = run_model(agent, prompt, text, f"{work}/repo")
+            try:
+                answer = parse_answer(raw)
+            except ValueError:
+                raise
+            except Exception as e:
+                raise ValueError(f"{type(e).__name__}: {e}") from e
         except (RuntimeError, subprocess.SubprocessError, SystemExit) as e:
             entry["analysis_failed_at"] = time.time()
             mark(key, "failed", f"analysis could not run; retrying in {RETRY_AFTER // 60} minutes: {e}")

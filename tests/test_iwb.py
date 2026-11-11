@@ -339,6 +339,64 @@ class Analyze(unittest.TestCase):
             with self.subTest(why=why), self.assertRaisesRegex(ValueError, why):
                 iwb.parse_answer(answer(obj))
 
+    def test_parse_answer_type_checks(self):
+        """test_parse_answer_type_checks: wrong-typed answer fields raise ValueError naming the field."""
+        cases = [
+            (answer({"decision": "plan", "summary": "x", "units": ["x"]}), "must be an object"),
+            (answer({"decision": "plan", "summary": "x", "units": {"a": 1}}), "units must be a list"),
+            (answer({"decision": "plan", "summary": "x", "units": [unit(scope="x")]}), "scope.files"),
+            (answer({"decision": "plan", "summary": "x", "units": [unit(depends_on=1)]}), "depends_on"),
+            (answer({"decision": "plan", "summary": "x", "units": [unit(uid=["a"])]}),
+             "id must be a non-empty string"),
+            (answer({"decision": "plan", "summary": "x", "units": [unit(uid="a", depends_on="a")]}), "depends_on"),
+            (answer({"decision": "plan", "summary": "x", "units": [unit(scope={"files": "f.py"})]}), "files"),
+            (answer({"decision": "questions", "summary": "?", "questions": "why?"}), "questions"),
+            (answer({"decision": "plan", "units": [unit()]}), "summary"),
+            (answer({"decision": "questions", "summary": 42, "questions": ["q"]}), "summary"),
+            ("```json\n[1, 2]\n```", "^the answer is not a JSON object$"),
+        ]
+        for text, why in cases:
+            with self.subTest(why=why), self.assertRaisesRegex(ValueError, why):
+                iwb.parse_answer(text)
+
+    def test_wrong_typed_plan_blocks_after_two_tries(self):
+        """test_wrong_typed_plan_blocks_after_two_tries: a units list of strings defers once, then blocks."""
+        self.answers = [answer({"decision": "plan", "summary": "x", "units": ["x"]}),
+                        answer({"decision": "plan", "summary": "x", "units": ["x"]})]
+        log = self.run_pass()
+        self.assertIn("must be an object", log)
+        self.assertIn("attempt 1 of 2", log)
+        self.assertEqual(self.posts, [])                 # attempt 1 posts nothing, bot:blocked included
+        self.assertEqual(self.state()["attempts"], 1)
+        log = self.run_pass()
+        self.assertEqual(len(self.prompts), 2)           # the second pass asked the model again
+        self.assertIn("must be an object", log)
+        self.assertEqual([p[1] for p in self.posts], ["bot:blocked"])
+
+    def test_backstop_catches_non_valueerror_from_parse_answer(self):
+        """test_backstop_catches_non_valueerror_from_parse_answer: a TypeError from parse_answer counts as an
+        unusable answer, so it defers once and then blocks instead of crashing the pass."""
+        real_parse_answer = iwb.parse_answer
+        calls = []
+
+        def boom(raw):
+            calls.append(raw)
+            raise TypeError("boom")
+        iwb.parse_answer = boom
+        try:
+            self.answers = ["anything", "anything"]
+            log = self.run_pass()
+            self.assertIn("TypeError: boom", log)
+            self.assertIn("attempt 1 of 2", log)
+            self.assertEqual(self.posts, [])             # attempt 1 posts nothing, bot:blocked included
+            self.assertEqual(self.state()["attempts"], 1)
+            log = self.run_pass()
+            self.assertEqual(calls, ["anything", "anything"])   # the second pass parsed a fresh answer
+            self.assertIn("TypeError: boom", log)
+            self.assertEqual([p[1] for p in self.posts], ["bot:blocked"])
+        finally:
+            iwb.parse_answer = real_parse_answer
+
     def test_no_change_is_reported_and_stops(self):
         # real case: issue #1 is a test of the bots; Opus invented an empty unit when "plan" was the only option
         self.answers = [answer({"decision": "no_change", "summary": "This issue only tests intake."})]
