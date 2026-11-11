@@ -4077,6 +4077,47 @@ class AutoMerge(unittest.TestCase):
         self.assertEqual((self.merges(), self.labels()), ([], ["bot:done"]))
         self.assertEqual(self.work()["status"], "merged")
 
+    def test_pr_merged_during_failed_repair_round_is_done_not_kenny(self):
+        # regression: Kenny merged PRs #49 and #55 while their repair rounds ran; the rounds then failed with
+        # product_rejected and iwb put bot:needs-kenny on the closed issues
+        self.reviews = [review(HEAD, P2_FINDING)]
+
+        def ecc(args, timeout=900, **kw):
+            if args[0] == "drive":
+                self.pr.update(state="closed", merged=True, merge_commit_sha="e" * 40)
+                self.issue["state"] = "closed"
+                self.ecc_calls.append(args)
+                return 3, {"ok": False, "data": {"stop": "product_rejected"}}, ""
+            return self.fake_ecc(args, timeout, **kw)
+        with redirect_stdout(io.StringIO()):
+            iwb.cmd_code(ecc=ecc)
+        self.assertEqual(self.pushed, [])
+        self.assertEqual((self.merges(), self.labels(), self.events), ([], ["bot:done"], []))
+        w = self.work()
+        self.assertEqual((w["status"], w["merge_sha"]), ("merged", "e" * 40))
+        self.assertNotIn("problem", w)
+        self.run_pass()
+        self.assertEqual(len(self.posts), 1)                     # left alone afterwards
+
+    def test_closed_issue_gets_no_repair_round(self):
+        self.reviews = [review(HEAD, P2_FINDING)]
+        self.issue["state"] = "closed"
+        spent = iwb.SPENT["code"]
+        self.run_pass()
+        self.assertEqual((self.ecc_calls, self.checkouts, self.gh_calls, self.posts, self.events), ([],) * 5)
+        self.assertEqual(iwb.SPENT["code"], spent)
+        self.assertNotIn("repair", self.work())
+        self.assertNotIn(self.KEY, iwb.prs_to_review(json.loads(iwb.STATE.read_text()), iwb.read_config()))
+
+    def test_pr_merged_during_failed_acceptance_run_is_done_not_kenny(self):
+        def accept(repo, bot, branch, sha, cmds):
+            self.pr.update(state="closed", merged=True, merge_commit_sha="e" * 40)
+            return False, [{"command": "python3 -m unittest", "exit": 1, "output": "FAILED"}]
+        iwb.acceptance_check = accept
+        self.run_pass()
+        self.assertEqual((self.merges(), self.labels(), self.events), ([], ["bot:done"], []))
+        self.assertEqual(self.work()["status"], "merged")
+
     def test_needs_kenny_stops_coding_and_analysis(self):
         self.pr.update(mergeable=False, mergeable_state="dirty")
         self.run_pass()
