@@ -257,6 +257,6 @@ A usage limit or outage retries after an hour. Two unusable answers mark the iss
 
 ## Contributing
 
-Run the tests before every change and add a regression test for every bug found. Keep `iwb` to the standard library. Agents commit and push with `prbot git <bot> -- commit` and `-- push`, so GitHub attributes the work to a bot rather than to Kenny.
+Run the tests before every change and add a regression test for every bug found. Keep `iwb` to the standard library. Agents commit and push with `prbot git <bot> -- commit` and `-- push`, so GitHub attributes the work to a bot rather than to Kenny. Inside an `iwb code` run this rule applies to what is pushed, not to the orchestrator's worktree: `publish` squashes the run into one commit by the worker bot from a trusted copy, so the author of an intermediate worktree commit is not a delivery problem.
 
 Depends on [openclaw-ecc-orchestrator](https://github.com/kennylhilljr/openclaw-ecc-orchestrator) for plans, routing by tier, worktrees, escalation and budgets, and on [pr-review-bots](https://github.com/kennylhilljr/pr-review-bots) for App identities, tokens, commits, pushes and cross-review.
