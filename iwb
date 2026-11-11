@@ -1569,9 +1569,29 @@ def slugify(title):
     return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40].strip("-") or "issue"
 
 
-def checkout(repo, bot, branch):
+MILESTONE_DOC = ".orchestration/milestone.md"
+
+
+def milestone(number, issue, units):
+    """team.json "milestone" for one issue, and the doc it points at. Without it the product owners at milestone
+    end saw "(none configured)" for exit criteria and gates and rejected every run (product_rejected). The issue
+    is the goal; each unit's acceptance commands are the exit criteria and are run again on the result."""
+    gates = list(dict.fromkeys(c for u in units for c in (u.get("acceptance") or {}).get("commands") or []))
+    rows = "\n".join(f"- `{u['id']}`: {u['title']}. Accepted when "
+                      + (", ".join(f"`{c}`" for c in (u.get("acceptance") or {}).get("commands") or [])
+                         or "its reviewers approve") + " passes." for u in units)
+    doc = (f"# Issue #{number}: {issue['title']}\n\n## 1. Goal (the issue)\n\n"
+           f"{(issue.get('body') or '(no description)').strip()}\n\n## 2. Exit criteria\n\n"
+           f"Every unit of the approved plan is merged and its acceptance commands pass on the result:\n\n{rows}\n"
+           f"\nThe milestone gate commands below are those acceptance commands, run on the result.\n")
+    return {"name": f"issue-{number}", "docs": [{"path": MILESTONE_DOC, "sections": ["1", "2"]}],
+            "gate_commands": gates}, doc
+
+
+def checkout(repo, bot, branch, number=None, issue=None, units=()):
     """iwb's own clone of the target repository (never one of Kenny's checkouts), with the bot branch created at
     the default branch's tip. The orchestrator fast-forwards that branch; HEAD stays on the default branch.
+    With the issue and its units, iwb's team.json also names the milestone (see `milestone`).
     Returns (dir, default branch, base commit)."""
     default = gh_json(["api", f"repos/{repo}", "--jq", "{b: .default_branch}"])[0]["b"]
     d = WORK_DIR / "repos" / repo.replace("/", "__")
@@ -1590,9 +1610,13 @@ def checkout(repo, bot, branch):
         # red-checked and approved by the other worker family, so the architect's milestone-start plan check is
         # skipped: it repeated that review, and when no architect answered it stopped the drive (no_architect).
         team.parent.mkdir(exist_ok=True)
-        team.write_text(json.dumps(TEAM) + "\n")
+        cfg = dict(TEAM)
+        if issue is not None:
+            cfg["milestone"], doc = milestone(number, issue, units)
+            (d / MILESTONE_DOC).write_text(doc)
+        team.write_text(json.dumps(cfg) + "\n")
         with open(d / ".git" / "info" / "exclude", "a") as f:
-            f.write("\n/.orchestration/team.json\n")
+            f.write(f"\n/.orchestration/team.json\n/{MILESTONE_DOC}\n")
     return str(d), default, base
 
 
@@ -1809,7 +1833,7 @@ def code_plan(key, entry, issue, state, since, ecc):
     save_state(state, since)        # a pass that dies mid-run leaves in-progress behind, which the next pass reports
     log(f"{key}: coding started, run {run_id}")
     try:
-        d, default, base = checkout(repo, worker, branch)
+        d, default, base = checkout(repo, worker, branch, number, issue, units)
         plan = str(Path(d).parent / f"{Path(d).name}.plan.json")
         Path(plan).write_text(json.dumps({"units": units}, indent=1) + "\n")
         cfg = ["--config", str(ecc_cfg), "--repo", d, "--target-branch", branch,
