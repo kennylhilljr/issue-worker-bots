@@ -575,7 +575,8 @@ class Approve(unittest.TestCase):
         iwb.prbot.openclaw_attention = lambda r, d: self.events.append(r)
         iwb.clone = lambda repo, bot: (tempfile.mkdtemp(dir=self.tmp.name), "main", "abc123")
         self.lint, self.red, self.verdicts, self.models, self.posts = [], None, [], [], []
-        iwb.lint_findings = lambda units, d, b: list(self.lint)
+        self.lint_fn = None                    # set to flag particular commands: called with the units linted
+        iwb.lint_findings = lambda units, d, b: self.lint_fn(units) if self.lint_fn else list(self.lint)
         iwb.red_check = lambda units, d: self.red or {u["id"]: {"runs": [{"command": "x", "exit": 1, "output": ""}],
                                                                 "red": True, "mechanical": False, "ok": True} for u in units}
 
@@ -651,6 +652,48 @@ class Approve(unittest.TestCase):
         self.assertEqual(self.models[1], ("claude", {"model": "opus", "effort": "high"}))
         saved = json.loads(Path(self.entry()["plan_file"]).read_text())["units"][0]
         self.assertIn("python3 -m pytest -q", saved["acceptance"]["commands"])
+
+    def saved_commands(self):
+        return json.loads(Path(self.entry()["plan_file"]).read_text())["units"][0]["acceptance"]["commands"]
+
+    def test_added_acceptance_is_filtered_per_command(self):
+        # regression: issue-worker-bots#38, an approver's added wrapper and missing-path commands went straight
+        # into the approved plan, which the orchestrator then refused at its gate
+        self.plan(code_unit(tier=2))
+        bad, lintbad, good = "bash -c :", "python3 -m unittest tests.missing", "python3 -m unittest tests.test_app"
+        self.lint_fn = lambda units: [f"lint acceptance.command_path_missing: fix: {lintbad}"] \
+            if any(lintbad in u["acceptance"]["commands"] for u in units) else []
+        self.verdicts = [{"verdict": "approve", "summary": "ok", "add_acceptance": {"fix": [bad, lintbad, good]}}]
+        self.run_pass()
+        self.assertEqual(self.saved_commands(), ["python3 -m unittest"])
+        self.assertEqual(self.entry()["approval"]["verdict"], "revise")
+        self.assertTrue(self.entry()["replan"])
+        self.assertEqual(self.entry()["review_revisions"], 1)
+        _, _, rest = self.posts[-1][2].partition("**Acceptance commands to add:**")
+        adds, _, gone = rest.partition("**Added acceptance commands dropped:**")
+        self.assertIn(good, adds)
+        self.assertNotIn(good, gone)
+        self.assertIn(f"`{bad}` — fix: acceptance command runs bash", gone)
+        self.assertIn(f"`{lintbad}` — lint acceptance.command_path_missing", gone)
+
+    def test_added_acceptance_refused_by_policy_is_dropped(self):
+        self.plan(code_unit(tier=2))
+        self.verdicts = [{"verdict": "approve", "summary": "ok", "add_acceptance": {"fix": ["git push origin main"]}}]
+        self.run_pass()
+        self.assertNotIn("git push origin main", self.saved_commands())
+        self.assertEqual(self.entry()["approval"]["verdict"], "revise")
+        self.assertIn("`git push origin main` — fix: acceptance command runs git push, which isn't allowed",
+                      self.posts[-1][2])
+
+    def test_valid_added_acceptance_is_merged_on_approve(self):
+        self.plan(code_unit(tier=2))
+        self.verdicts = [{"verdict": "approve", "summary": "ok",
+                          "add_acceptance": {"fix": ["python3 -m unittest tests.test_ok"]}}]
+        self.run_pass()
+        self.assertEqual(self.entry()["approval"]["verdict"], "approve")
+        self.assertIn("python3 -m unittest tests.test_ok", self.saved_commands())
+        self.assertNotIn("Acceptance commands to add:", self.posts[-1][2])
+        self.assertNotIn("dropped", self.posts[-1][2])
 
     def test_revise_once_then_block_and_reject_blocks(self):
         self.plan(code_unit())
