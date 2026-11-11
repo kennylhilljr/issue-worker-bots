@@ -1752,6 +1752,23 @@ class GateWrappers(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("needs a shell", problems[0])
 
+    def test_inline_code_may_hold_shell_characters(self):
+        # kennylhilljr/agent-control-plane-infra#23: the orchestrator skips the inline-code argument
+        cmds = ['python3 -B -c "import a; assert 1 < 2"', 'node -e "a;b"', "python3.13 -c 'print(1 | 2)'"]
+        saved = iwb.missing_program
+        iwb.missing_program = lambda c: None
+        try:
+            self.assertEqual(iwb.fixable_problems([unit(acceptance={"commands": cmds})]), [])
+        finally:
+            iwb.missing_program = saved
+
+    def test_shell_syntax_outside_inline_code_still_reported(self):
+        cmds = ["python3 -m unittest x; rm -rf y", "cat a | grep b", 'python3 -c "x" > out', "python3 t.py 'a;b'",
+                'python3 -c "x" "a\nb"', "python3 -m unittest 'unclosed"]
+        for c in cmds:
+            self.assertTrue(iwb.needs_shell(c), c)
+        self.assertFalse(iwb.needs_shell("perl -E 'say 1; say 2'"))
+
 
 def orchestrator_gate_policy():
     """The sibling orchestrator's gate command policy, or None when it isn't checked out."""
@@ -1780,6 +1797,15 @@ class GateWrappersMatchOrchestrator(unittest.TestCase):
     def test_orchestrator_refuses_what_iwb_sends_back(self):
         self.assertIsNotNone(GATE_RUNNER.check_command_policy(REAL_WRAPPER_CMDS[0].split()))
         self.assertIsNone(GATE_RUNNER.check_command_policy(REAL_WRAPPER_CMDS[1].split()))
+
+    def test_same_shell_syntax_rule(self):
+        self.assertEqual(iwb.SHELL_OPERATORS, GATE_RUNNER.SHELL_OPERATORS)
+        self.assertEqual(iwb.SHELL_METACHARS, GATE_RUNNER.METACHAR_SEQUENCES)
+        self.assertEqual(iwb.INLINE_CODE_FLAGS, GATE_RUNNER.INLINE_CODE_FLAGS)
+        import shlex
+        for c in ['python3 -B -c "import a; assert 1 < 2"', 'node -e "a;b"', "python3 -m unittest x; rm -rf y",
+                  "cat a | grep b", "python3 t.py 'a;b'", 'python3 -c "x" > out']:
+            self.assertEqual(iwb.needs_shell(c), GATE_RUNNER.check_command_policy(shlex.split(c)) is not None, c)
 
 
 @unittest.skipUnless(ORCH, "needs the sibling openclaw-ecc-orchestrator checkout and Python 3.11+")
