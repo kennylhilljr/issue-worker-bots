@@ -3565,6 +3565,14 @@ class AutoMerge(unittest.TestCase):
         self.assertEqual((self.ecc_calls, self.posts), ([], []))
         self.assertNotIn("repair", self.work())
 
+    def test_saying_there_are_no_p1_or_p2_findings_still_merges(self):
+        # the live reviews of ecc-customization#30 and issue-worker-bots#56 end like this
+        self.reviews = [review(HEAD, P3_FINDING + "\n\nNo P1 or P2 findings. The rest is correct.\n\n"
+                                     "Nothing here rises to P1 or P2.")]
+        self.run_pass()
+        self.assertEqual(len(self.merges()), 1)
+        self.assertEqual(self.labels(), ["bot:done"])
+
     def test_unseparable_blocking_review_goes_to_kenny(self):
         self.reviews = [review(HEAD, "| Priority | Where |\n| --- | --- |\n| P1 | src/parser.py |")]
         self.run_pass()
@@ -3596,6 +3604,12 @@ class ReviewFindings(unittest.TestCase):
         self.assertIn("Fix it.", found[2][1])
         self.assertNotIn("Observation", found[2][1])
         self.assertNotIn("Reviewed commit", found[2][1])
+
+    def test_stray_mentions(self):
+        self.assertFalse(iwb.stray_blocking("No P1 or P2 findings.\nNothing here rises to P0, P1 or P2.", []))
+        self.assertTrue(iwb.stray_blocking("Overall fine.\nP2: `a.py` drops errors.", []))
+        found = iwb.review_findings(P2_FINDING)
+        self.assertFalse(iwb.stray_blocking(P2_FINDING, found))
 
     def test_no_findings(self):
         self.assertEqual(iwb.review_findings(review(HEAD)["body"]), [])

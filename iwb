@@ -2069,6 +2069,7 @@ REVIEWED = re.compile(r"Reviewed commit `([0-9a-f]{7,40})`")    # prbot's review
 BLOCKING = re.compile(r"\bP[0-2]\b")                            # prbot counts P1 and P2; P0 is worse still
 FINDING_START = re.compile(r"^\s{0,3}(?:[-*+]|\d+[.)]|#{1,6})?\s*(?:\*\*|__)?\s*\[?(P[0-3])\b")
 FINDING_END = re.compile(r"^(?:#{1,6}\s|\s{0,3}(?:-{3,}|\*{3,})\s*$|\s*<sub>|[-*+]\s|\d+[.)]\s)")
+NEGATED = re.compile(r"\b(?:no|nothing|none|not|without|zero|neither|nor)\b[^.\n]*\bP[0-2]\b", re.I)
 CHECK_OK = ("success", "neutral", "skipped")
 
 
@@ -2088,6 +2089,14 @@ def review_findings(body):
         elif cur:
             cur[1].append(line)
     return [(p, "\n".join(lines).strip()) for p, lines in out]
+
+
+def stray_blocking(body, findings):
+    """Whether the review mentions P0-P2 outside its separated findings, other than to say there are none
+    ("No P1 or P2 findings", "Nothing here rises to P1 or P2"). Such a mention can't go into a repair round."""
+    inside = {line for _, text in findings for line in text.splitlines()}
+    return any(BLOCKING.search(NEGATED.sub("", line)) for line in (body or "").splitlines()
+               if line.strip() and line.strip() not in {x.strip() for x in inside})
 
 
 def pr_facts(repo, url):
@@ -2132,7 +2141,7 @@ def pr_gate(entry, facts, repo, worker_login, reviewer_login):
         return "wait", f"no review of the head commit `{sha[:10]}` by `{reviewer_login}` yet"
     findings = review_findings(review["body"])
     serious = [f for f in findings if f[0] != "P3"]
-    if serious or BLOCKING.search(review["body"]):
+    if serious or stray_blocking(review["body"], findings):
         if (w.get("repair") or {}).get("status") is not None:
             return "kenny", (f"the review of `{sha[:10]}` still has P0-P2 findings after the one repair round "
                              f"({review.get('url', '')})")
