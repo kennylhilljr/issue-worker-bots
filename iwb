@@ -935,6 +935,10 @@ Judge, reading code as needed and changing nothing:
 4. Are tiers and risks honest? Security, database, architecture, CI or data-loss risk needs tier 2.
 
 You may raise a unit's tier or add acceptance commands. You may never lower a tier or remove a command.
+An added acceptance command follows the planner's rules: no shell syntax (pipes, &&, ;, redirects, backticks,
+$( ); no wrappers (bash, sh, env, timeout, xargs and similar); no VAR=value prefix; only programs on the coding
+PATH; and every path it names must exist in the repository or be added by the unit's scope.files. A command that
+breaks these rules is dropped and the plan goes back to the planner for revision.
 Answer with one JSON object in a ```json fenced block and nothing after it:
 {{"verdict": "approve" | "revise" | "reject", "summary": "one paragraph",
   "changes": ["specific change the planner must make (revise only)"],
@@ -1159,6 +1163,41 @@ def apply_verdict(units, v):
     return units
 
 
+def filter_added_acceptance(units, v, repo, repo_dir, branch):
+    """Check each acceptance command the approver added against the plan gates, one at a time. The plan already
+    passed them, so a finding on a copy with one command added belongs to that command. Unit ids can't be used to
+    attribute findings, since every policy and fixable finding starts with one. Returns (kept, dropped): kept maps
+    unit ids to surviving commands, dropped lists (unit id, command, reason). Changes neither argument."""
+    def findings(amended):
+        return policy_violations(amended, repo) or fixable_problems(amended) or lint_findings(amended, repo_dir, branch)
+    by_id = {u["id"]: u for u in units}
+    kept, dropped, seen = {}, [], set()
+    for uid, cmds in v.get("add_acceptance", {}).items():
+        for c in cmds:
+            if (uid, c) in seen or uid in by_id and c in by_id[uid]["acceptance"]["commands"]:
+                continue
+            seen.add((uid, c))
+            if uid not in by_id:
+                dropped.append((uid, c, "no such unit"))
+                continue
+            amended = copy.deepcopy(units)
+            next(u for u in amended if u["id"] == uid)["acceptance"]["commands"].append(c)
+            found = findings(amended)
+            if found:
+                dropped.append((uid, c, found[0]))
+            else:
+                kept.setdefault(uid, []).append(c)
+    if kept:
+        amended = copy.deepcopy(units)
+        for u in amended:
+            u["acceptance"]["commands"].extend(kept.get(u["id"], []))
+        found = findings(amended)
+        if found:
+            dropped += [(uid, c, f"fails together: {found[0]}") for uid, cs in kept.items() for c in cs]
+            kept = {}
+    return kept, dropped
+
+
 def is_docs_unit(u):
     return all(DOC_FILE.search(f) and not re.search(r"(^|/)LICEN[CS]E", f, re.I) for f in u["scope"]["files"])
 
@@ -1188,15 +1227,20 @@ def plan_digest(units):
     return hashlib.sha256(json.dumps(units, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
 
-def approval_comment(v, approver_slug, model, red, units):
+def approval_comment(v, approver_slug, model, red, units, dropped=()):
     rows = "\n".join(f"| `{uid}` | {'yes' if r['red'] else 'no'}{' (mechanical)' if r['mechanical'] else ''} | "
                      f"{', '.join(str(x['exit']) for x in r['runs'])} |" for uid, r in red.items())
     head = {"approve": "Plan approved", "revise": "Plan needs changes", "reject": "Plan rejected"}[v["verdict"]]
     changes = "".join(f"\n- {c}" for c in v.get("changes", []))
     raised = ", ".join(f"`{k}` to tier {t}" for k, t in v.get("raise_tiers", {}).items())
+    adds = "".join(f"\n- `{uid}`: `{c}`" for uid, cs in v.get("add_acceptance", {}).items() for c in cs) \
+        if v["verdict"] != "approve" else ""
+    gone = "".join(f"\n- `{uid}`: `{c}` — {why}" for uid, c, why in dropped)
     return (f"{P_MARKER}\n### {head} by `{approver_slug}`\n\n_Review by `{model}`, a different model family "
             f"from the planner._\n\n{v['summary']}\n" + (f"\n**Changes needed:**{changes}\n" if changes else "")
             + (f"\nTiers raised: {raised}.\n" if raised else "")
+            + (f"\n**Acceptance commands to add:**{adds}\n" if adds else "")
+            + (f"\n**Added acceptance commands dropped:**{gone}\n" if gone else "")
             + f"\n| Unit | Fails before the change | Exit codes |\n| --- | --- | --- |\n{rows}\n")
 
 
@@ -1346,6 +1390,13 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo_filter=None)
                      f"# Red check\n```json\n{json.dumps(red, indent=1)}\n```\n")
             prompt = APPROVAL_PROMPT.format(url=issue["url"], repo=repo, branch=branch, sha=sha[:10])
             v = parse_verdict(run_model(approver_agent, prompt, stdin, f"{work}/repo", model=model))
+            kept, dropped = filter_added_acceptance(units, v, repo, f"{work}/repo", branch)
+            v = {**v, "add_acceptance": kept}
+            if dropped:                        # a bad added command sends the plan back, never into it
+                v = {**v, "verdict": "revise" if v["verdict"] == "approve" else v["verdict"],
+                     "changes": list(v.get("changes", [])) + [
+                         f"Unit {uid}: added acceptance {c!r} dropped ({why}); replace it with one that meets the "
+                         f"orchestrator's rules" for uid, c, why in dropped]}
         except (RuntimeError, subprocess.SubprocessError, SystemExit, ValueError) as e:
             entry["approval_failed_at"] = time.time()
             mark(key, "failed", f"approval could not finish; will retry: {e}")
@@ -1357,7 +1408,7 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo_filter=None)
         if v["verdict"] == "approve" and not_red:
             v = {**v, "verdict": "revise", "changes": [f"Unit {uid}: its acceptance commands already pass on the "
                                                        f"unchanged code, so they can't show the change works." for uid in not_red]}
-        body = approval_comment(v, slug, model["model"], red, units)
+        body = approval_comment(v, slug, model["model"], red, units, dropped)
         if dry_run:
             log(f"{key}: would post ({v['verdict']}):\n{body}")
             continue
