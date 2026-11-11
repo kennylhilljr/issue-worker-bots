@@ -954,7 +954,30 @@ def policy_violations(units, repo):
     return out
 
 
-SHELL_SYNTAX = re.compile(r"\||&&|;|>|<|\$\(|`|\n")
+# The orchestrator's gate runs commands without a shell and refuses shell operator words and shell characters
+# in any argument except an interpreter's inline code (SHELL_OPERATORS, METACHAR_SEQUENCES and INLINE_CODE_FLAGS
+# in openclaw_ecc_orchestrator/gates/runner.py), so `python3 -c "import a; a.f()"` runs as written.
+SHELL_OPERATORS = {"&&", "||", "|", ";", ";;", "&", ">", ">>", "<", "<<", "2>", "2>&1", "&>", "|&"}
+SHELL_METACHARS = ("&&", "||", ";", "|", "`", "$(", "${", ">", "<", "\n", "\r")
+INLINE_CODE_FLAGS = {"python": {"-c"}, "pypy": {"-c"}, "node": {"-e", "--eval", "-p", "--print"},
+                     "ruby": {"-e"}, "perl": {"-e", "-E"}}
+
+
+def needs_shell(cmd):
+    """Whether the orchestrator's gate would refuse `cmd` for shell syntax. A command shlex can't split needs a
+    shell too."""
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        return True
+    if not words:
+        return False
+    if any(w in SHELL_OPERATORS for w in words):
+        return True
+    prog = re.sub(r"[-_]?\d[\d.]*$", "", os.path.basename(words[0]).lower()) or words[0]
+    flags = INLINE_CODE_FLAGS.get(prog, set())
+    code = {i + 1 for i, w in enumerate(words[:-1]) if i > 0 and w in flags}
+    return any(seq in w for i, w in enumerate(words) if i not in code for seq in SHELL_METACHARS)
 # Programs the orchestrator's gate runner refuses as shells or command wrappers (WRAPPERS in
 # openclaw_ecc_orchestrator/gates/runner.py). iwb passes it no allow_wrappers, so each is refused at the gate.
 GATE_WRAPPERS = {
@@ -1004,11 +1027,11 @@ def fixable_problems(units):
     plan back for revision instead of blocking the issue."""
     cmds = [(u, c) for u in units for c in u["acceptance"]["commands"]]
     return [f"{u['id']}: acceptance command needs a shell, which the orchestrator doesn't use: {c[:100]}"
-            for u, c in cmds if SHELL_SYNTAX.search(c)] \
+            for u, c in cmds if needs_shell(c)] \
         + [f"{u['id']}: acceptance command {gate_refusal(c)}: {c[:100]}"
-           for u, c in cmds if not SHELL_SYNTAX.search(c) and gate_refusal(c)] \
+           for u, c in cmds if not needs_shell(c) and gate_refusal(c)] \
         + [f"{u['id']}: acceptance command {missing_program(c)}: {c[:100]}"
-           for u, c in cmds if not SHELL_SYNTAX.search(c) and missing_program(c)] \
+           for u, c in cmds if not needs_shell(c) and missing_program(c)] \
         + [cost_problem(u) for u in units if cost_problem(u)]
 
 
