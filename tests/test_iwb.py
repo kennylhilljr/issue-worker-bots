@@ -4,7 +4,6 @@ from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 os.environ["PRBOT_PATH"] = str(ROOT / "tests" / "prbot_stub.py")   # no ../pr-review-bots needed
@@ -1151,6 +1150,17 @@ class TestCommandReply(unittest.TestCase):
         language, so bot/19-add-password-validation-abc123 and similar branches stay named."""
         for branch in ["bot/19-add-password-validation-abc123", "bot/19-rotate-api-key-storage-abc123",
                        "bot/19-refresh-token-expiry-handling-abc123", "bot/19-skip-secret-scanning-abc123"]:
+            for status, phrase in [("pushed", "branch is pushed"), ("in-progress", "coding is running"),
+                                   ("stopped", "nothing was pushed")]:
+                with self.subTest(branch=branch, status=status):
+                    self.check(self.entry(work={"status": status, "branch": branch}), [phrase, branch],
+                               "next pass")
+
+    def test_long_ordinary_titles_keep_the_branch(self):
+        """test_long_ordinary_titles_keep_the_branch: a 28-letter word and a title slug of 20 one-letter words
+        (the most slugify's 40 characters allow) still give a named branch."""
+        twenty = iwb.slugify(" ".join("abcdefghijklmnopqrst"))
+        for branch in ["bot/19-antidisestablishmentarianism-abc123", f"bot/19-{twenty}-abc123"]:
             for status, phrase in [("pushed", "branch is pushed"), ("in-progress", "coding is running"),
                                    ("stopped", "nothing was pushed")]:
                 with self.subTest(branch=branch, status=status):

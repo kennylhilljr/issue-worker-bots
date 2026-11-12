@@ -721,15 +721,16 @@ def command_of(body, worker_slugs):
 
 
 SAFE_STATUS = re.compile(r"[a-z][a-z0-9-]{0,23}")
-BRANCH_SHAPE = re.compile(r"bot/\d{1,9}(?:-[a-z0-9]+){1,20}")    # what cmd_work builds: bot/<n>-<slugify(title)>-<hash>
+BRANCH_SHAPE = re.compile(r"bot/\d{1,9}(?:-[a-z0-9]+){1,24}")    # what cmd_work builds: bot/<n>-<slugify(title)>-<hash>
 TOKEN_HEAD = re.compile(r"gh[pousr]-|github-pat-|sk-|xox[abpr]-|akia|eyj")
 
 
 def random_word(w):
-    """A word that reads like generated secret material rather than language: 24 characters or more, or 16 or
-    more that switch between letters and digits three or more times or hold five consonants in a row. Long words
-    such as internationalization or base64urlencoding stay readable."""
-    if len(w) >= 24:
+    """A word that reads like generated secret material rather than language: 32 characters or more (longer than
+    ordinary words), 24 or more that hold a digit, or 16 or more that switch between letters and digits three or
+    more times or hold five consonants in a row. Long words such as internationalization,
+    antidisestablishmentarianism or base64urlencoding stay readable."""
+    if len(w) >= 32 or len(w) >= 24 and re.search(r"\d", w):
         return True
     if len(w) < 16:
         return False
