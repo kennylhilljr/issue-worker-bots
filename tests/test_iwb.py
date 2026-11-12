@@ -726,9 +726,49 @@ class Analyze(unittest.TestCase):
         self.comments = [{"user": OWNER, "body": "resume", "at": self.later()}]
         self.run_pass()
         self.assertEqual(len(self.prompts), 1)              # no second analysis
-        self.assertIn("coding (build step 4) isn't running yet", self.comments_posted()[0])
+        self.assertIn("approval is switched off", self.comments_posted()[0])
+        self.assertNotIn("running yet", self.comments_posted()[0])
         self.run_pass()
         self.assertEqual(len(self.comments_posted()), 1)    # answered once
+
+    def status_comment(self):
+        self.comments = [{"user": OWNER, "body": "status", "at": self.later()}]
+
+    def test_blocked_entry_gets_no_posted_reply_to_status(self):
+        """test_blocked_entry_gets_no_posted_reply_to_status: a blocked issue still labelled bot:blocked is
+        skipped before any command is answered."""
+        self.plan_first()
+        state = json.loads(iwb.STATE.read_text())
+        state[self.KEY]["blocked"] = True
+        iwb.STATE.write_text(json.dumps(state))
+        self.issue["labels"] = ["bot:blocked"]
+        self.status_comment()
+        with mock.patch.object(iwb, "command_reply", wraps=iwb.command_reply) as cr:
+            self.run_pass()
+        cr.assert_not_called()
+        self.assertEqual(self.comments_posted(), [])
+        self.assertEqual(len(self.prompts), 1)
+        self.assertIs(self.state()["blocked"], True)
+
+    def test_paused_entry_gets_no_reply_to_status(self):
+        """test_paused_entry_gets_no_reply_to_status: a paused config answers no commands."""
+        self.plan_first()
+        iwb.CONFIG.write_text(json.dumps({"paused": True}))
+        self.status_comment()
+        with mock.patch.object(iwb, "command_reply", wraps=iwb.command_reply) as cr:
+            self.run_pass()
+        cr.assert_not_called()
+        self.assertEqual(self.comments_posted(), [])
+
+    def test_status_after_plan_gets_one_reply(self):
+        """test_status_after_plan_gets_one_reply: the control for the blocked and paused cases."""
+        self.plan_first()
+        self.status_comment()
+        with mock.patch.object(iwb, "command_reply", wraps=iwb.command_reply) as cr:
+            self.run_pass()
+        self.assertEqual(cr.call_count, 1)
+        self.assertEqual(len(self.comments_posted()), 1)
+        self.assertNotIn("running yet", self.comments_posted()[0])
 
     def test_feedback_after_a_plan_revises_it(self):
         self.plan_first()
@@ -941,6 +981,312 @@ class Analyze(unittest.TestCase):
         self.assertIn("would post (bot:planned)", log)
         self.assertEqual(self.posts, [])
         self.assertNotIn("analysis", self.state())
+
+
+class TestCommandReply(unittest.TestCase):
+    """command_reply says where a planned issue really stands, in at most two sentences, without free text."""
+    REPO = "kennylhilljr/demo"
+    CMDS = ("status", "proceed")
+    PR = "https://github.com/o/r/pull/1"
+    APPROVED = {"verdict": "approve", "at": 1, "approver": "kenny"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved_config = iwb.CONFIG
+        iwb.CONFIG = Path(self.tmp.name) / "config.json"
+        self.config({})
+
+    def tearDown(self):
+        iwb.CONFIG = self.saved_config
+        self.tmp.cleanup()
+
+    def config(self, conf):
+        iwb.CONFIG.write_text(json.dumps(conf))
+
+    def entry(self, **keys):
+        return {"analysis": {"decision": "plan", "model": "opus", "at": 0}, **keys}
+
+    def replies(self, entry):
+        return [iwb.command_reply(cmd, entry, "claude-dev-gh", self.REPO) for cmd in self.CMDS]
+
+    def check(self, entry, present, absent):
+        for reply in self.replies(entry):
+            for text in [present] if isinstance(present, str) else present:
+                self.assertIn(text, reply)
+            for text in [absent, "next pass", "running yet"] if isinstance(absent, str) else \
+                    [*absent, "next pass", "running yet"]:
+                self.assertNotIn(text, reply)
+
+    STOPPED = {"status": "stopped", "branch": "bot/1-x-abc123",
+               "stopped": "product_rejected. milestone_complete: product_rejected", "problem": "free. text! here?"}
+
+    def fixtures(self):
+        """Every (config, entry) pair the branch tests use."""
+        a = self.APPROVED
+        return [
+            ({}, self.entry(stale_plan={"at": 1, "reason": "edited"}, work={"status": "pr-open", "pr": self.PR})),
+            ({}, self.entry(work={"status": "pr-open", "pr": self.PR})),
+            ({}, self.entry(work={"status": "merged", "pr": self.PR})),
+            ({}, self.entry(work={"status": "pr-closed", "pr": self.PR})),
+            ({}, self.entry(work={"status": "needs-kenny", "pr": self.PR})),
+            ({}, self.entry(work={"status": "needs-kenny", "comment": "https://github.com/o/r/issues/1#issuecomment-1"})),
+            ({}, self.entry(work={"status": "pushed", "branch": "bot/19-x"})),
+            ({}, self.entry(work={"status": "in-progress", "branch": "bot/19-x"})),
+            ({}, self.entry(work=dict(self.STOPPED))),
+            ({}, self.entry(work={**self.STOPPED, "pr": "https://github.com/o/r/pull/7"})),
+            ({}, self.entry(work={"status": "quota", "problem": "some long sentence. with periods."})),
+            ({}, self.entry(work={"status": "approved"})),
+            ({}, self.entry(work={"status": "mystery"})),
+            ({}, self.entry(work={"status": "done!"}, approval=a)),
+            ({}, self.entry(approval={**a, "verdict": "reject"})),
+            ({}, self.entry(approval={**a, "verdict": "revise"})),
+            ({}, self.entry(approval=a)),
+            ({"coding_live": True, "coding_repos": [self.REPO]}, self.entry(approval=a)),
+            ({}, self.entry()),
+            ({"approval_live": True}, self.entry()),
+            ({"approval_live": True}, {"analysis": {"decision": "plan", "model": "opus", "at": 100},
+                                       "approval": {**a, "at": 50}}),
+        ]
+
+    def test_a_stale_plan(self):
+        """test_a_stale_plan: a changed issue says a new analysis is coming, whatever the work record says."""
+        self.check(self.entry(stale_plan={"at": 1, "reason": "edited"}, work={"status": "pr-open", "pr": self.PR}),
+                   "new analysis", "pull request is open")
+
+    def test_b_pr_open(self):
+        """test_b_pr_open: an open pull request is named with its URL."""
+        self.check(self.entry(work={"status": "pr-open", "pr": self.PR}), ["pull request is open", self.PR],
+                   "pull request was merged")
+
+    def test_c_merged(self):
+        """test_c_merged: a merged pull request is named with its URL."""
+        self.check(self.entry(work={"status": "merged", "pr": self.PR}), ["pull request was merged", self.PR],
+                   "pull request is open")
+
+    def test_d_pr_closed(self):
+        """test_d_pr_closed: a pull request closed unmerged is named with its URL."""
+        self.check(self.entry(work={"status": "pr-closed", "pr": self.PR}), ["closed without merging", self.PR],
+                   "pull request was merged")
+
+    def test_e_needs_kenny(self):
+        """test_e_needs_kenny: links the pull request, or the comment when there is no pull request."""
+        self.check(self.entry(work={"status": "needs-kenny", "pr": self.PR}), ["waiting for Kenny", self.PR],
+                   "pull request is open")
+        url = "https://github.com/o/r/issues/1#issuecomment-1"
+        self.check(self.entry(work={"status": "needs-kenny", "comment": url}), ["waiting for Kenny", url],
+                   "pull request is open")
+
+    def test_f_pushed(self):
+        """test_f_pushed: a pushed branch is named while the pull request is opened."""
+        self.check(self.entry(work={"status": "pushed", "branch": "bot/19-x"}), ["branch is pushed", "bot/19-x"],
+                   "coding is running")
+
+    def test_g_in_progress(self):
+        """test_g_in_progress: running coding names its branch."""
+        self.check(self.entry(work={"status": "in-progress", "branch": "bot/19-x"}),
+                   ["coding is running", "bot/19-x"], "branch is pushed")
+
+    def test_stopped_names_branch(self):
+        """test_stopped_names_branch: a stopped run names its branch and echoes none of its free text."""
+        self.check(self.entry(work=dict(self.STOPPED)), ["bot/1-x-abc123", "Coding stopped"],
+                   ["product_rejected", "free. text", "pull request is open"])
+
+    def test_stopped_prefers_pr(self):
+        """test_stopped_prefers_pr: a stopped run with a pull request names the pull request, not the branch."""
+        pr = "https://github.com/o/r/pull/7"
+        self.check(self.entry(work={**self.STOPPED, "pr": pr}), [pr, "Coding stopped"],
+                   ["bot/1-x-abc123", "product_rejected", "free. text", "pull request is open"])
+
+    def test_token_shaped_branch_is_not_echoed(self):
+        """test_token_shaped_branch_is_not_echoed: security review of attempt 1 found that an issue titled with an
+        sk- key reached the comment through the branch name in pushed, in-progress and stopped replies."""
+        for title in ["sk-" + "a" * 16, "sk-abc-def-ghi-jkl-mno", "ghp_" + "A" * 36, "x " + "a" * 40]:
+            branch = f"bot/1-{iwb.slugify(title)}-abc123"
+            word = iwb.slugify(title).split("-")[-1]
+            for status, phrase in [("pushed", "branch is pushed"), ("in-progress", "coding is running"),
+                                   ("stopped", "Coding stopped")]:
+                with self.subTest(title=title, status=status):
+                    self.check(self.entry(work={"status": status, "branch": branch}), phrase,
+                               [branch, word, "sk-"])
+
+    def test_real_shaped_long_branch_is_still_named(self):
+        """test_real_shaped_long_branch_is_still_named: a branch made from an ordinary long title stays visible."""
+        branch = f"bot/19-{iwb.slugify('Status and proceed replies describe where the issue stands')}-abc123"
+        self.check(self.entry(work={"status": "in-progress", "branch": branch}), ["coding is running", branch],
+                   "branch is pushed")
+
+    def test_long_word_branch_is_still_named(self):
+        """test_long_word_branch_is_still_named: PR review of attempt 2 found that bot/19-internationalization-abc123
+        was hidden because one word was 16 characters or more, so pushed, in-progress and stopped lost the branch."""
+        branch = "bot/19-internationalization-abc123"
+        for status, phrase in [("pushed", "branch is pushed"), ("in-progress", "coding is running"),
+                               ("stopped", "nothing was pushed")]:
+            with self.subTest(status=status):
+                self.check(self.entry(work={"status": status, "branch": branch}), [phrase, branch], "next pass")
+
+    def test_mixed_token_word_branch_is_not_echoed(self):
+        """test_mixed_token_word_branch_is_not_echoed: a ghp_ token in a title loses its underscore in slugify, so
+        the remaining word of letters and digits is what keeps it out of the comment."""
+        word = "a1b2c3d4e5f6g7h8i9j0k1"
+        branch = f"bot/1-{iwb.slugify('ghp_' + word)}-abc123"
+        for status, phrase in [("pushed", "branch is pushed"), ("in-progress", "coding is running"),
+                               ("stopped", "Coding stopped")]:
+            with self.subTest(status=status):
+                self.check(self.entry(work={"status": status, "branch": branch}), phrase, [branch, word])
+
+    def test_digit_word_branch_is_still_named(self):
+        """test_digit_word_branch_is_still_named: PR review of attempt 3 found that bot/19-base64urlencoding-abc123
+        was hidden because a long word mixed letters and digits, so pushed, in-progress and stopped lost the
+        branch."""
+        for branch in ["bot/19-base64urlencoding-abc123", "bot/19-add-sha256checksum-field-abc123"]:
+            for status, phrase in [("pushed", "branch is pushed"), ("in-progress", "coding is running"),
+                                   ("stopped", "nothing was pushed")]:
+                with self.subTest(branch=branch, status=status):
+                    self.check(self.entry(work={"status": status, "branch": branch}), [phrase, branch],
+                               "next pass")
+
+    def test_ordinary_credential_words_keep_the_branch(self):
+        """test_ordinary_credential_words_keep_the_branch: a title about passwords, tokens or keys is ordinary
+        language, so bot/19-add-password-validation-abc123 and similar branches stay named."""
+        for branch in ["bot/19-add-password-validation-abc123", "bot/19-rotate-api-key-storage-abc123",
+                       "bot/19-refresh-token-expiry-handling-abc123", "bot/19-skip-secret-scanning-abc123"]:
+            for status, phrase in [("pushed", "branch is pushed"), ("in-progress", "coding is running"),
+                                   ("stopped", "nothing was pushed")]:
+                with self.subTest(branch=branch, status=status):
+                    self.check(self.entry(work={"status": status, "branch": branch}), [phrase, branch],
+                               "next pass")
+
+    def test_long_ordinary_titles_keep_the_branch(self):
+        """test_long_ordinary_titles_keep_the_branch: a 28-letter word, a word with five consonants in a row and a
+        title slug of 20 one-letter words (the most slugify's 40 characters allow) still give a named branch."""
+        twenty = iwb.slugify(" ".join("abcdefghijklmnopqrst"))
+        for branch in ["bot/19-antidisestablishmentarianism-abc123", "bot/19-strengthlessness-abc123",
+                       f"bot/19-{twenty}-abc123"]:
+            for status, phrase in [("pushed", "branch is pushed"), ("in-progress", "coding is running"),
+                                   ("stopped", "nothing was pushed")]:
+                with self.subTest(branch=branch, status=status):
+                    self.check(self.entry(work={"status": status, "branch": branch}), [phrase, branch],
+                               "next pass")
+
+    def test_branch_outside_iwb_shape_is_not_echoed(self):
+        """test_branch_outside_iwb_shape_is_not_echoed: a branch value that iwb would not build (spaces,
+        backticks, sentence punctuation, another prefix, not a string) is left out of the reply."""
+        for branch in ["bot/19-x` and more. text", "feature/x", "bot/19-Upper-abc123", "bot/19-x. Next pass!",
+                       "bot/19-" + "-".join(["word"] * 30), 7]:
+            for status, phrase in [("pushed", "branch is pushed"), ("in-progress", "coding is running"),
+                                   ("stopped", "Coding stopped")]:
+                with self.subTest(branch=branch, status=status):
+                    absent = ["`bot/", "feature/x"] if not isinstance(branch, str) else [branch, "`bot/"]
+                    self.check(self.entry(work={"status": status, "branch": branch}), phrase, absent)
+                    for reply in self.replies(self.entry(work={"status": status, "branch": branch})):
+                        self.assertLessEqual(len(re.findall(r"[.!?](?=\s|$)", reply)), 2, reply)
+
+    def test_i_quota(self):
+        """test_i_quota: a run waiting on the usage limit says so and does not echo its problem text."""
+        self.check(self.entry(work={"status": "quota", "problem": "some long sentence. with periods."}),
+                   "Coding is waiting for the coding model's usage limit to reset.",
+                   ["some long sentence", "Coding stopped"])
+
+    def test_j_approved_queued(self):
+        """test_j_approved_queued: an approved work record is queued for coding."""
+        self.check(self.entry(work={"status": "approved"}), "The plan is approved and queued for coding.",
+                   "coding is running")
+
+    def test_k_unknown_status(self):
+        """test_k_unknown_status: a short slug status nobody handles is named as it is."""
+        for status in ("mystery", "waiting-review"):
+            self.check(self.entry(work={"status": status}), f"Coding status is `{status}`.",
+                       "waiting for an approver")
+
+    def test_k_unsafe_status_is_not_echoed(self):
+        """test_k_unsafe_status_is_not_echoed: a status that could carry text or a token is never posted,
+        and an approval on file does not make it look queued."""
+        self.config({"approval_live": True, "coding_live": True, "coding_repos": [self.REPO]})
+        for status in ["waiting/review", "pending review", "done!", "mystery. next pass!", "ghp_" + "A" * 16,
+                       "sk-" + "a" * 16, "a" * 40]:
+            for reply in self.replies(self.entry(work={"status": status}, approval=self.APPROVED)):
+                self.assertIn("Coding status is not one iwb recognizes.", reply)
+                self.assertNotIn(status, reply)
+                self.assertNotIn("queued for coding", reply)
+                self.assertNotIn("waiting for an approver", reply)
+                self.assertNotIn("next pass", reply)
+                self.assertLessEqual(len(re.findall(r"[.!?](?=\s|$)", reply)), 2, reply)
+
+    def test_k_non_string_status_falls_through(self):
+        """test_k_non_string_status_falls_through: a status that is not a non-empty string is ignored."""
+        self.config({"approval_live": True})
+        for status in (7, ""):
+            self.check(self.entry(work={"status": status}), "waiting for an approver", "Coding status")
+
+    def test_l_rejected(self):
+        """test_l_rejected: a rejected plan names who rejected it."""
+        self.check(self.entry(approval={**self.APPROVED, "verdict": "reject"}), ["rejected", "kenny"],
+                   ["needs revision", "queued for coding"])
+
+    def test_m_revise(self):
+        """test_m_revise: a plan sent back names who asked for revision."""
+        self.check(self.entry(approval={**self.APPROVED, "verdict": "revise"}), ["needs revision", "kenny"],
+                   ["rejected", "queued for coding"])
+
+    def test_n_approved_coding_off(self):
+        """test_n_approved_coding_off: an approved plan in a repository without live coding says coding is off."""
+        self.check(self.entry(approval=self.APPROVED), ["coding is switched off", "kenny"], "queued for coding")
+        self.config({"coding_live": True})       # live, but this repository is not listed
+        self.check(self.entry(approval=self.APPROVED), ["coding is switched off", "kenny"], "queued for coding")
+        self.config({"coding_live": True, "coding_repos": [self.REPO]})
+        reply = iwb.command_reply("proceed", self.entry(approval=self.APPROVED), "claude-dev-gh")
+        self.assertIn("coding is switched off", reply)   # no repository given: not assumed live
+
+    def test_o_approved_queued(self):
+        """test_o_approved_queued: an approved plan where coding is live is queued for coding."""
+        self.config({"coding_live": True, "coding_repos": [self.REPO]})
+        self.check(self.entry(approval=self.APPROVED), ["The plan is approved by `kenny` and queued for coding.",
+                                                        "kenny"], "coding is switched off")
+
+    def test_p_approval_off(self):
+        """test_p_approval_off: with no verdict and approval off, the plan is ready but nothing approves it."""
+        self.check(self.entry(), "approval is switched off", "waiting for an approver")
+
+    def test_q_waiting_for_approver(self):
+        """test_q_waiting_for_approver: with approval live and no verdict, the plan waits for an approver."""
+        self.config({"approval_live": True})
+        self.check(self.entry(), "waiting for an approver", "approval is switched off")
+
+    def test_stale_approval_is_ignored(self):
+        """test_stale_approval_is_ignored: an approval older than the current analysis counts as no verdict."""
+        self.config({"approval_live": True})
+        entry = {"analysis": {"decision": "plan", "model": "opus", "at": 100},
+                 "approval": {"verdict": "approve", "at": 50, "approver": "kenny"}}
+        self.check(entry, "waiting for an approver", ["queued for coding", "coding is switched off", "kenny"])
+
+    def test_status_reply_is_at_most_two_sentences(self):
+        """test_status_reply_is_at_most_two_sentences: the preamble plus one state sentence, for every fixture."""
+        for conf, entry in self.fixtures():
+            self.config(conf)
+            reply = iwb.command_reply("status", entry, "claude-dev-gh", self.REPO)
+            self.assertTrue(reply.startswith("Status: last analysis was a **plan** by `opus` at "), reply)
+            self.assertLessEqual(len(re.findall(r"[.!?](?=\s|$)", reply)), 2, reply)
+
+    def test_no_reply_says_running_yet_when_coding_is_on(self):
+        """test_no_reply_says_running_yet_when_coding_is_on: no fixture produces the old step-4 wording."""
+        self.config({"coding_live": True, "coding_repos": [self.REPO], "approval_live": True})
+        for _, entry in self.fixtures():
+            for reply in self.replies(entry):
+                self.assertNotIn("running yet", reply)
+                self.assertNotIn("next pass", reply)
+
+    def test_non_plan_replies_are_unchanged(self):
+        """test_non_plan_replies_are_unchanged: stop, questions and no-plan keep their wording; status without a
+        plan is only the preamble."""
+        q = {"analysis": {"decision": "questions", "model": "opus", "at": 0}}
+        self.assertEqual(iwb.command_reply("stop", self.entry(), "claude-dev-gh", self.REPO),
+                         "Stopped. Nothing more will happen on this issue until `bot:stop` is removed.")
+        self.assertTrue(iwb.command_reply("proceed", q, "claude-dev-gh", self.REPO).startswith(
+            "I still need answers to the questions above"))
+        self.assertTrue(iwb.command_reply("proceed", {}, "claude-dev-gh").startswith(
+            "There's no code change planned here."))
+        self.assertEqual(iwb.command_reply("status", q, "claude-dev-gh", self.REPO),
+                         "Status: last analysis was a **questions** by `opus` at 1970-01-01 00:00 UTC.")
 
 
 class RedCheckReview(unittest.TestCase):

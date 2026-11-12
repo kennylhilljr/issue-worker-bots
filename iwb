@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""iwb: issue worker bots. Step 2 of DESIGN.md: intake only.
+"""iwb: issue worker bots. Intake and analysis of issues, then approval and coding when switched on (DESIGN.md).
 
   iwb tick                  what launchd runs: intake, then analyze, then approve and code when switched on
   iwb tick --from-queue DIR
@@ -40,7 +40,8 @@
   iwb intake [--dry-run] [--baseline] [--limit N]
       One pass over open issues on every repository the worker bots are installed on. An issue
       qualifies when the owner opened it, or the owner added the bot:work label. The chosen worker
-      bot comments once and adds bot:queued. Nothing else happens yet; analysis is step 3.
+      bot comments once and adds bot:queued. The same iwb tick then runs analysis, and approval and
+      coding when switched on.
       --dry-run   print what would be picked up; post and save nothing
       --baseline  mark the issues open right now as seen, without commenting
       --limit N   pick up at most N issues per pass (default 5)
@@ -283,7 +284,6 @@ def pick_up(repo, issue, agent, reason):
     slug = prbot.bot_config(bot)["slug"]
     body = (f"{MARKER}\nPicked up by `{slug}` ({reason}). Queued for analysis.\n\n"
             f"Analysis runs within a few minutes and posts a plan, questions, or a no-code answer here. "
-            f"Coding isn't running yet. "
             f"Add `bot:skip` to opt out, or `agent:claude` / `agent:codex` to choose the worker.")
     name, color, desc = QUEUED
     run_gh_as(bot, repo, ["label", "create", name, "-R", repo, "--color", color, "--description", desc, "--force"])
@@ -637,8 +637,8 @@ def plan_comment(a, slug, model):
     return (f"{A_MARKER}\n### Plan from `{slug}`\n\n_Analysis by `{model}`._\n\n{a['summary']}\n\n"
             f"| Unit | What | Tier | Risk | Files | Done when |\n| --- | --- | --- | --- | --- | --- |\n{rows}\n\n"
             f"<details><summary>Full plan (orchestrator format)</summary>\n\n```json\n{plan}\n```\n</details>\n\n"
-            f"Coding isn't running yet (build step 4), so the plan waits here. Comment to change it, "
-            f"or add `bot:skip` to stop.")
+            f"Coding starts once the plan is approved and coding is switched on for this repository. "
+            f"Comment to change it, or add `bot:skip` to stop.")
 
 
 def questions_comment(a, slug, model):
@@ -720,18 +720,116 @@ def command_of(body, worker_slugs):
     return COMMANDS.get(t)
 
 
-def command_reply(cmd, entry, slug):
+SAFE_STATUS = re.compile(r"[a-z][a-z0-9-]{0,23}")
+BRANCH_SHAPE = re.compile(r"bot/\d{1,9}(?:-[a-z0-9]+){1,24}")    # what cmd_work builds: bot/<n>-<slugify(title)>-<hash>
+TOKEN_HEAD = re.compile(r"gh[pousr]-|github-pat-|sk-|xox[abpr]-|akia|eyj")
+
+
+def random_word(w):
+    """A word that reads like generated secret material rather than language: 32 characters or more (longer than
+    ordinary words), 24 or more that hold a digit, or 16 or more that switch between letters and digits three or
+    more times. Letters alone are never judged by their spelling, so long words such as internationalization,
+    strengthlessness, antidisestablishmentarianism or base64urlencoding stay readable."""
+    if len(w) >= 32 or len(w) >= 24 and re.search(r"\d", w):
+        return True
+    if len(w) < 16:
+        return False
+    return len(re.findall(r"(?<=[a-z])(?=\d)|(?<=\d)(?=[a-z])", w)) >= 3
+
+
+def safe_branch(branch):
+    """The branch name when a reply may show it, else None.
+
+    Only iwb's own shape passes: bot/<number> then lowercase words joined by hyphens (slugify output), so the
+    name can't carry spaces, backticks or sentence punctuation into the comment. The words come from the
+    issue title, which is already public, and cmd_work already posted this exact name ("Coding started on ...").
+    The check therefore keeps out only what looks like a credential: a known token prefix at a word start once
+    slugify has turned "_" into "-" (ghp-, github-pat-, sk-, xoxb-, akia, eyj) followed by 10 or more further
+    characters, or a word that looks random (random_word). It does not judge ordinary words, so a title such
+    as "add password validation" keeps its branch. TOKENISH's 32-character rule is not used because it matches
+    nearly every real branch."""
+    if not isinstance(branch, str) or len(branch) > 80 or not BRANCH_SHAPE.fullmatch(branch):
+        return None
+    words = branch[4:].split("-")
+    if any(random_word(w) for w in words):
+        return None
+    for i in range(len(words)):
+        rest = "-".join(words[i:])
+        m = TOKEN_HEAD.match(rest)
+        if m and len(re.sub(r"-", "", rest[m.end():])) >= 10:
+            return None
+    return branch
+
+
+def command_reply(cmd, entry, slug, repo=None):
+    """The public answer to a short command. Where a plan exists, one sentence says where the issue stands.
+    That sentence uses fixed text plus only the approver, model, PR and comment URL fields, the branch only when
+    safe_branch passes it, and a work status only when it is a short slug that does not look like a token: free
+    text such as work["problem"] or work["stopped"] never reaches the comment."""
     a = entry.get("analysis") or {}
+
+    def plan_state():
+        work = entry.get("work") or {}
+        status = work.get("status")
+        branch, pr, comment_url = safe_branch(work.get("branch")), work.get("pr"), work.get("comment")
+        approval = entry.get("approval") or {}
+        verdict = approval.get("verdict") if approval.get("at", 0) >= a.get("at", 0) else None
+        approver = approval.get("approver") if verdict else None
+        conf = read_config()
+        by = f" by `{approver}`" if approver else ""
+        if entry.get("stale_plan"):
+            return "The issue changed since this plan, so a new analysis is coming."
+        if status == "pr-open":
+            return f"The pull request is open ({pr})." if pr else "The pull request is open."
+        if status == "merged":
+            return f"The pull request was merged ({pr})." if pr else "The pull request was merged."
+        if status == "pr-closed":
+            return (f"The pull request was closed without merging ({pr})." if pr
+                    else "The pull request was closed without merging.")
+        if status == "needs-kenny":
+            link = pr or comment_url
+            return (f"The pull request is waiting for Kenny ({link})." if link
+                    else "The pull request is waiting for Kenny.")
+        if status == "pushed":
+            on = f" (`{branch}`)" if branch else ""
+            return f"Coding finished and the branch is pushed{on}; the pull request is being opened."
+        if status == "in-progress":
+            on = f" on branch `{branch}`" if branch else ""
+            return f"The plan is approved and coding is running now{on}."
+        if status == "stopped":
+            if pr:
+                return f"Coding stopped; the pull request is {pr}."
+            if branch:
+                return f"Coding stopped on branch `{branch}` and nothing was pushed."
+            return "Coding stopped."
+        if status == "quota":
+            return "Coding is waiting for the coding model's usage limit to reset."
+        if status == "approved":
+            return "The plan is approved and queued for coding."
+        if isinstance(status, str) and status:   # an unknown status is named only when it can't carry text or a token
+            if SAFE_STATUS.fullmatch(status) and not TOKENISH.search(status):
+                return f"Coding status is `{status}`."
+            return "Coding status is not one iwb recognizes."
+        if verdict == "reject":
+            return f"The plan was rejected{by}."
+        if verdict == "revise":
+            return f"The plan needs revision, as asked{by}." if approver else "The plan needs revision."
+        if verdict == "approve":
+            if repo is None or repo not in conf.get("coding_repos", []) or not conf.get("coding_live"):
+                return f"The plan is approved{by}, but coding is switched off for this repository."
+            return f"The plan is approved{by} and queued for coding."
+        if not conf.get("approval_live"):
+            return "The plan is ready, but approval is switched off, so nothing more happens for now."
+        return "The plan is ready and waiting for an approver."
+
     if cmd == "status":
         when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(a.get("at", 0)))
-        return (f"Status: last analysis was a **{a.get('decision', 'none')}** by `{a.get('model', '?')}` at {when}. "
-                f"Coding (build step 4) isn't running yet.")
+        head = f"Status: last analysis was a **{a.get('decision', 'none')}** by `{a.get('model', '?')}` at {when}."
+        return f"{head} {plan_state()}" if a.get("decision") == "plan" else head
     if cmd == "stop":
         return "Stopped. Nothing more will happen on this issue until `bot:stop` is removed."
-    if a.get("decision") == "plan":
-        return ("Got it. The plan above is ready to go, but coding (build step 4) isn't running yet, so nothing more "
-                "happens for now. Once step 4 is live, a ready plan runs without anyone needing to say so. "
-                "Comment with changes if you want the plan revised, or `replan` for a fresh one.")
+    if cmd == "proceed" and a.get("decision") == "plan":
+        return plan_state()
     if a.get("decision") == "questions":
         return "I still need answers to the questions above before I can plan. Reply with them and I'll plan again."
     return "There's no code change planned here. Describe the change you want and I'll plan it."
@@ -794,7 +892,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo_filter=None)
             elif cmd:
                 bot = WORKERS[entry["agent"]]
                 slug = prbot.bot_config(bot)["slug"]
-                body = f"{R_MARKER}\n{command_reply(cmd, entry, slug)}"
+                body = f"{R_MARKER}\n{command_reply(cmd, entry, slug, repo)}"
                 if dry_run:
                     log(f"{key}: would answer '{cmd}': {body}")
                     continue
