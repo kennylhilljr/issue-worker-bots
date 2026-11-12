@@ -784,12 +784,13 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo_filter=None)
                 entry.pop(k, None)
         digest = issue_digest(issue)
         a = entry.get("analysis")
+        replan_at = None                      # a replan command is acknowledged only once its analysis posts
         if a:   # short commands get an answer, not another expensive analysis
             cutoff = max(a["at"], entry.get("handled_at", 0))
             new = [c for c in comments if c["user"] in trusted and iso_epoch(c["at"]) > cutoff]
             cmd = command_of(new[-1]["body"], worker_slugs) if new else None
             if cmd == "replan":
-                entry["handled_at"], entry["replan"] = iso_epoch(new[-1]["at"]), True
+                entry["replan"], replan_at = True, iso_epoch(new[-1]["at"])
             elif cmd:
                 bot = WORKERS[entry["agent"]]
                 slug = prbot.bot_config(bot)["slug"]
@@ -882,6 +883,8 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo_filter=None)
         entry.pop("stale_plan", None)        # a fresh analysis replaces the out-of-date plan
         entry.pop("reason", None)            # consumed only now: a held or failed analysis keeps them
         entry.pop("replan", None)
+        if replan_at is not None:
+            entry["handled_at"] = replan_at
         entry["analysis"] = {"decision": answer["decision"], "at": time.time(), "model": model, "comment": url,
                              "digest": digest}
         tell_openclaw(repo, number, issue["title"], slug, model, answer, url)

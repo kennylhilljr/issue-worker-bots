@@ -159,7 +159,7 @@ Merging (decided 2026-11-11, behind `"auto_merge": true` in `config.json`, off b
 
 ## Coming back to an issue
 
-The bots look at every open issue they picked up on each 5-minute pass; there are no webhooks for now. A review bot's verdict on a plan also goes into the next analysis, so a revise verdict reaches the planner. Once coding has started (`bot:in-progress` or `bot:pr-open`), comments on the issue no longer start a new analysis: feedback belongs on the PR from then on. These are the things that bring a bot back:
+The bots look at every open issue they picked up on each 5-minute pass; there are no webhooks for now. A review bot's verdict on a plan also goes into the next analysis, so a revise verdict reaches the planner. Once coding has started (`bot:in-progress` or `bot:pr-open`), comments on the issue no longer start a new analysis: feedback belongs on the PR from then on. A `replan` command, or a revise verdict, is acknowledged only when the new analysis is posted: a held pass, a model failure, an unusable answer or a failed post leaves the request pending for the next pass. These are the things that bring a bot back:
 
 | Trigger | How it's detected | What the bot does |
 | --- | --- | --- |

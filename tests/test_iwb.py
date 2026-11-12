@@ -1,5 +1,6 @@
 """Tests for iwb intake. No network: GitHub reads and bot posts are faked. Run: python3 -m unittest discover -s tests"""
 import importlib.util, io, json, os, re, shlex, tempfile, time, unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -826,31 +827,104 @@ class Analyze(unittest.TestCase):
         state[self.KEY].update(kw)
         iwb.STATE.write_text(json.dumps(state))
 
+    def set_revise_verdict(self):
+        """The state cmd_approve leaves after a revise verdict."""
+        self.set_entry(replan=True, approval={"verdict": "revise", "source_digest": iwb.issue_digest(self.issue),
+                                              "at": time.time(), "comment": "https://x/verdict"})
+
     def test_a_replan_held_by_the_limit_runs_on_the_next_pass(self):
         # regression: needs_analysis popped "replan" before the per-pass limit check, so a plan the approver sent
         # back that was held by the limit was saved without the flag and sat on bot:planned forever
         self.plan_first()
-        self.set_entry(replan=True)
+        self.set_revise_verdict()
+        before = self.state()["analysis"]
         log = self.run_pass(limit=0)
         self.assertIn("analysis (replan requested) waits for the next pass", log)
         self.assertTrue(self.state()["replan"])
+        state = json.loads(iwb.STATE.read_text())                    # an earlier issue takes the only run
+        state["kennylhilljr/demo#0"] = {"agent": "claude", "picked_up_at": 1}
+        iwb.STATE.write_text(json.dumps(state))
+        self.answers = [answer({"decision": "plan", "summary": "other", "units": [unit()]})]
+        log = self.run_pass(limit=1)
+        self.assertIn(f"{self.KEY}: analysis (replan requested) waits for the next pass (limit 1)", log)
+        self.assertEqual((self.state()["replan"], self.state()["analysis"]), (True, before))
         self.answers = [answer({"decision": "plan", "summary": "v2", "units": [unit()]})]
         log = self.run_pass()
         self.assertIn("(replan requested)", log)
-        self.assertEqual(len(self.prompts), 2)
+        self.assertEqual(len(self.prompts), 3)
         self.assertNotIn("replan", self.state())                     # consumed once the analysis was posted
         self.run_pass()
-        self.assertEqual(len(self.prompts), 2)
+        self.assertEqual(len(self.prompts), 3)
 
     def test_a_replan_whose_analysis_failed_is_retried(self):
         self.plan_first()
-        self.set_entry(replan=True)
+        self.set_revise_verdict()
+        now = time.time()
         self.answers = [RuntimeError("model outage")]
-        self.run_pass()
+        with mock.patch.object(iwb.time, "time", lambda: now):
+            self.run_pass()
+            self.assertTrue(self.state()["replan"])
+            self.run_pass()                                            # within the hour: no retry yet
+            self.assertEqual(len(self.prompts), 2)
         self.assertTrue(self.state()["replan"])
-        self.set_entry(analysis_failed_at=0)                           # the hour has passed
         self.answers = [answer({"decision": "plan", "summary": "v2", "units": [unit()]})]
-        self.assertIn("(replan requested)", self.run_pass())
+        with mock.patch.object(iwb.time, "time", lambda: now + iwb.RETRY_AFTER + 1):
+            self.assertIn("(replan requested)", self.run_pass())
+        self.assertNotIn("replan", self.state())
+
+    def test_replan_command_acknowledged_only_after_post(self):
+        # a replan command moved handled_at before its analysis ran, so a held or failed pass acknowledged it
+        self.plan_first()
+        prior = self.state()["analysis"]["at"] + 1
+        self.set_entry(handled_at=prior)
+        now = time.time() + 600
+        cmd_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 60))   # the command precedes the post
+        self.comments = [{"user": OWNER, "body": "@claude-dev-gh replan", "at": cmd_at}]
+        before = self.state()["analysis"]
+
+        def unchanged():
+            s = self.state()
+            self.assertEqual((s["handled_at"], s["analysis"]), (prior, before))
+
+        clock = [now]
+        with mock.patch.object(iwb.time, "time", lambda: clock[0]):
+            self.assertIn("waits for the next pass", self.run_pass(limit=0))               # held
+            unchanged()
+            self.assertTrue(self.state()["replan"])
+            self.answers = [RuntimeError("model outage")]                                   # model failure
+            self.run_pass()
+            unchanged()
+            n = len(self.prompts)
+            self.run_pass()                                                                 # retry cooldown
+            self.assertEqual(len(self.prompts), n)
+            unchanged()
+            clock[0] += iwb.RETRY_AFTER + 1
+            self.answers = ["no json here"]                                                 # unusable answer
+            self.assertIn("unusable answer", self.run_pass())
+            unchanged()
+            self.answers = [answer({"decision": "plan", "summary": "dry", "units": [unit()]})]
+            self.assertIn("would post", self.run_pass(dry_run=True))                         # dry run
+            unchanged()
+
+            def failing_post(*a):
+                raise RuntimeError("GitHub is down")
+            iwb.post, real_post = failing_post, iwb.post                                    # posting fails
+            self.answers = [answer({"decision": "plan", "summary": "lost", "units": [unit()]})]
+            try:
+                with self.assertRaises(RuntimeError):
+                    self.run_pass()
+            finally:
+                iwb.post = real_post
+            unchanged()
+            self.assertTrue(self.state()["replan"])
+            self.answers = [answer({"decision": "plan", "summary": "fresh", "units": [unit()]})]
+            self.assertIn("(replan requested)", self.run_pass())                             # success
+            s = self.state()
+            self.assertEqual((s["handled_at"], s["analysis"]["at"]), (iwb.iso_epoch(cmd_at), now + iwb.RETRY_AFTER + 1))
+            self.assertNotIn("replan", s)
+            n = len(self.prompts)
+            self.run_pass()
+        self.assertEqual(len(self.prompts), n)                                               # not analyzed again
 
     def test_a_reason_held_by_the_limit_survives(self):
         self.set_entry(reason="reopened")
