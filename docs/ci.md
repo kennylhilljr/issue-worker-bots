@@ -39,5 +39,5 @@ jobs:
 
 - **macOS runner.** The red-check tests (`RedCheckSandbox` in `tests/test_iwb.py`) run real commands under `sandbox-exec`, which exists only on macOS.
 - **No pr-review-bots checkout.** The suite loads `tests/prbot_stub.py` instead of the sibling `prbot`, and the stub raises on any unfaked authentication or GitHub call, so the job needs no secrets.
-- **Python 3.9 and 3.13.** `iwb` must stay 3.9-compatible; 3.13 covers the current release.
+- **Python 3.9 and 3.13.** `iwb` must stay 3.9-compatible; 3.13 covers a recent release.
 - **Read-only permissions and no dependency installation.** `iwb` and its tests use the standard library only.
