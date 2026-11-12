@@ -2318,6 +2318,29 @@ class Code(unittest.TestCase):
         w = self.state()["work"]
         self.assertEqual((w["runner"], w["fallback_from"], w["status"]), ("claude", "codex", "pr-open"))
         self.assertTrue(all(bot == "codex-dev" for bot, _, _ in self.posts))   # still the codex worker's issue
+        bot, _, label_agent, body = self.prs[0]
+        # labeled with the runner that wrote it, so prbot has codex review it, not claude
+        self.assertEqual((bot, label_agent), ("codex-dev", "claude"))
+        self.assertIn("with the `claude` runner in place of `codex`", body)
+
+    def test_a_reviewing_runners_usage_limit_backs_off_instead_of_looping(self):
+        # the claude author is fine but the codex reviewer is out of credits: retrying at once would fail the same
+        # way, and with each finished run starting the next pass that would loop
+        self.ecc_results["drive"] = (3, {"ok": False, "data": {"stop": "needs_owner"}, "checks": []})
+        def reviewer_out_of_credits():
+            run_id = self.ecc_calls[-1][self.ecc_calls[-1].index("--run-id") + 1]
+            d = iwb.WORK_DIR / "ecc-state" / "logs" / run_id
+            d.mkdir(parents=True)
+            (d / "u1-attempt1.status.json").write_text(json.dumps({"argv": ["codex", "exec"]}))
+            (d / "u1-attempt1.log").write_text("You've hit your usage limit.\n")
+        self.during_drive = reviewer_out_of_credits
+        self.run_pass()
+        e = self.state()
+        self.assertEqual(e["work"]["status"], "quota")
+        self.assertIn("work_failed_at", e)
+        calls = len(self.ecc_calls)
+        self.run_pass()
+        self.assertEqual(len(self.ecc_calls), calls)                     # not again within the hour
 
     def test_no_fallback_when_the_approver_is_the_new_runners_family(self):
         for approver, fallback in (("claude-pr-gh", True), ("codex-pr-gh", False), ("someone", True)):
@@ -2738,6 +2761,7 @@ class OrchestratorDrift(unittest.TestCase):
         saved = (iwb.ECC, iwb.CONFIG)
         self.addCleanup(lambda: (setattr(iwb, "ECC", saved[0]), setattr(iwb, "CONFIG", saved[1])))
         iwb.ECC, iwb.CONFIG = orch / "bin" / "ecc", Path(tmp.name, "config.json")
+        self.enterContext(mock.patch.object(iwb, "WORK_DIR", Path(tmp.name, "work")))   # its orchestrator.lock
         self.assertIsNone(iwb.orchestrator_drift())
         git("checkout", "-qb", "feature", cwd=orch)
         Path(orch, "f").write_text("y\n")
@@ -2774,6 +2798,7 @@ class OrchestratorFastForward(unittest.TestCase):
         saved = (iwb.ECC, iwb.CONFIG)
         self.addCleanup(lambda: (setattr(iwb, "ECC", saved[0]), setattr(iwb, "CONFIG", saved[1])))
         iwb.ECC, iwb.CONFIG = self.orch / "bin" / "ecc", Path(self.tmp.name, "config.json")
+        self.enterContext(mock.patch.object(iwb, "WORK_DIR", Path(self.tmp.name, "work")))   # its orchestrator.lock
         self.commit(self.src, "g", "next")                                  # origin moves on after the clone
 
     def commit(self, repo, name, msg):
@@ -2796,6 +2821,21 @@ class OrchestratorFastForward(unittest.TestCase):
         self.assertEqual(self.head(self.orch), self.head(self.src))
         self.assertIn("fast-forwarded", out)
         self.assertTrue(Path(self.orch, "notes.txt").exists())
+
+    def test_no_fetch_or_fast_forward_while_a_run_uses_the_checkout(self):
+        # parallel runs: one run's fast-forward must not change the orchestrator under another run's commands
+        before = self.head(self.orch)
+        held = iwb.orchestrator_in_use()
+        r, out = self.drift()
+        self.assertIsNone(r)                                               # clean main, as last fetched: fine
+        self.assertEqual((self.head(self.orch), out), (before, ""))
+        self.commit(self.orch, "mine", "local")
+        self.assertIn("not origin/main", self.drift()[0])                  # local commits are still refused
+        self.run_git("reset", "-q", "--hard", before, cwd=self.orch)
+        held.close()
+        r, out = self.drift()
+        self.assertIsNone(r)
+        self.assertEqual(self.head(self.orch), self.head(self.src))
 
     def test_changed_tracked_file_is_refused(self):
         before = self.head(self.orch)
@@ -2890,6 +2930,16 @@ class StateFile(unittest.TestCase):
         self.assertEqual({k: v["n"] for k, v in disk.items() if "#" in k}, {f"r{i}#1": 14 for i in range(6)})
         self.assertEqual(disk["_runner_quota"], {f"runner{i}": 14 for i in range(6)})
         self.assertEqual(disk["_last_agent"], "claude")
+
+    def test_one_runners_quota_keeps_the_later_reset(self):
+        self.use_tmp_state({"_runner_quota": {"codex": 1}})
+        state, since = iwb.load_state()
+        state["_runner_quota"]["codex"] = 100                               # a generic one-hour wait
+        disk = json.loads(iwb.STATE.read_text())
+        disk["_runner_quota"]["codex"] = 900                                # another run parsed the real reset
+        iwb.STATE.write_text(json.dumps(disk))
+        iwb.save_state(state, since)
+        self.assertEqual(json.loads(iwb.STATE.read_text())["_runner_quota"], {"codex": 900})
 
     def test_a_key_both_writers_created_is_merged(self):
         self.use_tmp_state({})
@@ -3521,8 +3571,8 @@ class Queue(unittest.TestCase):
         self.event(42, "labeled")
         code, _ = self.drain()
         self.assertEqual(code, 0)
-        self.assertEqual(self.calls, [("intake", [f"{self.REPO}#42"]), ("analyze", [f"{self.REPO}#42"]),
-                                      ("intake", [f"{self.REPO}#7"]), ("analyze", [f"{self.REPO}#7"])])
+        self.assertEqual(self.calls, [("intake", [f"{self.REPO}#42"]), ("intake", [f"{self.REPO}#7"]),
+                                      ("analyze", [f"{self.REPO}#42", f"{self.REPO}#7"])])   # one parallel pass
         self.assertEqual(self.left(), [])
 
     def test_ready_issues_are_handed_to_the_code_queue_not_coded_here(self):
@@ -3534,7 +3584,7 @@ class Queue(unittest.TestCase):
         sent = json.loads(src.read_text())
         self.event(4)                                                 # no plan: nothing to hand off
         self.assertEqual(self.drain()[0], 0)
-        self.assertEqual([s for s, _ in self.calls], ["intake", "analyze", "approve"] * 2)   # never "code"
+        self.assertEqual([s for s, _ in self.calls], ["intake", "intake", "analyze", "approve", "approve"])   # never "code"
         self.assertEqual(self.left(), [])
         (handoff,) = self.cq.iterdir()
         self.assertEqual(json.loads(handoff.read_text()), {**sent, "stage": "code"})
@@ -3557,8 +3607,8 @@ class Queue(unittest.TestCase):
         self.wait.add(("analyze", f"{self.REPO}#5"))                  # a failed read during analysis
         self.hold.add(("intake", f"{self.REPO}#6"))                   # a per-pass limit during intake
         self.drain()
-        self.assertEqual(self.calls, [("intake", [f"{self.REPO}#5"]), ("analyze", [f"{self.REPO}#5"]),
-                                      ("intake", [f"{self.REPO}#6"])])
+        self.assertEqual(self.calls, [("intake", [f"{self.REPO}#5"]), ("intake", [f"{self.REPO}#6"]),
+                                      ("analyze", [f"{self.REPO}#5"])])
         self.assertFalse(self.cq.exists())                            # neither was handed to coding
 
     def test_a_failure_is_deferred_with_an_attempt_count_and_exits_nonzero(self):
@@ -3679,11 +3729,24 @@ class Queue(unittest.TestCase):
     def test_the_analysis_limit_is_shared_by_the_issues_in_a_run(self):
         self.enterContext(mock.patch.object(iwb, "ANALYZE_LIMIT", 1))   # one analysis per run, as before analysis_concurrency
         seen = []
-        iwb.cmd_analyze = lambda only=None, limit=None, **kw: seen.append(limit) or iwb.SPENT.update(analyze=1)
+        iwb.cmd_analyze = lambda only=None, limit=None, **kw: seen.append((limit, sorted(only))) \
+            or iwb.SPENT.update(analyze=1)
         self.event(1)
         self.event(2)
         self.drain()
-        self.assertEqual(seen, [1, 0])
+        self.assertEqual(seen, [(1, [f"{self.REPO}#1", f"{self.REPO}#2"])])   # one pass shares the run's budget
+
+    def test_queued_analyses_fall_back_to_one_at_a_time_when_the_pass_fails(self):
+        self.event(1)
+        self.event(2)
+        self.failing["analyze", f"{self.REPO}#1"] = RuntimeError("boom")
+        code, out = self.drain()
+        self.assertEqual(code, 1)
+        self.assertEqual([c for c in self.calls if c[0] == "analyze"],
+                         [("analyze", [f"{self.REPO}#1", f"{self.REPO}#2"]), ("analyze", [f"{self.REPO}#1"]),
+                          ("analyze", [f"{self.REPO}#2"])])
+        self.assertIn("one at a time", out)
+        self.assertEqual(iwb.OUTCOME, {f"{self.REPO}#1": "failed"})
 
     def test_unusable_files_are_logged_and_rejected(self):
         names = [self.event(1, raw="{not json").name,
@@ -4944,6 +5007,78 @@ class AutoMerge(unittest.TestCase):
             iwb.run_job(job)                                                # what `iwb code --job` runs
         self.assertEqual(self.pushed, [("claude-dev", REPAIRED, self.BRANCH)])
         self.assertEqual((self.work()["repair"]["status"], self.work()["repair"]["runner"]), ("pushed", "claude"))
+
+    def set_work(self, **fields):
+        state = json.loads(iwb.STATE.read_text())
+        state[self.KEY]["work"].update(fields)
+        iwb.STATE.write_text(json.dumps(state))
+
+    def test_a_fallback_prs_reviewer_is_the_other_family_of_its_runner(self):
+        self.set_work(runner="codex")                                     # coded by codex for the claude worker
+        self.reviews = [review(HEAD)]                                     # codex reviewing codex: never counts
+        log = self.run_pass()
+        self.assertIn("no review of the head commit", log)
+        self.assertEqual(self.merges(), [])
+        self.reviews = [review(HEAD, user="claude-pr-gh[bot]")]
+        self.run_pass()
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_a_repair_round_never_switches_runner(self):
+        # the round's author must stay the PR's: its reviewer was chosen as the other family of that runner
+        self.set_work(runner="codex")
+        self.reviews = [review(HEAD, P2_FINDING, user="claude-pr-gh[bot]")]
+        state = json.loads(iwb.STATE.read_text())
+        state["_runner_quota"] = {"codex": time.time() + 3600}
+        iwb.STATE.write_text(json.dumps(state))
+        self.config(runner_fallback=True)
+        log = self.run_pass()
+        self.assertIn("repair round waits for the codex usage limit", log)
+        self.assertEqual((self.ecc_calls, self.posts), ([], []))
+        state = json.loads(iwb.STATE.read_text())
+        state["_runner_quota"] = {}
+        iwb.STATE.write_text(json.dumps(state))
+        self.run_pass()
+        self.assertEqual(self.policy_author(), ["codex"])
+
+    def policy_author(self):
+        args = self.ecc_calls[1]
+        return json.loads(Path(args[args.index("--policy-file") + 1]).read_text())["author_providers"]
+
+    def test_a_repair_round_that_cannot_start_waits_an_hour(self):
+        # a failure before the round is recorded (setup, orchestrator checkout) used to be retried on every pass,
+        # and every finished run starts a pass
+        self.reviews = [review(HEAD, P2_FINDING)]
+        iwb.orchestrator_drift = lambda: "the orchestrator at /x is at abc, not origin/main (def)"
+        self.run_pass()
+        self.assertNotIn("repair", self.work())
+        self.assertIn("work_failed_at", json.loads(iwb.STATE.read_text())[self.KEY])
+        iwb.orchestrator_drift = lambda: None
+        log = self.run_pass()
+        self.assertIn("repair round waits an hour", log)
+        self.assertEqual(self.ecc_calls, [])
+
+    def test_a_usage_limit_during_the_repair_round_leaves_it_to_run_again(self):
+        self.reviews = [review(HEAD, P2_FINDING)]
+
+        def ecc(args, timeout=900, **kw):
+            if args[0] == "drive":
+                self.ecc_calls.append(args)
+                run_id = args[args.index("--run-id") + 1]
+                d = iwb.WORK_DIR / "ecc-state" / "logs" / run_id
+                d.mkdir(parents=True)
+                (d / "repair-1-attempt1.status.json").write_text(json.dumps({"argv": ["claude", "-p"]}))
+                (d / "repair-1-attempt1.log").write_text("Claude AI usage limit reached|1794543660\n")
+                return 3, {"ok": False, "data": {"stop": "needs_owner"}}, ""
+            return self.fake_ecc(args, timeout, **kw)
+        with redirect_stdout(io.StringIO()):
+            iwb.cmd_code(ecc=ecc)
+        self.assertEqual(self.pushed, [])
+        self.assertNotIn("repair", self.work())                          # the one round isn't spent
+        self.assertNotEqual(self.work()["status"], "needs-kenny")
+        self.assertIn("claude", json.loads(iwb.STATE.read_text())["_runner_quota"])
+        self.assertTrue(any("Repair round paused" in a[-1] for _, a in self.gh_calls))
+        log = self.run_pass()
+        self.assertIn("repair round waits for the claude usage limit", log)
 
     def test_repair_round_waits_for_the_coding_limit(self):
         self.reviews = [review(HEAD, P2_FINDING)]

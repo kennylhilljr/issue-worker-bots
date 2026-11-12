@@ -21,7 +21,7 @@ Intake and analysis are live on all of `kennylhilljr`'s repositories. Plan appro
 | --- | --- |
 | 1. Worker Apps (`claude-dev-gh`, `codex-dev-gh`) | Done. Installed on all of Kenny's repositories with contents, issues and pull requests read and write. |
 | 2. Intake watcher | Live: launchd runs it every 5 minutes. Trusts Kenny and `openclaw-ops-assist[bot]`; the 6 issues open at install were skipped. |
-| 3. Analysis step | Live: launchd runs `tick` (intake, then one analysis) every 5 minutes. |
+| 3. Analysis step | Live: launchd runs `tick` (intake, then up to three analyses at once) every 5 minutes. |
 | 4. Clarity, policy and red-check gates, agent plan approval, orchestrator runs, draft PRs | 4a, gates and approval: built, runs when `approval_live` is set. 4b, coding and draft PRs: built and tested with fakes, pilot on `kennylhilljr/ecc-customization`, not yet run live; runs when `coding_live` is set. |
 | 5. Review hand-off, repair round and gated merge | Built and tested with fakes; runs when `auto_merge` is set (with `coding_live`). |
 | 6. More repositories and model tuning | Not started. |
@@ -123,7 +123,7 @@ launchd starts each queue job again, at most once a minute, for as long as its f
 
 | Folder | What goes there |
 | --- | --- |
-| `~/.local/state/github-events/iwb/` | New events from the router, and the untouched files of issues that only hit a per-pass limit (one analysis per run, for example). Those are taken first on the next run. |
+| `~/.local/state/github-events/iwb/` | New events from the router, and the untouched files of issues that only hit a per-pass limit (`analysis_concurrency` analyses per run, for example). Those are taken first on the next run. |
 | `~/.local/state/github-events/iwb-deferred/` | Files of an issue whose step failed, even when the step caught the error itself (a model, post or push failure; the run exits 1), or whose GitHub read failed (exit 0). Each such move adds 1 to an `attempts` field in the file. Issues waiting for capacity, a pause or a delay also go here, without counting an attempt: every queued event and sweep while `"paused": true` is set in `config.json`, another pass holding `work.lock` (only for an issue that has coding to do), no free coding slot (`code_concurrency`, `max_parallel`, or a run already going in the repository), the hour after a model failure. The hourly `tick` moves them all back into their queue after its scan. |
 | `~/.local/state/github-events/iwb-rejected/` | Anything that can never be handled: bad JSON, no valid repo or issue number, a pull request (including an issue event whose number turns out to be a pull request), a repository the bots aren't installed on, files deferred 24 times, and every other entry found in the queue: stray files such as `.DS_Store`, folders (moved whole, contents untouched) and symlinks (the link itself moves; its target is never followed or touched). Nothing reads or clears this folder; look through it and empty it by hand now and then. |
 
@@ -145,7 +145,7 @@ The worker is chosen by an `agent:claude` or `agent:codex` label; otherwise the 
 
 ### Analysis
 
-`iwb analyze` takes one picked-up issue per pass, clones its repository read-only with the worker bot's token, and runs the worker's strongest model on it (override the models in `config.json` under `analysis_models`). Only the issue and comments from Kenny, trusted openers and the worker bots, plus the review bots' plan verdicts, go into the prompt; other people's comments are left out.
+`iwb analyze` takes up to `analysis_concurrency` (default 3) picked-up issues per pass and runs their analyses at the same time. For each it clones its repository read-only with the worker bot's token, and runs the worker's strongest model on it (override the models in `config.json` under `analysis_models`). Only the issue and comments from Kenny, trusted openers and the worker bots, plus the review bots' plan verdicts, go into the prompt; other people's comments are left out.
 
 The model answers with exactly one of:
 
@@ -223,12 +223,12 @@ Plans ready, questions posted and blocked issues appear in OpenClaw as `attentio
 
 | Command | What it does |
 | --- | --- |
-| `iwb tick` | What launchd runs: intake, then one analysis, then step 4a when `approval_live` is set and step 4b when `coding_live` is set. |
+| `iwb tick` | What launchd runs: intake, then up to `analysis_concurrency` analyses at once, then step 4a when `approval_live` is set and step 4b when `coding_live` is set. |
 | `iwb tick --from-queue DIR` | Intake, analysis and approval for only the issues named by event files in `DIR`, each once per run; hands issues ready to code to `DIR-code`. Deletes a handled issue's files and moves the rest to `DIR-deferred` or `DIR-rejected`. Exits 1 if an issue failed, 2 if `DIR` is not a queue folder. |
 | `iwb code --from-queue DIR` | Codes the issues handed off in `DIR`, with the same deferred and rejected folders. |
 | `iwb code [--dry-run]` | Starts a coding run for each approved plan that has a free slot (each run opens its PR), then (with `auto_merge`) runs step 5 on open worker PRs. `--dry-run` prints what it would do. |
 | `iwb intake [--dry-run] [--baseline] [--limit N]` | One pass over open issues; picks up at most N (default 5). `--dry-run` prints and saves nothing; `--baseline` marks the open issues as seen without commenting. |
-| `iwb analyze [--dry-run] [--limit N]` | Analyzes up to N picked-up issues (default 1) and posts a no-code answer, questions or a plan. |
+| `iwb analyze [--dry-run] [--limit N]` | Analyzes up to N picked-up issues at the same time (default `analysis_concurrency`, 3) and posts a no-code answer, questions or a plan. |
 
 Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bot:approved`, `bot:in-progress`, `bot:pr-open`, `bot:needs-kenny`, `bot:done` and `bot:blocked`; `bot:stale` is not built yet. `bot:stop` is set by Kenny.
 

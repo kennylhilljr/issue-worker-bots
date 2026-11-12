@@ -196,7 +196,11 @@ def merge_changes(disk, old, new):
                     if f not in new[k]:
                         disk[k].pop(f, None)
                     elif f not in was or was[f] != new[k][f]:
-                        disk[k][f] = new[k][f]
+                        mine, theirs = new[k][f], disk[k].get(f)
+                        if k == "_runner_quota" and all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                                                         for x in (mine, theirs)):
+                            mine = max(mine, theirs)   # two runs hit one runner's limit: keep the later reset
+                        disk[k][f] = mine
             else:
                 disk[k] = new[k]
     return disk
@@ -994,7 +998,18 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
         log(f"{key}: analyzing with {model} ({why})")
         jobs.append({"key": key, "entry": entry, "repo": repo, "number": number, "issue": issue, "text": text,
                      "digest": digest, "replan_at": replan_at, "agent": agent, "bot": bot, "model": model})
-    for job, (answer, err) in zip(jobs, run_parallel(analyze_one, jobs, limit)):
+    try:
+        finish_analyses(jobs, run_parallel(analyze_one, jobs, limit), dry_run)
+    finally:                                  # a post failing part way never loses the answers posted before it
+        if not dry_run:
+            save_state(state, since)
+    log(f"analysis pass done: {runs} run{'s' if runs != 1 else ''}")
+    return 0
+
+
+def finish_analyses(jobs, results, dry_run):
+    """Post each analysis's answer (or record its failure) on its issue's state entry, in order."""
+    for job, (answer, err) in zip(jobs, results):
         key, entry, repo, number, issue = job["key"], job["entry"], job["repo"], job["number"], job["issue"]
         digest, replan_at, bot, model = job["digest"], job["replan_at"], job["bot"], job["model"]
         if isinstance(err, (RuntimeError, subprocess.SubprocessError, SystemExit)):
@@ -1047,10 +1062,6 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
                              "digest": digest}
         tell_openclaw(repo, number, issue["title"], slug, model, answer, url)
         log(f"{key}: posted {answer['decision']} ({label}) {url}")
-    if not dry_run:
-        save_state(state, since)
-    log(f"analysis pass done: {runs} run{'s' if runs != 1 else ''}")
-    return 0
 
 
 def tell_openclaw(repo, number, title, slug, model, answer, url):
@@ -1946,11 +1957,42 @@ def cert_problem(path, horizon):
     return f"orchestrator certifications won't last the run ({'; '.join(out)})" if out else None
 
 
+def orchestrator_lock_path():
+    return WORK_DIR / "locks" / "orchestrator.lock"
+
+
+def orchestrator_in_use():
+    """Hold the orchestrator checkout for a run (a shared lock; close the file when the run ends), so no other
+    process fetches or fast-forwards it between the run's orchestrator commands."""
+    import fcntl
+    path = orchestrator_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a+")
+    fcntl.flock(f, fcntl.LOCK_SH)
+    return f
+
+
 def orchestrator_drift():
     """Why the orchestrator checkout isn't at origin/main, or None. iwb runs whatever is checked out there, and
-    Kenny's working checkout may sit on a feature branch. A clean main that is only behind is fast-forwarded."""
+    Kenny's working checkout may sit on a feature branch. A clean main that is only behind is fast-forwarded, but
+    only while no run holds the checkout (orchestrator_in_use); while one does, a clean main that is behind the
+    origin/main last fetched passes as it is, so every run keeps one version of the orchestrator throughout."""
     repo = ecc_path().resolve().parent.parent
     git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, timeout=300)
+    held = try_lock(orchestrator_lock_path())
+    if held is None:
+        head, main = (git("rev-parse", "--verify", "-q", ref).stdout.strip() for ref in ("HEAD", "origin/main"))
+        if main and (head == main or fast_forwardable(git, head, main)):
+            return None
+        return (f"the orchestrator at {repo} is at {head[:10] or '?'}, not origin/main ({main[:10] or '?'}); "
+                f"update it or set ecc_path in config.json")
+    try:
+        return checked_drift(repo, git)
+    finally:
+        held.close()
+
+
+def checked_drift(repo, git):
     f = git("fetch", "-q", "origin")
     if f.returncode != 0:
         return f"could not fetch the orchestrator at {repo}: {f.stderr.strip()[-200:]}"
@@ -2285,6 +2327,7 @@ def code_plan(key, entry, issue, state, since, ecc):
     w.update(status="in-progress", branch=branch, run_id=run_id, started_at=time.time(), started_comment=url)
     save_state(state, since)        # a pass that dies mid-run leaves in-progress behind, which the next pass reports
     log(f"{key}: coding started, run {run_id}")
+    in_use = orchestrator_in_use()
     try:
         d, default, base = checkout(repo, worker, branch, number, issue, units)
         w["plan_sha256"] = drive_units(ecc, d, repo, number, runner, units, branch, run_id, w["approver"], conf,
@@ -2304,9 +2347,11 @@ def code_plan(key, entry, issue, state, since, ecc):
     except (WorkError, RuntimeError, subprocess.SubprocessError, SystemExit, OSError, KeyError) as e:
         quota = runner_quota(run_id) if isinstance(e, WorkError) else None
         if quota:
-            runner, msg, until = quota
-            runner = runner or w.get("runner") or agent
+            limited, msg, until = quota
+            runner = limited or runner
             state["_runner_quota"] = {**(state.get("_runner_quota") or {}), runner: until}
+            if runner != (w.get("runner") or agent):
+                entry["work_failed_at"] = time.time()   # a reviewing runner: the author isn't limited, so wait anyway
             w.update(status="quota", at=time.time(), problem=f"{runner} usage limit")
             when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(until))
             try:
@@ -2320,9 +2365,12 @@ def code_plan(key, entry, issue, state, since, ecc):
         block(entry, worker, repo, number, issue["title"], f"{W_MARKER}\nCoding stopped: {short(e)}",
               f"coding: {short(e, 300)}")
         return
+    finally:
+        in_use.close()
     rows = "\n".join(f"| `{u['id']}` | {u['title']} | {u['routing']['initial_tier']} |" for u in units)
     body = (f"Closes #{number}\n\nPlanned by `{wslug}` ({entry['analysis'].get('comment', '')}), approved by "
-            f"`{w['approver']}` ({w.get('approval_comment', '')}), coded by orchestrator run `{run_id}`.\n\n"
+            f"`{w['approver']}` ({w.get('approval_comment', '')}), coded by orchestrator run `{run_id}`"
+            f"{f' with the `{runner}` runner in place of `{agent}` (usage limit)' if runner != agent else ''}.\n\n"
             f"| Unit | What | Tier |\n| --- | --- | --- |\n{rows}\n\niwb squash-merges this PR only when the cross-review "
             f"of its head has no P0-P2 findings, the acceptance commands pass on the head, no protected path is "
             f"changed and no check fails; otherwise Kenny decides.")
@@ -2395,7 +2443,9 @@ def finish_pr(key, entry, issue, state, since):
     rec = next(b for b in entry["branches"] if b["branch"] == w["branch"])
     try:
         if not rec.get("pr"):
-            rec["pr"] = create_pr(worker, repo, w["branch"], w["default"], issue["title"], w["pr_body"], entry["agent"])
+            # labeled with the runner that wrote the code: prbot has the other family review it (pr_gate expects so)
+            rec["pr"] = create_pr(worker, repo, w["branch"], w["default"], issue["title"], w["pr_body"],
+                                  pr_runner(entry))
             save_state(state, since)
         if not rec.get("ready"):
             ready_pr(worker, repo, rec["pr"])
@@ -2729,6 +2779,7 @@ def repair_round(key, entry, issue, state, since, ecc, review, findings, sha, ru
     except RuntimeError as e:
         log(f"{key}: could not post the repair note: {e}")
     log(f"{key}: repair round started, run {run_id}")
+    in_use = orchestrator_in_use()
     try:
         d, default, base = checkout_pr(repo, worker, w["branch"], sha, number, issue, units)
         drive_units(ecc, d, repo, number, runner, units, w["branch"], run_id, w["approver"], conf, cost, ecc_cfg)
@@ -2739,9 +2790,29 @@ def repair_round(key, entry, issue, state, since, ecc, review, findings, sha, ru
         log(f"{key}: repair round stopped: {e}")
         return
     except (WorkError, RuntimeError, subprocess.SubprocessError, SystemExit, OSError, KeyError) as e:
+        quota = runner_quota(run_id) if isinstance(e, WorkError) else None
+        if quota:                   # not the round's fault: it runs again once the runner can, nothing was pushed
+            limited, msg, until = quota
+            limited = limited or runner
+            state["_runner_quota"] = {**(state.get("_runner_quota") or {}), limited: until}
+            w.pop("repair", None)
+            if limited != runner:
+                entry["work_failed_at"] = time.time()
+            when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(until))
+            try:
+                run_gh_as(worker, repo, ["issue", "comment", number, "-R", repo, "--body",
+                                         f"{W_MARKER}\nRepair round paused: the `{limited}` runner hit its usage "
+                                         f"limit (run `{run_id}`): {msg}\n\nNothing was pushed; the round runs "
+                                         f"again after {when}."])
+            except RuntimeError as err:
+                log(f"{key}: could not post the usage-limit note: {err}")
+            mark(key, "waiting", f"repair round paused: {limited} usage limit until {when}")
+            return
         w["repair"].update(status="failed", problem=short(e, 300))
         kenny_unless_landed(key, entry, f"the repair round failed ({short(e)})")
         return
+    finally:
+        in_use.close()
     w["repair"].update(status="pushed", sha=new, done_at=time.time())
     try:
         run_gh_as(worker, repo, ["issue", "comment", number, "-R", repo, "--body",
@@ -2801,7 +2872,7 @@ def review_prs(keys, state, since, ecc, dry_run, runs, limit, conf, running=None
                 continue
             facts = pr_facts(repo, w["pr"])
             worker_login = prbot.bot_config(worker)["slug"] + "[bot]"
-            reviewer_login = prbot.bot_config(REVIEW_BOTS[APPROVERS[entry["agent"]]])["slug"] + "[bot]"
+            reviewer_login = prbot.bot_config(REVIEW_BOTS[other_runner(pr_runner(entry))])["slug"] + "[bot]"
         except (SystemExit, KeyError, IndexError, ValueError) as e:
             mark(key, "deferred", f"could not read the PR {w['pr']}; will retry: {e!r}")
             continue
@@ -2827,10 +2898,14 @@ def review_prs(keys, state, since, ecc, dry_run, runs, limit, conf, running=None
                 if runs >= limit:
                     mark(key, "held", f"repair round waits for the next pass (limit {limit})")
                     continue
-                runner, until = pick_runner(entry, state, conf, w.get("runner"))
-                if runner is None:
-                    mark(key, "waiting", f"repair round waits for the {w.get('runner') or entry['agent']} usage "
-                         f"limit to reset at {time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(until))}")
+                runner = pr_runner(entry)   # never another family: the PR's reviewer is chosen by its author
+                until = (state.get("_runner_quota") or {}).get(runner, 0)
+                if until > time.time():
+                    mark(key, "waiting", f"repair round waits for the {runner} usage limit to reset at "
+                         f"{time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(until))}")
+                    continue
+                if time.time() - entry.get("work_failed_at", 0) < RETRY_AFTER:
+                    mark(key, "waiting", "repair round waits an hour after its last try failed to start")
                     continue
                 busy = capacity_problem(running, repo, runner, conf)
                 if busy:
@@ -2863,12 +2938,14 @@ def review_prs(keys, state, since, ecc, dry_run, runs, limit, conf, running=None
                     merges += 1
                     merge_now(key, entry, facts, *detail, commands)
         except (RuntimeError, subprocess.SubprocessError, SystemExit, OSError) as e:
+            if action == "repair":
+                entry["work_failed_at"] = time.time()
             mark(key, "failed", f"PR step ({action}) could not run; retrying next pass: {e}")
         save_state(state, since)
     return runs
 
 
-def work_lock(name="work.lock"):
+def work_lock(name="work.lock", wait=False):
     """One step-4b pass at a time, so a manual `iwb code` never mistakes a running pass for an interrupted one.
     `tick.lock` does the same for the intake, analysis and approval part of `tick`, in both of its modes. None if
     another process holds the lock."""
@@ -2876,7 +2953,7 @@ def work_lock(name="work.lock"):
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     f = open(WORK_DIR / name, "w")
     try:
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(f, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         f.close()
         return None
@@ -2972,19 +3049,28 @@ def fallback_allowed(entry, runner):
     return fam is not None and fam != runner_family(runner)
 
 
-def pick_runner(entry, state, conf, preferred=None):
-    """(runner, None) for the runner CLI to code this issue now, or (None, reset time) while it must wait for a
-    usage limit. `preferred` (default the worker's own runner) unless it is usage-limited; then the worker's own
-    runner, or with config.json "runner_fallback": true the other one when fallback_allowed."""
+def pick_runner(entry, state, conf):
+    """(runner, None) for the runner CLI to code this issue's plan now, or (None, reset time) while it must wait
+    for a usage limit: the worker's own runner unless it is usage-limited, then with config.json
+    "runner_fallback": true the other one, when fallback_allowed and not usage-limited itself."""
     now, agent = time.time(), entry["agent"]
     quota = state.get("_runner_quota") or {}
-    first = preferred or agent
-    for r in [first] + [x for x in REQUIRED_RUNNERS if x != first]:
+    for r in [agent] + [x for x in REQUIRED_RUNNERS if x != agent]:
         if quota.get(r, 0) > now:
             continue
-        if r in (first, agent) or conf.get("runner_fallback") is True and fallback_allowed(entry, r):
+        if r == agent or conf.get("runner_fallback") is True and fallback_allowed(entry, r):
             return r, None
-    return None, quota.get(first, 0)
+    return None, quota.get(agent, 0)
+
+
+def pr_runner(entry):
+    """The runner that authored the issue's PR: its fixes (the repair round) come from it too, and its review
+    from the other family, whatever the worker."""
+    return (entry.get("work") or {}).get("runner") or entry["agent"]
+
+
+def other_runner(runner):
+    return next(r for r in REQUIRED_RUNNERS if r != runner)
 
 
 def start_run(job, inline=None):
@@ -3042,7 +3128,7 @@ def run_job(job, ecc=None):
             repair_round(key, entry, job["issue"], state, since, ecc or run_ecc, job["review"],
                          [tuple(f) for f in job["findings"]], job["sha"], job["runner"])
     except Exception as e:          # never leave the job to be picked again every pass
-        if step == "code" and isinstance(entry, dict):
+        if isinstance(entry, dict):
             entry["work_failed_at"] = time.time()
         log(f"{key}: {step} could not run; retrying in {RETRY_AFTER // 60} minutes: {e!r}")
     finally:
@@ -3051,7 +3137,8 @@ def run_job(job, ecc=None):
 
 def cmd_job(path):
     """`iwb code --job FILE` (started by a pass, never by hand): run the job, release its locks, then run a pass
-    of its own so the freed slot is used and open PRs are looked at, unless coding is off or paused."""
+    of its own (after any pass holding work.lock) so the freed slot is used and open PRs are looked at, unless
+    coding is off or paused."""
     path = Path(path)
     job = json.loads(path.read_text())
     path.unlink(missing_ok=True)
@@ -3065,7 +3152,9 @@ def cmd_job(path):
                 pass
     conf = read_config()
     if conf.get("coding_live") and not conf.get("paused"):
-        return cmd_code()
+        # waits for a pass that is choosing work: that pass may have counted this run as going, and with no
+        # other trigger its slot would stay empty until the hourly tick
+        return cmd_code(wait=True)
     return 0
 
 
@@ -3117,7 +3206,7 @@ def prs_to_review(state, conf):
     return keys
 
 
-def cmd_code(dry_run=False, limit=None, ecc=None, only=None, review=True, intake_q=None):
+def cmd_code(dry_run=False, limit=None, ecc=None, only=None, review=True, intake_q=None, wait=False):
     """Step 4b: code plans that step 4a approved, in repositories listed in config.json "coding_repos". Then
     step 5 for open PRs, unless `review` is False (a code-queue drain runs step 5 once, at its end). Each coding
     or repair run starts as its own process (start_run) within the capacity: config.json "code_concurrency" runs
@@ -3131,7 +3220,7 @@ def cmd_code(dry_run=False, limit=None, ecc=None, only=None, review=True, intake
     if conf.get("paused"):
         log("paused in config.json; no coding")
         return 0
-    lock = work_lock()
+    lock = work_lock(wait=wait)
     if lock is None:
         log("another coding pass is running; skipping")
         if only:                          # only issues that have coding to do wait for the lock
@@ -3619,6 +3708,26 @@ def sweep_pass(q, scope, groups, handed):
     return ok, held
 
 
+def analyze_queued(keys):
+    """Analysis for the queued issues in `keys` in one pass, so they run at the same time (analysis_concurrency).
+    If that pass fails as a whole, each issue it left without an outcome gets a pass of its own; answers posted
+    before the failure were saved, so those issues need none."""
+    if not keys:
+        return
+    try:
+        cmd_analyze(limit=analysis_limit() - SPENT["analyze"], only=set(keys))
+        return
+    except (Exception, SystemExit) as e:
+        log(f"queue: analysis of {len(keys)} issue{'s' if len(keys) != 1 else ''} failed ({e!r}); one at a time")
+    for key in keys:
+        if key in OUTCOME:
+            continue
+        try:
+            cmd_analyze(limit=analysis_limit() - SPENT["analyze"], only={key})
+        except (Exception, SystemExit) as e:
+            mark(key, "failed", f"queued event failed: {e!r}")
+
+
 def cmd_drain(queue_dir):
     """`tick --from-queue DIR`: intake, analysis and approval for each issue that has event files in DIR. Once a
     stage records an outcome for an issue (held, waiting, deferred, failed) the later stages skip it in this run.
@@ -3671,8 +3780,11 @@ def cmd_drain(queue_dir):
         for key in [] if paused else groups:
             try:
                 cmd_intake(limit=LIMIT - SPENT["intake"], only={key})
-                if key not in OUTCOME:
-                    cmd_analyze(limit=analysis_limit() - SPENT["analyze"], only={key})
+            except (Exception, SystemExit) as e:
+                mark(key, "failed", f"queued event failed: {e!r}")
+        analyze_queued([] if paused else [k for k in groups if k not in OUTCOME])
+        for key in [] if paused else groups:
+            try:
                 if key not in OUTCOME and read_config().get("approval_live"):
                     cmd_approve(limit=APPROVE_LIMIT - SPENT["approve"], only={key})
             except (Exception, SystemExit) as e:
