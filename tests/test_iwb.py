@@ -1157,10 +1157,11 @@ class TestCommandReply(unittest.TestCase):
                                "next pass")
 
     def test_long_ordinary_titles_keep_the_branch(self):
-        """test_long_ordinary_titles_keep_the_branch: a 28-letter word and a title slug of 20 one-letter words
-        (the most slugify's 40 characters allow) still give a named branch."""
+        """test_long_ordinary_titles_keep_the_branch: a 28-letter word, a word with five consonants in a row and a
+        title slug of 20 one-letter words (the most slugify's 40 characters allow) still give a named branch."""
         twenty = iwb.slugify(" ".join("abcdefghijklmnopqrst"))
-        for branch in ["bot/19-antidisestablishmentarianism-abc123", f"bot/19-{twenty}-abc123"]:
+        for branch in ["bot/19-antidisestablishmentarianism-abc123", "bot/19-strengthlessness-abc123",
+                       f"bot/19-{twenty}-abc123"]:
             for status, phrase in [("pushed", "branch is pushed"), ("in-progress", "coding is running"),
                                    ("stopped", "nothing was pushed")]:
                 with self.subTest(branch=branch, status=status):

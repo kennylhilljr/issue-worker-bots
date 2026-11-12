@@ -728,14 +728,13 @@ TOKEN_HEAD = re.compile(r"gh[pousr]-|github-pat-|sk-|xox[abpr]-|akia|eyj")
 def random_word(w):
     """A word that reads like generated secret material rather than language: 32 characters or more (longer than
     ordinary words), 24 or more that hold a digit, or 16 or more that switch between letters and digits three or
-    more times or hold five consonants in a row. Long words such as internationalization,
-    antidisestablishmentarianism or base64urlencoding stay readable."""
+    more times. Letters alone are never judged by their spelling, so long words such as internationalization,
+    strengthlessness, antidisestablishmentarianism or base64urlencoding stay readable."""
     if len(w) >= 32 or len(w) >= 24 and re.search(r"\d", w):
         return True
     if len(w) < 16:
         return False
-    switches = len(re.findall(r"(?<=[a-z])(?=\d)|(?<=\d)(?=[a-z])", w))
-    return switches >= 3 or bool(re.search(r"[bcdfghjklmnpqrstvwxz]{5}", w))
+    return len(re.findall(r"(?<=[a-z])(?=\d)|(?<=\d)(?=[a-z])", w)) >= 3
 
 
 def safe_branch(branch):
