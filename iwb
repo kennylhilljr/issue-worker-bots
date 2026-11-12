@@ -29,8 +29,8 @@
       Step 4b: for each plan that step 4a approved and that has a free slot (config.json "code_concurrency",
       default 4, at most "max_parallel", default 3, per runner, one per repository), a coding run started as its own
       process (`iwb code --job FILE`, never run by hand), holding its issue's and repository's locks until it ends.
-      With "runner_fallback" a plan whose runner is usage-limited goes to the other runner when the plan's
-      approver is of another model family. Each run: in a repository listed in config.json "coding_repos": an
+      With "runner_fallback" a plan whose runner is usage-limited goes to the other runner, whatever the plan's
+      approver; its PR is reviewed by the family other than the runner that wrote it. Each run: in a repository listed in config.json "coding_repos": an
       orchestrator run in iwb's own clone, one commit by the worker bot on bot/<n>-<slug>-<attempt>, and a draft PR marked
       ready (bot:in-progress, then bot:pr-open). In tick only when "coding_live" is true.
       Step 5, when config.json "auto_merge" is true: for each open worker PR, one repair round on P0-P2 findings in
@@ -2433,10 +2433,9 @@ def fallback_note(entry, runner, usual, state):
     until = (state.get("_runner_quota") or {}).get(usual)
     when = f" until {time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(until))}" \
         if isinstance(until, (int, float)) and until > time.time() else ""
-    approver = (entry.get("work") or {}).get("approver") or (entry.get("approval") or {}).get("approver")
     return (f"\n\nRunner switched from `{usual}` to `{runner}`: the `{usual}` runner is at its usage limit{when}. "
-            f"The plan's approver `{approver}` is of another model family than `{runner}`, so the plan's approval "
-            f"and the PR's cross-review stay independent of the code's author.")
+            f"The PR is labeled `agent:{runner}`, so its cross-review, and the merge that waits for it, comes from "
+            f"`{other_runner(runner)}`, the other family than the code's author.")
 
 
 def repo_checks_config(d, ecc_cfg):
@@ -3087,24 +3086,18 @@ def runner_family(name):
     return fams.pop() if len(fams) == 1 else None
 
 
-def fallback_allowed(entry, runner):
-    """Whether `runner` may code this issue's plan in place of its worker's own runner: only when the plan's
-    approver is of another model family, so the plan, its approval and the PR review are never one family's."""
-    approver = (entry.get("approval") or {}).get("approver") or (entry.get("work") or {}).get("approver")
-    fam = runner_family(approver)
-    return fam is not None and fam != runner_family(runner)
-
-
 def pick_runner(entry, state, conf):
     """(runner, None) for the runner CLI to code this issue's plan now, or (None, reset time) while it must wait
     for a usage limit: the worker's own runner unless it is usage-limited, then with config.json
-    "runner_fallback": true the other one, when fallback_allowed and not usage-limited itself."""
+    "runner_fallback": true the other one when it is not usage-limited itself, whatever the plan's approver's
+    family: the PR is labeled with the runner that wrote it, so its cross-review (and the merge gate) comes from
+    the other family than the code's author."""
     now, agent = time.time(), entry["agent"]
     quota = state.get("_runner_quota") or {}
     for r in [agent] + [x for x in REQUIRED_RUNNERS if x != agent]:
         if quota.get(r, 0) > now:
             continue
-        if r == agent or conf.get("runner_fallback") is True and fallback_allowed(entry, r):
+        if r == agent or conf.get("runner_fallback") is True:
             return r, None
     return None, quota.get(agent, 0)
 
