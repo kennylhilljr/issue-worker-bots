@@ -1167,6 +1167,96 @@ class Approve(unittest.TestCase):
         self.assertEqual(iwb.denied_command("curl https://x"), "curl")
 
 
+class ScanRules(unittest.TestCase):
+    NOW = 1000000
+    WEEK = 7 * 86400
+    GOOD = dict(title="t", category="stale-docs", area="README.md", root_cause=None, evidence="README.md:3",
+                why="w", change="c", acceptance="a", confidence=90, fingerprint="stale-docs:README.md:install")
+
+    def due(self, record, **kw):
+        return iwb.scan_due(record, iwb.SCAN_INTERVAL_DAYS, self.NOW, **kw)
+
+    @staticmethod
+    def wrap(obj):
+        return "Findings:\n```json\n" + json.dumps(obj) + "\n```\n"
+
+    def test_constants(self):
+        self.assertEqual(iwb.SCAN_INTERVAL_DAYS, 7)
+        self.assertEqual(iwb.SCAN_FIELDS, ("title", "category", "area", "root_cause", "evidence", "why", "change",
+                                           "acceptance", "confidence", "fingerprint"))
+
+    def test_due_rules(self):
+        now, week, hour = self.NOW, self.WEEK, iwb.RETRY_AFTER
+        self.assertTrue(self.due({}))                                              # never scanned
+        self.assertFalse(self.due({"at": now - 60}))                               # recent scan: not due
+        self.assertFalse(self.due({"at": now - week + 1}))                         # one second before the interval
+        self.assertTrue(self.due({"at": now - week}))                              # at the boundary
+        self.assertFalse(self.due({"at": now - 60, "failed_at": now - hour + 1}))  # failure just under an hour ago
+        self.assertTrue(self.due({"at": now - 60, "failed_at": now - hour}))       # failure an hour ago, recent at
+        self.assertTrue(self.due({"at": now - 60, "next_eligible_at": now - 60}))  # next_eligible_at past
+        self.assertTrue(self.due({"at": now - 60, "next_eligible_at": now}))
+        self.assertFalse(self.due({"at": now - 60, "next_eligible_at": now + 60}))  # next_eligible_at future
+        # conflicting timestamps
+        self.assertFalse(self.due({"at": now - 2 * week, "failed_at": now - 60, "next_eligible_at": now - 60}))
+        self.assertFalse(self.due({"at": now - 2 * week, "next_eligible_at": now + 60}))
+        self.assertTrue(self.due({"at": now - 2 * week, "failed_at": now - hour - 1}))
+
+    def test_manual_and_force(self):
+        now = self.NOW
+        self.assertTrue(self.due({"at": now - 60}, manual=True))
+        self.assertTrue(self.due({"at": now - 60, "next_eligible_at": now + 60}, manual=True))
+        self.assertFalse(self.due({"at": now - 60, "failed_at": now - 60}, manual=True))
+        self.assertTrue(self.due({"at": now - 60, "failed_at": now - iwb.RETRY_AFTER}, manual=True))
+        self.assertTrue(self.due({"at": now - 60, "failed_at": now - 60, "next_eligible_at": now + 60}, force=True))
+        self.assertTrue(self.due({"at": now - 60, "failed_at": now - 60}, manual=True, force=True))
+
+    def test_parse_scan_answer_types(self):
+        good = self.GOOD
+        both = [good, dict(good, root_cause="r", confidence=80.5)]
+        self.assertEqual(iwb.parse_scan_answer(self.wrap({"findings": both})), both)
+        self.assertEqual(iwb.parse_scan_answer(self.wrap({"findings": []})), [])
+        for c in (0, 100, 0.0, 100.0):
+            got = iwb.parse_scan_answer(self.wrap({"findings": [dict(good, confidence=c)]}))
+            self.assertEqual(got[0]["confidence"], c)
+        # the last block wins, earlier ones are ignored either way
+        text = self.wrap({"findings": "x"}) + self.wrap({"findings": [good]})
+        self.assertEqual(iwb.parse_scan_answer(text), [good])
+        bad = {
+            "no block": "no json here " + json.dumps({"findings": [good]}),
+            "malformed last block": self.wrap({"findings": [good]}) + "```json\n{not json\n```\n",
+            "non-object last block": self.wrap({"findings": [good]}) + self.wrap([good]),
+            "not an object": self.wrap([good]),
+            "findings missing": self.wrap({"other": []}),
+            "findings not a list": self.wrap({"findings": "x"}),
+            "finding not an object": self.wrap({"findings": ["x"]}),
+            "confidence bool": self.wrap({"findings": [dict(good, confidence=True)]}),
+            "confidence str": self.wrap({"findings": [dict(good, confidence="90")]}),
+            "confidence null": self.wrap({"findings": [dict(good, confidence=None)]}),
+            "confidence below 0": self.wrap({"findings": [dict(good, confidence=-1)]}),
+            "confidence above 100": self.wrap({"findings": [dict(good, confidence=100.5)]}),
+            "root_cause int": self.wrap({"findings": [dict(good, root_cause=3)]}),
+        }
+        for k in iwb.SCAN_FIELDS:
+            bad[f"{k} missing"] = self.wrap({"findings": [{f: v for f, v in good.items() if f != k}]})
+        for k in ("title", "category", "area", "evidence", "why", "change", "acceptance", "fingerprint"):
+            bad[f"{k} null"] = self.wrap({"findings": [dict(good, **{k: None})]})
+            bad[f"{k} int"] = self.wrap({"findings": [dict(good, **{k: 1})]})
+        for name, text in bad.items():
+            with self.subTest(name):
+                with self.assertRaises(ValueError):
+                    iwb.parse_scan_answer(text)
+
+    def test_filter_findings(self):
+        f = lambda conf, fp: {"confidence": conf, "fingerprint": fp, "title": fp + str(conf)}
+        found = [f(82, "a"), f(60, "b"), f(95, "c"), f(90, "a"), f(80, "d"), f(79, "e")]
+        before = json.dumps(found)
+        kept = iwb.filter_findings(found)
+        self.assertEqual([x["title"] for x in kept], ["c95", "a90", "d80"])
+        self.assertEqual(json.dumps(found), before)                     # inputs untouched
+        self.assertEqual(iwb.filter_findings([]), [])
+        self.assertEqual([x["title"] for x in iwb.filter_findings([f(79.9, "a"), f(80.0, "b")])], ["b80.0"])
+
+
 class RedCheckSandbox(unittest.TestCase):
     def setUp(self):
         need_sandbox_exec(self)
