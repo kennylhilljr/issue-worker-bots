@@ -2342,12 +2342,14 @@ class Code(unittest.TestCase):
         iwb.CONFIG.write_text(json.dumps({**self.PILOT, "runner_fallback": fallback}))
 
     def test_a_usage_limited_runner_hands_the_plan_to_the_other_one(self):
-        self.limit_codex("codex-pr-gh")                                  # approver of another family than claude
+        # the approver's family does not matter: claude may code a codex plan that claude-pr-gh approved, since
+        # the PR is labeled agent:claude and so reviewed (and merge-gated) by codex
+        self.limit_codex("claude-pr-gh")
         self.changed = ["README.md", "skills/README.md"]
         self.run_pass()
         self.assertEqual(self.labels(), ["bot:in-progress", "bot:pr-open"])
         self.assertIn("Runner switched from `codex` to `claude`", self.posts[0][2])
-        self.assertIn("`codex-pr-gh`", self.posts[0][2])
+        self.assertIn("cross-review, and the merge that waits for it, comes from `codex`", self.posts[0][2])
         self.assertEqual(self.policy_of(self.ecc_calls[1])["author_providers"], ["claude"])
         w = self.state()["work"]
         self.assertEqual((w["runner"], w["fallback_from"], w["status"]), ("claude", "codex", "pr-open"))
@@ -2376,16 +2378,37 @@ class Code(unittest.TestCase):
         self.run_pass()
         self.assertEqual(len(self.ecc_calls), calls)                     # not again within the hour
 
-    def test_no_fallback_when_the_approver_is_the_new_runners_family(self):
-        for approver, fallback in (("claude-pr-gh", True), ("codex-pr-gh", False), ("someone", True)):
-            with self.subTest(approver=approver, fallback=fallback):
-                self.limit_codex(approver, fallback)
-                log = self.run_pass()
-                self.assertIn("coding waits for the codex usage limit", log)
-                self.assertEqual((self.ecc_calls, self.posts), ([], []))
+    def test_fallback_whatever_the_approvers_family(self):
+        for approver in ("claude-pr-gh", "codex-pr-gh", "someone", None):
+            with self.subTest(approver=approver):
+                self.limit_codex(approver)
+                self.assertEqual(iwb.pick_runner(self.state(), json.loads(iwb.STATE.read_text()),
+                                                 json.loads(iwb.CONFIG.read_text())), ("claude", None))
+
+    def test_a_usage_limited_claude_hands_the_plan_to_codex(self):
+        # the symmetric case: a claude plan approved by codex-pr-gh is coded by codex and reviewed by claude
+        self.approve_plan([REAL_TIER0_UNIT])
+        state = json.loads(iwb.STATE.read_text())
+        state[self.KEY]["approval"]["approver"] = "codex-pr-gh"
+        state["_runner_quota"] = {"claude": time.time() + 7200}
+        iwb.STATE.write_text(json.dumps(state))
+        iwb.CONFIG.write_text(json.dumps({**self.PILOT, "runner_fallback": True}))
+        self.changed = ["README.md", "skills/README.md"]
+        self.run_pass()
+        self.assertIn("Runner switched from `claude` to `codex`", self.posts[0][2])
+        self.assertEqual(self.policy_of(self.ecc_calls[1])["author_providers"], ["codex"])
+        w = self.state()["work"]
+        self.assertEqual((w["runner"], w["fallback_from"]), ("codex", "claude"))
+        bot, _, label_agent, _ = self.prs[0]
+        self.assertEqual((bot, label_agent), ("claude-dev", "codex"))   # so prbot has claude review it
+        self.assertEqual(iwb.other_runner(iwb.pr_runner(self.state())), "claude")
+
+    def test_no_fallback_without_the_setting_or_with_both_runners_limited(self):
+        self.limit_codex("claude-pr-gh", fallback=False)
+        self.assertIn("coding waits for the codex usage limit", self.run_pass())
+        self.assertEqual((self.ecc_calls, self.posts), ([], []))
         state = json.loads(iwb.STATE.read_text())
         state["_runner_quota"]["claude"] = time.time() + 60             # both limited: wait even when allowed
-        state[self.KEY]["approval"]["approver"] = "codex-pr-gh"
         iwb.STATE.write_text(json.dumps(state))
         iwb.CONFIG.write_text(json.dumps({**self.PILOT, "runner_fallback": True}))
         self.assertIn("coding waits for the codex usage limit", self.run_pass())
