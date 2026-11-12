@@ -21,7 +21,7 @@ Intake and analysis are live on all of `kennylhilljr`'s repositories. Plan appro
 | --- | --- |
 | 1. Worker Apps (`claude-dev-gh`, `codex-dev-gh`) | Done. Installed on all of Kenny's repositories with contents, issues and pull requests read and write. |
 | 2. Intake watcher | Live: launchd runs it every 5 minutes. Trusts Kenny and `openclaw-ops-assist[bot]`; the 6 issues open at install were skipped. |
-| 3. Analysis step | Live: launchd runs `tick` (intake, then one analysis) every 5 minutes. |
+| 3. Analysis step | Live: launchd runs `tick` (intake, then up to three analyses at once) every 5 minutes. |
 | 4. Clarity, policy and red-check gates, agent plan approval, orchestrator runs, draft PRs | 4a, gates and approval: built, runs when `approval_live` is set. 4b, coding and draft PRs: built and tested with fakes, pilot on `kennylhilljr/ecc-customization`, not yet run live; runs when `coding_live` is set. |
 | 5. Review hand-off, repair round and gated merge | Built and tested with fakes; runs when `auto_merge` is set (with `coding_live`). |
 | 6. More repositories and model tuning | Not started. |
@@ -123,8 +123,8 @@ launchd starts each queue job again, at most once a minute, for as long as its f
 
 | Folder | What goes there |
 | --- | --- |
-| `~/.local/state/github-events/iwb/` | New events from the router, and the untouched files of issues that only hit a per-pass limit (one analysis per run, for example). Those are taken first on the next run. |
-| `~/.local/state/github-events/iwb-deferred/` | Files of an issue whose step failed, even when the step caught the error itself (a model, post or push failure; the run exits 1), or whose GitHub read failed (exit 0). Each such move adds 1 to an `attempts` field in the file. Issues waiting for capacity, a pause or a delay also go here, without counting an attempt: every queued event and sweep while `"paused": true` is set in `config.json`, another pass holding `work.lock` (only for an issue that has coding to do), two issues already being coded, the hour after a model failure. The hourly `tick` moves them all back into their queue after its scan. |
+| `~/.local/state/github-events/iwb/` | New events from the router, and the untouched files of issues that only hit a per-pass limit (`analysis_concurrency` analyses per run, for example). Those are taken first on the next run. |
+| `~/.local/state/github-events/iwb-deferred/` | Files of an issue whose step failed, even when the step caught the error itself (a model, post or push failure; the run exits 1), or whose GitHub read failed (exit 0). Each such move adds 1 to an `attempts` field in the file. Issues waiting for capacity, a pause or a delay also go here, without counting an attempt: every queued event and sweep while `"paused": true` is set in `config.json`, another pass holding `work.lock` (only for an issue that has coding to do), no free coding slot (`code_concurrency`, `max_parallel`, or a run already going in the repository), the hour after a model failure. The hourly `tick` moves them all back into their queue after its scan. |
 | `~/.local/state/github-events/iwb-rejected/` | Anything that can never be handled: bad JSON, no valid repo or issue number, a pull request (including an issue event whose number turns out to be a pull request), a repository the bots aren't installed on, files deferred 24 times, and every other entry found in the queue: stray files such as `.DS_Store`, folders (moved whole, contents untouched) and symlinks (the link itself moves; its target is never followed or touched). Nothing reads or clears this folder; look through it and empty it by hand now and then. |
 
 Handled issues' files are deleted. An empty or missing queue folder exits 0 without a log line. A burst of new issues larger than the per-pass limits drains one run at a time, about a minute apart: each run starts with a fresh budget, so its first issue always goes through, and the issues it couldn't reach stay in the queue for the next run. Plain `tick` reads the issue queue folder from `IWB_QUEUE_DIR`, with the path above as the default; the code queue is the folder next to it with `-code` added.
@@ -133,7 +133,7 @@ A queue folder is only touched if it is the default path, or its parent folder h
 
 [`launchd/`](launchd/README.md) holds the proposed jobs: the issue queue job and the code job, which launchd starts whenever their folders have entries, and the full-scan `tick` slowed to once an hour as a backstop. They are not installed by `install-intake.sh`; the steps and the rollback are in `launchd/README.md`.
 
-Both forms of `tick` take `~/.local/state/issue-worker-bots/tick.lock` (non-blocking) for intake, analysis and approval, so the two jobs never run those steps at once. A run that finds the lock held logs a line and exits 0. A queue run then leaves the folder as it is, since the run holding the lock is active, and launchd starts it again a minute later. Coding, in the code job and in the hourly `tick`, takes `work.lock`, so only one coding pass runs at a time.
+Both forms of `tick` take `~/.local/state/issue-worker-bots/tick.lock` (non-blocking) for intake, analysis and approval, so the two jobs never run those steps at once. A run that finds the lock held logs a line and exits 0. A queue run then leaves the folder as it is, since the run holding the lock is active, and launchd starts it again a minute later. Coding passes, in the code job and in the hourly `tick`, take `work.lock`, so only one pass at a time chooses what to code; the runs themselves go on in their own processes (see "Parallel runs").
 
 ## How an issue is handled
 
@@ -145,7 +145,7 @@ The worker is chosen by an `agent:claude` or `agent:codex` label; otherwise the 
 
 ### Analysis
 
-`iwb analyze` takes one picked-up issue per pass, clones its repository read-only with the worker bot's token, and runs the worker's strongest model on it (override the models in `config.json` under `analysis_models`). Only the issue and comments from Kenny, trusted openers and the worker bots, plus the review bots' plan verdicts, go into the prompt; other people's comments are left out.
+`iwb analyze` takes up to `analysis_concurrency` (default 3) picked-up issues per pass and runs their analyses at the same time. For each it clones its repository read-only with the worker bot's token, and runs the worker's strongest model on it (override the models in `config.json` under `analysis_models`). Only the issue and comments from Kenny, trusted openers and the worker bots, plus the review bots' plan verdicts, go into the prompt; other people's comments are left out.
 
 The model answers with exactly one of:
 
@@ -161,7 +161,7 @@ In step 4a a plan can go back to the planner twice at most: once when `lint-plan
 
 ### Coding (step 4b)
 
-`iwb code` takes one plan per pass that step 4a approved (the plan file must be unchanged since the approval) in a repository listed in `coding_repos`. The worker labels the issue `bot:in-progress` and runs the orchestrator in `iwb`'s own clone of the repository: `ecc review-plan --approve` with the approving review bot as operator, `ecc create-run --yes --review-id`, then the same pair for `ecc drive`, with `bot/<n>-<slug>` as the target branch. The branch is then fetched into a new repository that `iwb` makes (no hooks, no config from the clone or the home folder), where the changed files are checked against the plan's scope and the protected paths, committed once as the worker bot, and pushed to the `bot/` branch on `https://github.com/<owner>/<repo>` only. The clone the agents worked in never sees a token. A draft PR with `Closes #<n>` and `agent:claude` or `agent:codex` is opened and marked ready, so `prbot watch` reviews it, and the issue gets `bot:pr-open`. A run that stops, or changes a file it shouldn't, gets `bot:blocked` and nothing is pushed. An approved plan with a unit whose `budget.maximum_cost_usd` is 0 or missing is never handed to `create-run`: it could only stop with `needs_owner`. The approval pins the plan file, so `iwb` leaves it as it is and labels the issue `bot:blocked`; removing the label replans the issue. Nothing is merged here; step 5 below decides that.
+`iwb code` takes the plans that step 4a approved, as many as there are free coding slots (see "Parallel runs") (the plan file must be unchanged since the approval) in a repository listed in `coding_repos`. The worker labels the issue `bot:in-progress` and runs the orchestrator in `iwb`'s own clone of the repository: `ecc review-plan --approve` with the approving review bot as operator, `ecc create-run --yes --review-id`, then the same pair for `ecc drive`, with `bot/<n>-<slug>` as the target branch. The branch is then fetched into a new repository that `iwb` makes (no hooks, no config from the clone or the home folder), where the changed files are checked against the plan's scope and the protected paths, committed once as the worker bot, and pushed to the `bot/` branch on `https://github.com/<owner>/<repo>` only. The clone the agents worked in never sees a token. A draft PR with `Closes #<n>` and `agent:claude` or `agent:codex` is opened and marked ready, so `prbot watch` reviews it, and the issue gets `bot:pr-open`. A run that stops, or changes a file it shouldn't, gets `bot:blocked` and nothing is pushed. An approved plan with a unit whose `budget.maximum_cost_usd` is 0 or missing is never handed to `create-run`: it could only stop with `needs_owner`. The approval pins the plan file, so `iwb` leaves it as it is and labels the issue `bot:blocked`; removing the label replans the issue. Nothing is merged here; step 5 below decides that.
 
 Settings in `~/.config/issue-worker-bots/config.json`; nothing is coded until both of the first two are set:
 
@@ -182,6 +182,16 @@ Settings in `~/.config/issue-worker-bots/config.json`; nothing is coded until bo
 | `test_commands` | none | `{"owner/repo": ["command", ...]}`: run on the PR head with the plan's acceptance commands before a merge. Run without a shell, sandboxed, with no network. |
 | `policy` | the seed list above for `ecc-customization` | Protected globs per repository, read the same way by the plan gate and the check after the run, on top of `.github/workflows/**`, `**/.env*`, `**/*.pem`, `**/*.key`, `**/secrets/**`, credentials and SSH key names. The older `{"deny_paths": [regex], "allow_paths": [regex]}` form also works; `allow_paths` never opens a built-in path. Either form replaces the seed list. A malformed entry (another key, an empty pattern, a bad regex) protects every path. |
 | `ecc_config` | certifications and catalog from the orchestrator runtime | Orchestrator config keys for the run (for example `repo_checks`). Coding waits, without posting, while the certifications file is missing. |
+| `code_concurrency` | 4 | Coding and repair runs going at once, across all repositories. |
+| `max_parallel` | 3 | Of those, the most one runner CLI (`claude` or `codex`) codes at once. |
+| `runner_fallback` | false | When the runner that would code a plan is at its usage limit, the other runner codes it instead of waiting, but only when the plan's approver is of another model family than that runner (see below). |
+| `analysis_concurrency` | 3 | Analyses per pass, run at the same time. |
+
+#### Parallel runs
+
+A coding pass (`iwb code`, the hourly `tick`, the code queue job) holds `work.lock` only while it chooses work. It starts each coding run and each repair round as its own process, `iwb code --job <file>`, and returns; the run then goes on for hours without the lock. Each run holds two locks under `~/.local/state/issue-worker-bots/locks/` for its whole life, its issue's and its repository's, which the pass takes before starting the process and the process inherits, so the kernel releases them when the run ends however it ends. That gives at most `code_concurrency` runs, at most `max_parallel` per runner, and never two runs in one repository. An issue labeled `bot:in-progress` whose issue lock is free has lost its run and is blocked as interrupted; one whose lock is held is left alone. When a run ends it starts a coding pass of its own (with `coding_live`), so a freed slot is used at once and open PRs are looked at. Merges (step 5) still run inside the pass, one at a time under `work.lock`. Each run saves only the fields of its own issue's state entry that it changed, under `state.lock`, so runs and passes saving at once keep each other's changes.
+
+With `runner_fallback`, a plan whose runner hit its usage limit (the "Coding paused" note) is handed to the other runner on the next pass, and the "Coding started" comment says so. This happens only when the plan's approver is of another model family than the new runner: a plan approved by `codex-pr-gh` can be coded by `claude` but never by `codex`. Step 4a has each worker's plans approved by the other agent's review bot, which is the family the fallback would switch to, so with those approvals the plan keeps waiting for its runner's reset; the fallback takes effect for a plan whose approver is of its worker's own family. The worker bot and its branch stay the same; the PR is labeled `agent:<runner>` with the runner that wrote the code, so its cross-review comes from the other family of that runner, and its repair round is written by that runner too (it waits for that runner's reset rather than switching). A run that failed because a reviewing runner (not the author) hit its limit waits for that runner's reset before the issue is tried again.
 
 ### Review, repair and gated merge (step 5)
 
@@ -213,12 +223,12 @@ Plans ready, questions posted and blocked issues appear in OpenClaw as `attentio
 
 | Command | What it does |
 | --- | --- |
-| `iwb tick` | What launchd runs: intake, then one analysis, then step 4a when `approval_live` is set and step 4b when `coding_live` is set. |
+| `iwb tick` | What launchd runs: intake, then up to `analysis_concurrency` analyses at once, then step 4a when `approval_live` is set and step 4b when `coding_live` is set. |
 | `iwb tick --from-queue DIR` | Intake, analysis and approval for only the issues named by event files in `DIR`, each once per run; hands issues ready to code to `DIR-code`. Deletes a handled issue's files and moves the rest to `DIR-deferred` or `DIR-rejected`. Exits 1 if an issue failed, 2 if `DIR` is not a queue folder. |
 | `iwb code --from-queue DIR` | Codes the issues handed off in `DIR`, with the same deferred and rejected folders. |
-| `iwb code [--dry-run]` | Codes one approved plan and opens its PR, then (with `auto_merge`) runs step 5 on open worker PRs. `--dry-run` prints what it would do. |
+| `iwb code [--dry-run]` | Starts a coding run for each approved plan that has a free slot (each run opens its PR), then (with `auto_merge`) runs step 5 on open worker PRs. `--dry-run` prints what it would do. |
 | `iwb intake [--dry-run] [--baseline] [--limit N]` | One pass over open issues; picks up at most N (default 5). `--dry-run` prints and saves nothing; `--baseline` marks the open issues as seen without commenting. |
-| `iwb analyze [--dry-run] [--limit N]` | Analyzes up to N picked-up issues (default 1) and posts a no-code answer, questions or a plan. |
+| `iwb analyze [--dry-run] [--limit N]` | Analyzes up to N picked-up issues at the same time (default `analysis_concurrency`, 3) and posts a no-code answer, questions or a plan. |
 
 Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bot:approved`, `bot:in-progress`, `bot:pr-open`, `bot:needs-kenny`, `bot:done` and `bot:blocked`; `bot:stale` is not built yet. `bot:stop` is set by Kenny.
 
