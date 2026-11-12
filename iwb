@@ -1457,6 +1457,72 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo_filter=None)
     return 0
 
 
+# ---------- scan helpers: due rules, answer parsing and finding filter (pure, no CLI yet) ----------
+
+SCAN_INTERVAL_DAYS = 7
+SCAN_FIELDS = ("title", "category", "area", "root_cause", "evidence", "why", "change", "acceptance",
+               "confidence", "fingerprint")
+SCAN_STR_FIELDS = ("title", "category", "area", "evidence", "why", "change", "acceptance", "fingerprint")
+
+
+def scan_due(record, interval_days, now, *, manual=False, force=False):
+    """Whether a repository's scan is due. record is state["_scan"][repo] (may be {}). First match wins."""
+    if force:
+        return True
+    if record.get("failed_at") is not None:
+        return now >= record["failed_at"] + RETRY_AFTER
+    if manual:
+        return True
+    if record.get("next_eligible_at") is not None:
+        return now >= record["next_eligible_at"]
+    if record.get("at") is None:
+        return True
+    return now >= record["at"] + interval_days * 86400
+
+
+def parse_scan_answer(text):
+    """The findings list from the last ```json block, or raises ValueError with the reason it is unusable."""
+    blocks = re.findall(r"```json\s*(.*?)\s*```", text, re.S)
+    if not blocks:
+        raise ValueError("the scan answer has no ```json block")
+    try:
+        a = json.loads(blocks[-1])
+    except ValueError:
+        raise ValueError("the scan answer's last json block is not readable JSON")
+    if not isinstance(a, dict):
+        raise ValueError("the scan answer is not a JSON object")
+    findings = a.get("findings")
+    if not isinstance(findings, list):
+        raise ValueError("findings is missing or not a list")
+    for i, f in enumerate(findings):
+        if not isinstance(f, dict):
+            raise ValueError(f"finding {i} is not an object")
+        missing = [k for k in SCAN_FIELDS if k not in f]
+        if missing:
+            raise ValueError(f"finding {i} is missing {', '.join(missing)}")
+        bad = [k for k in SCAN_STR_FIELDS if not isinstance(f[k], str)]
+        if bad:
+            raise ValueError(f"finding {i}: {', '.join(bad)} must be strings")
+        if f["root_cause"] is not None and not isinstance(f["root_cause"], str):
+            raise ValueError(f"finding {i}: root_cause must be a string or null")
+        c = f["confidence"]
+        if isinstance(c, bool) or not isinstance(c, (int, float)) or not 0 <= c <= 100:
+            raise ValueError(f"finding {i}: confidence must be a number from 0 to 100")
+    return findings
+
+
+def filter_findings(findings):
+    """Findings with confidence >= 80, the highest per fingerprint, by confidence descending. Inputs untouched."""
+    best = {}
+    for f in findings:
+        if not f["confidence"] >= 80:          # also drops NaN
+            continue
+        kept = best.get(f["fingerprint"])
+        if kept is None or f["confidence"] > kept["confidence"]:
+            best[f["fingerprint"]] = f
+    return sorted(best.values(), key=lambda f: f["confidence"], reverse=True)
+
+
 # ---------- step 4b: coding the approved plan and opening the PR ----------
 
 CODE_LIMIT = 1             # coding runs per pass
