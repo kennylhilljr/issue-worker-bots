@@ -26,7 +26,11 @@
       plan was analyzed, the state entry is marked stale_plan (no approval or coding anywhere until a new
       analysis), an event goes back to the issue queue, and nothing is coded.
   iwb code [--dry-run]
-      Step 4b: for one plan that step 4a approved, in a repository listed in config.json "coding_repos": an
+      Step 4b: for each plan that step 4a approved and that has a free slot (config.json "code_concurrency",
+      default 4, at most "max_parallel", default 3, per runner, one per repository), a coding run started as its own
+      process (`iwb code --job FILE`, never run by hand), holding its issue's and repository's locks until it ends.
+      With "runner_fallback" a plan whose runner is usage-limited goes to the other runner when the plan's
+      approver is of another model family. Each run: in a repository listed in config.json "coding_repos": an
       orchestrator run in iwb's own clone, one commit by the worker bot on bot/<n>-<slug>-<attempt>, and a draft PR marked
       ready (bot:in-progress, then bot:pr-open). In tick only when "coding_live" is true.
       Step 5, when config.json "auto_merge" is true: for each open worker PR, one repair round on P0-P2 findings in
@@ -36,7 +40,8 @@
   iwb analyze [--dry-run] [--limit N]
       Step 3: for each picked-up issue (or one where the owner answered the bot's questions), run the
       worker's strongest model read-only on a fresh clone and post either questions (bot:needs-info) or
-      a plan in orchestrator format (bot:planned). One analysis per pass by default.
+      a plan in orchestrator format (bot:planned). Up to config.json "analysis_concurrency" (default 3) analyses
+      per pass, run at the same time.
   iwb intake [--dry-run] [--baseline] [--limit N]
       One pass over open issues on every repository the worker bots are installed on. An issue
       qualifies when the owner opened it, or the owner added the bot:work label. The chosen worker
@@ -178,16 +183,19 @@ def state_lock_path():
 
 def merge_changes(disk, old, new):
     """Apply what changed from `old` to `new` onto `disk`, one field deep: inside an issue's entry only the fields
-    this pass changed are written, so another pass's change to other fields of the same entry stays."""
+    this pass changed are written, so another pass's change to other fields of the same entry stays. A key this
+    pass created that another pass created too meanwhile (two coding runs recording `_runner_quota` for different
+    runners) is merged the same way, as if this pass had found it empty."""
     for k in set(old) | set(new):
         if k not in new:
             disk.pop(k, None)
         elif k not in old or old[k] != new[k]:
-            if isinstance(old.get(k), dict) and isinstance(new[k], dict) and isinstance(disk.get(k), dict):
-                for f in set(old[k]) | set(new[k]):
+            was = old.get(k, {})
+            if isinstance(was, dict) and isinstance(new[k], dict) and isinstance(disk.get(k), dict):
+                for f in set(was) | set(new[k]):
                     if f not in new[k]:
                         disk[k].pop(f, None)
-                    elif f not in old[k] or old[k][f] != new[k][f]:
+                    elif f not in was or was[f] != new[k][f]:
                         disk[k][f] = new[k][f]
             else:
                 disk[k] = new[k]
@@ -384,7 +392,7 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None, repo_filte
 # ---------- step 3: analysis, with the strongest model, read-only ----------
 
 ANALYSIS_MODELS = {"claude": {"model": "opus", "effort": "high"}, "codex": {"model": "gpt-6-astra", "effort": "high"}}
-ANALYZE_LIMIT = 1         # analyses per pass; they are the most expensive step
+ANALYZE_LIMIT = 3         # analyses per pass, run in parallel; config.json "analysis_concurrency"
 MAX_ATTEMPTS = 2          # unusable answers before the issue is marked bot:blocked
 RETRY_AFTER = 3600        # seconds before retrying after a model failure (usage limit, outage)
 A_MARKER = "<!-- iwb:analysis -->"
@@ -454,6 +462,24 @@ EXAMPLE_UNIT = {
 
 def read_config():
     return json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+
+
+CONCURRENCY_CEILING = 16  # the most any concurrency key in config.json may ask for
+
+
+def conf_count(name, default, conf=None):
+    """config.json `name` as a whole number from 1 to CONCURRENCY_CEILING; `default` when it is missing, and with a
+    log line when it is anything else, so a typo never stops the bots or starts dozens of runs."""
+    v = (read_config() if conf is None else conf).get(name, default)
+    if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= CONCURRENCY_CEILING:
+        log(f"config.json {name} must be a whole number from 1 to {CONCURRENCY_CEILING}, not {v!r}; using {default}")
+        return default
+    return v
+
+
+def analysis_limit(conf=None):
+    """Analyses per pass, run at the same time: config.json "analysis_concurrency" (default ANALYZE_LIMIT)."""
+    return conf_count("analysis_concurrency", ANALYZE_LIMIT, conf)
 
 
 MAX_COST_CEILING = 100    # the most config.json "max_cost_usd_per_issue" may be; a typo shouldn't buy a $1e9 run
@@ -835,8 +861,48 @@ def command_reply(cmd, entry, slug, repo=None):
     return "There's no code change planned here. Describe the change you want and I'll plan it."
 
 
-def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo_filter=None):
+def analyze_one(job):
+    """The expensive part of one analysis, safe to run in a thread: a fresh clone, the model, the answer parsed.
+    Returns the answer; raises what cmd_analyze handles (model or clone failure, unusable answer)."""
+    work = None
+    try:
+        work, branch, sha = clone(job["repo"], job["bot"])
+        cost = issue_cost()
+        prompt = ANALYSIS_PROMPT.format(repo=job["repo"], branch=branch, sha=sha[:10], cost=f"${cost}",
+                                        example=json.dumps(example_unit(cost), indent=1))
+        raw = run_model(job["agent"], prompt, job["text"], f"{work}/repo")
+        try:
+            return parse_answer(raw)
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"{type(e).__name__}: {e}") from e
+    finally:
+        if work:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def run_parallel(fn, jobs, workers):
+    """[(result, None) or (None, exception)] for fn(job) over `jobs`, in their order, at most `workers` at a time.
+    One job runs in this thread. Callers change state only from the results, in this thread."""
+    def one(job):
+        try:
+            return fn(job), None
+        except (Exception, SystemExit) as e:
+            return None, e
+    if len(jobs) <= 1 or workers <= 1:
+        return [one(j) for j in jobs]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
+        return list(pool.map(one, jobs))
+
+
+def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
+    """Step 3. Issues are read and chosen one at a time; then up to `limit` (config.json "analysis_concurrency")
+    analyses run at the same time, and their answers are posted in order."""
     state, since = load_state()
+    if limit is None:
+        limit = analysis_limit()
     paused = read_config().get("paused", False)
     cfg = prbot.load_config()
     owner = cfg[next(b for b in WORKERS.values() if b in cfg)]["owner"]
@@ -844,7 +910,7 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo_filter=None)
     bot_logins = {cfg[b]["slug"] + "[bot]" for b in WORKERS.values() if b in cfg}
     worker_slugs = [cfg[b]["slug"] for b in WORKERS.values() if b in cfg]
     approver_logins = {cfg[b]["slug"] + "[bot]" for b in ("claude", "codex") if b in cfg}   # the review bots
-    runs = 0
+    runs, jobs = 0, []
     for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
         if "agent" not in entry or paused or only is not None and key not in only \
                 or repo_filter is not None and not key.startswith(repo_filter + "#"):
@@ -926,24 +992,21 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo_filter=None)
         agent, bot = entry["agent"], WORKERS[entry["agent"]]
         model = analysis_model(agent)["model"]
         log(f"{key}: analyzing with {model} ({why})")
-        work = None
-        try:
-            work, branch, sha = clone(repo, bot)
-            cost = issue_cost()
-            prompt = ANALYSIS_PROMPT.format(repo=repo, branch=branch, sha=sha[:10], cost=f"${cost}",
-                                            example=json.dumps(example_unit(cost), indent=1))
-            raw = run_model(agent, prompt, text, f"{work}/repo")
-            try:
-                answer = parse_answer(raw)
-            except ValueError:
-                raise
-            except Exception as e:
-                raise ValueError(f"{type(e).__name__}: {e}") from e
-        except (RuntimeError, subprocess.SubprocessError, SystemExit) as e:
+        jobs.append({"key": key, "entry": entry, "repo": repo, "number": number, "issue": issue, "text": text,
+                     "digest": digest, "replan_at": replan_at, "agent": agent, "bot": bot, "model": model})
+    for job, (answer, err) in zip(jobs, run_parallel(analyze_one, jobs, limit)):
+        key, entry, repo, number, issue = job["key"], job["entry"], job["repo"], job["number"], job["issue"]
+        digest, replan_at, bot, model = job["digest"], job["replan_at"], job["bot"], job["model"]
+        if isinstance(err, (RuntimeError, subprocess.SubprocessError, SystemExit)):
             entry["analysis_failed_at"] = time.time()
-            mark(key, "failed", f"analysis could not run; retrying in {RETRY_AFTER // 60} minutes: {e}")
+            mark(key, "failed", f"analysis could not run; retrying in {RETRY_AFTER // 60} minutes: {err}")
             continue
-        except ValueError as e:
+        if err is not None and not isinstance(err, ValueError):
+            entry["analysis_failed_at"] = time.time()          # was an uncaught crash of the whole pass
+            mark(key, "failed", f"analysis crashed; retrying in {RETRY_AFTER // 60} minutes: {err!r}")
+            continue
+        if err is not None:
+            e = err
             entry["attempts"] = entry.get("attempts", 0) + 1
             log(f"{key}: unusable answer ({e}); attempt {entry['attempts']} of {MAX_ATTEMPTS}")
             if entry["attempts"] >= MAX_ATTEMPTS and not dry_run:
@@ -957,9 +1020,6 @@ def cmd_analyze(dry_run=False, limit=ANALYZE_LIMIT, only=None, repo_filter=None)
             else:
                 mark(key, "deferred")         # the next pass asks the model again
             continue
-        finally:
-            if work:
-                shutil.rmtree(work, ignore_errors=True)
         slug = prbot.bot_config(bot)["slug"]
         if answer["decision"] == "plan":
             body, label = plan_comment(answer, slug, model), "bot:planned"
@@ -1623,9 +1683,7 @@ def filter_findings(findings):
 
 # ---------- step 4b: coding the approved plan and opening the PR ----------
 
-CODE_LIMIT = 1             # coding runs per pass
 PR_STATUSES = ("pr-open", "needs-kenny", "merged", "pr-closed")   # work statuses once the PR exists (step 5)
-IN_PROGRESS_LIMIT = 2      # issues being coded at once (DESIGN.md "Budgets and limits")
 DRIVE_TIMEOUT = 6 * 3600
 RUNNER_TIMEOUT = 3600      # hard ceiling per coding attempt; the orchestrator's budget.minutes is advisory only
 POLL = 30                  # seconds between checks for bot:stop and pause while drive runs
@@ -2206,6 +2264,7 @@ def code_plan(key, entry, issue, state, since, ecc):
         raise RuntimeError(drift)
     agent, w = entry["agent"], entry["work"]
     worker = WORKERS[agent]
+    runner = w.get("runner") or agent   # another runner than the worker's own only by pick_runner's fallback
     units = json.loads(Path(entry["plan_file"]).read_text())["units"]
     free = [u["id"] for u in units if cost_problem(u)]
     if free:                        # approval pins the plan file, so a plan with no cost budget needs a new plan
@@ -2221,14 +2280,15 @@ def code_plan(key, entry, issue, state, since, ecc):
     branch = f"bot/{number}-{slugify(issue['title'])}-{hashlib.sha256(run_id.encode()).hexdigest()[:6]}"
     wslug = prbot.bot_config(worker)["slug"]
     url = post(worker, repo, number, f"{W_MARKER}\nPlan approved by `{w['approver']}`. Coding started on "
-               f"`{branch}` (orchestrator run `{run_id}`).", "bot:in-progress")
+               f"`{branch}` (orchestrator run `{run_id}`).{fallback_note(entry, runner, agent, state)}",
+               "bot:in-progress")
     w.update(status="in-progress", branch=branch, run_id=run_id, started_at=time.time(), started_comment=url)
     save_state(state, since)        # a pass that dies mid-run leaves in-progress behind, which the next pass reports
     log(f"{key}: coding started, run {run_id}")
     try:
         d, default, base = checkout(repo, worker, branch, number, issue, units)
-        w["plan_sha256"] = drive_units(ecc, d, repo, number, agent, units, branch, run_id, w["approver"], conf, cost,
-                                       ecc_cfg)
+        w["plan_sha256"] = drive_units(ecc, d, repo, number, runner, units, branch, run_id, w["approver"], conf,
+                                       cost, ecc_cfg)
         sha = publish(worker, repo, d, base, branch, default, units, f"{issue['title']} (#{number})\n\nCloses "
                       f"#{number}. Planned by {wslug}, approved by {w['approver']}, orchestrator run {run_id}.")
     except Stopped as e:
@@ -2245,7 +2305,7 @@ def code_plan(key, entry, issue, state, since, ecc):
         quota = runner_quota(run_id) if isinstance(e, WorkError) else None
         if quota:
             runner, msg, until = quota
-            runner = runner or agent
+            runner = runner or w.get("runner") or agent
             state["_runner_quota"] = {**(state.get("_runner_quota") or {}), runner: until}
             w.update(status="quota", at=time.time(), problem=f"{runner} usage limit")
             when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(until))
@@ -2271,6 +2331,19 @@ def code_plan(key, entry, issue, state, since, ecc):
     w.update(status="pushed", default=default, pr_body=body)
     save_state(state, since)        # pushed: a retry opens the PR from this branch and never pushes again
     finish_pr(key, entry, issue, state, since)
+
+
+def fallback_note(entry, runner, usual, state):
+    """The sentence an issue comment adds when `runner` codes in place of `usual` (runner fallback), else ""."""
+    if runner == usual:
+        return ""
+    until = (state.get("_runner_quota") or {}).get(usual)
+    when = f" until {time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(until))}" \
+        if isinstance(until, (int, float)) and until > time.time() else ""
+    approver = (entry.get("work") or {}).get("approver") or (entry.get("approval") or {}).get("approver")
+    return (f"\n\nRunner switched from `{usual}` to `{runner}`: the `{usual}` runner is at its usage limit{when}. "
+            f"The plan's approver `{approver}` is of another model family than `{runner}`, so the plan's approval "
+            f"and the PR's cross-review stay independent of the code's author.")
 
 
 def repo_checks_config(d, ecc_cfg):
@@ -2622,13 +2695,15 @@ def checkout_pr(repo, bot, branch, sha, number, issue, units):
     return d, default, sha
 
 
-def repair_round(key, entry, issue, state, since, ecc, review, findings, sha):
+def repair_round(key, entry, issue, state, since, ecc, review, findings, sha, runner=None):
     """The one repair round: the findings as orchestrator units on the PR branch, pushed as one more commit by the
-    worker bot; prbot then reviews the new head. A failure leaves the PR for Kenny."""
+    worker bot; prbot then reviews the new head. A failure leaves the PR for Kenny. `runner` authors the fixes
+    (default: the runner that coded the PR)."""
     repo, number = key.rsplit("#", 1)
     owner, name = repo.split("/")
     w, agent = entry["work"], entry["agent"]
     worker = WORKERS[agent]
+    runner = runner or w.get("runner") or agent
     units = repair_units(findings, json.loads(Path(entry["plan_file"]).read_text())["units"])
     problems = policy_violations(units, repo)
     if problems:
@@ -2643,19 +2718,20 @@ def repair_round(key, entry, issue, state, since, ecc, review, findings, sha):
         raise RuntimeError(drift)
     run_id = f"iwb.{owner}.{name}.{number}.repair.{time.strftime('%Y%m%d%H%M%S', time.gmtime())}"
     w["repair"] = {"status": "running", "from": sha, "run_id": run_id, "review": review.get("url", ""),
-                   "findings": len(findings), "units": units, "at": time.time()}
+                   "findings": len(findings), "units": units, "at": time.time(), "runner": runner}
     save_state(state, since)        # the round is spent from here on: it never runs twice for this PR
+    switched = fallback_note(entry, runner, w.get("runner") or agent, state)
     try:
         run_gh_as(worker, repo, ["issue", "comment", number, "-R", repo, "--body",
                                  f"{W_MARKER}\nRepair round started on {w['pr']} for {len(findings)} P0-P2 finding"
                                  f"{'s' if len(findings) != 1 else ''} in {review.get('url', 'the review')} "
-                                 f"(run `{run_id}`)."])
+                                 f"(run `{run_id}`).{switched}"])
     except RuntimeError as e:
         log(f"{key}: could not post the repair note: {e}")
     log(f"{key}: repair round started, run {run_id}")
     try:
         d, default, base = checkout_pr(repo, worker, w["branch"], sha, number, issue, units)
-        drive_units(ecc, d, repo, number, agent, units, w["branch"], run_id, w["approver"], conf, cost, ecc_cfg)
+        drive_units(ecc, d, repo, number, runner, units, w["branch"], run_id, w["approver"], conf, cost, ecc_cfg)
         new = publish(worker, repo, d, base, w["branch"], default, units,
                       f"Repair round for the review of {w['pr']} (#{number})\n\nOrchestrator run {run_id}.")
     except Stopped as e:
@@ -2707,11 +2783,14 @@ def merge_now(key, entry, facts, review, minor, commands):
     log(f"{key}: merged {w['pr']} as {merged[:10]}")
 
 
-def review_prs(keys, state, since, ecc, dry_run, runs, limit, conf):
+def review_prs(keys, state, since, ecc, dry_run, runs, limit, conf, running=None, inline=True):
     """Step 5 for the issues in `keys`, whose PRs are open: see pr_gate. A repair round counts as a coding run
-    against `limit`; merges have MERGE_LIMIT. Returns the coding runs so far."""
-    merges = 0
+    against `limit` and the capacity (capacity_problem) and starts like one (start_run); merges have MERGE_LIMIT
+    and run here, one pass at a time under work.lock. Returns the coding runs so far."""
+    merges, running = 0, {} if running is None else running
     for key in keys:
+        if key in running:
+            continue
         entry = state[key]
         repo, number = key.rsplit("#", 1)
         w, worker = entry["work"], WORKERS[entry["agent"]]
@@ -2748,9 +2827,32 @@ def review_prs(keys, state, since, ecc, dry_run, runs, limit, conf):
                 if runs >= limit:
                     mark(key, "held", f"repair round waits for the next pass (limit {limit})")
                     continue
+                runner, until = pick_runner(entry, state, conf, w.get("runner"))
+                if runner is None:
+                    mark(key, "waiting", f"repair round waits for the {w.get('runner') or entry['agent']} usage "
+                         f"limit to reset at {time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(until))}")
+                    continue
+                busy = capacity_problem(running, repo, runner, conf)
+                if busy:
+                    mark(key, "waiting", f"repair round waits: {busy}")
+                    continue
+                review, findings = detail
+                sha = facts["pr"]["sha"]
+                job = {"key": key, "step": "repair", "runner": runner, "id": f"{time.time():.6f}.{os.getpid()}",
+                       "issue": issue, "review": review, "findings": [list(f) for f in findings], "sha": sha}
+                if not inline:
+                    w["job"] = job["id"]
+                    save_state(state, since)
                 runs += 1
                 SPENT["code"] += 1
-                repair_round(key, entry, issue, state, since, ecc, *detail, facts["pr"]["sha"])
+                rec = start_run(job, (lambda: repair_round(key, entry, issue, state, since, ecc, review, findings,
+                                                           sha, runner)) if inline else None)
+                if rec is None:
+                    runs -= 1
+                    SPENT["code"] -= 1
+                    mark(key, "waiting", "repair round waits: its issue or repository lock is held")
+                elif not inline:
+                    running[key] = rec
             elif action == "accept":
                 commands = acceptance_commands(entry, repo, conf)
                 if not commands:
@@ -2779,6 +2881,192 @@ def work_lock(name="work.lock"):
         f.close()
         return None
     return f
+
+
+# ---------- parallel coding: one process per coding or repair run ----------
+# A pass (cmd_code, under work.lock) chooses the runs and starts each as its own process, `iwb code --job FILE`,
+# then returns; the run goes on for hours without holding work.lock. Each run holds two locks for its whole life:
+# its issue's and its repository's. The pass takes both (non-blocking) before it starts the process, which
+# inherits them, so they are released only when the run's process exits, however it ends. Only a pass holding
+# work.lock takes these locks, so what it reads from them can't change under it. A held issue lock means the run
+# is alive: "in-progress" without one is an interrupted run. When a run ends it starts a pass of its own, which
+# fills the slot it freed and runs step 5.
+CODE_CONCURRENCY = 4       # coding and repair runs at once across all repositories; config.json "code_concurrency"
+RUNNER_PARALLEL = 3        # of those, the most one runner CLI codes; config.json "max_parallel"
+SPAWN_RUNS = True          # False runs each one inside the pass, one after another (the tests' fake orchestrator)
+
+
+def lock_file(kind, name):
+    """The lock file of an issue ("owner/repo#n") or a repository ("owner/repo") under WORK_DIR/locks."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    return WORK_DIR / "locks" / f"{kind}-{safe}-{hashlib.sha256(name.encode()).hexdigest()[:8]}.lock"
+
+
+def try_lock(path):
+    """The open lock file, locked (non-blocking), or None while another process holds it. Lock files are never
+    deleted: a process could lock the old file while another one creates the new one."""
+    import fcntl
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def running_runs():
+    """{issue key: run record} for the coding and repair runs alive now, the ones whose issue lock is held. Call
+    only while holding work.lock."""
+    d, out = WORK_DIR / "locks", {}
+    for p in sorted(d.glob("issue-*.lock")) if d.is_dir() else []:
+        f = try_lock(p)
+        if f:
+            f.close()
+            continue
+        try:
+            rec = json.loads(p.read_text())
+        except (OSError, ValueError):
+            rec = None
+        rec = rec if isinstance(rec, dict) and isinstance(rec.get("key"), str) else {"key": p.name}
+        out[rec["key"]] = rec                     # held but unreadable still takes a slot
+    return out
+
+
+def capacity_problem(running, repo, runner, conf):
+    """Why another run of `runner` in `repo` can't start now, or None: the total (config.json "code_concurrency"),
+    one run per repository, and the runner's own share ("max_parallel")."""
+    total = conf_count("code_concurrency", CODE_CONCURRENCY, conf)
+    if len(running) >= total:
+        return f"{len(running)} runs are going (code_concurrency {total})"
+    if any(r.get("repo") == repo for r in running.values()) or (lock_busy("repo", repo)):
+        return f"another run is going in {repo}"
+    cap = conf_count("max_parallel", RUNNER_PARALLEL, conf)
+    mine = sum(1 for r in running.values() if r.get("runner") == runner)
+    if mine >= cap:
+        return f"{mine} {runner} runs are going (max_parallel {cap})"
+    return None
+
+
+def lock_busy(kind, name):
+    f = try_lock(lock_file(kind, name))
+    if f:
+        f.close()
+    return f is None
+
+
+def runner_family(name):
+    """"claude" or "codex" for a runner, model or bot name (codex-pr-gh, gpt-6-astra, claude-pr-gh), else None."""
+    n = str(name or "").lower()
+    fams = {f for f, words in (("claude", ("claude", "anthropic", "opus", "sonnet", "haiku")),
+                               ("codex", ("codex", "gpt", "openai"))) if any(x in n for x in words)}
+    return fams.pop() if len(fams) == 1 else None
+
+
+def fallback_allowed(entry, runner):
+    """Whether `runner` may code this issue's plan in place of its worker's own runner: only when the plan's
+    approver is of another model family, so the plan, its approval and the PR review are never one family's."""
+    approver = (entry.get("approval") or {}).get("approver") or (entry.get("work") or {}).get("approver")
+    fam = runner_family(approver)
+    return fam is not None and fam != runner_family(runner)
+
+
+def pick_runner(entry, state, conf, preferred=None):
+    """(runner, None) for the runner CLI to code this issue now, or (None, reset time) while it must wait for a
+    usage limit. `preferred` (default the worker's own runner) unless it is usage-limited; then the worker's own
+    runner, or with config.json "runner_fallback": true the other one when fallback_allowed."""
+    now, agent = time.time(), entry["agent"]
+    quota = state.get("_runner_quota") or {}
+    first = preferred or agent
+    for r in [first] + [x for x in REQUIRED_RUNNERS if x != first]:
+        if quota.get(r, 0) > now:
+            continue
+        if r in (first, agent) or conf.get("runner_fallback") is True and fallback_allowed(entry, r):
+            return r, None
+    return None, quota.get(first, 0)
+
+
+def start_run(job, inline=None):
+    """Take the issue's and the repository's locks and start the run: `inline()` in this process when given
+    (the locks are released when it returns), else `iwb code --job FILE` as its own process, which keeps them.
+    Returns the run record, or None when a lock is held (nothing started)."""
+    key = job["key"]
+    repo = key.rsplit("#", 1)[0]
+    fi = try_lock(lock_file("issue", key))
+    if fi is None:
+        return None
+    fr = try_lock(lock_file("repo", repo))
+    if fr is None:
+        fi.close()
+        return None
+    rec = {"key": key, "repo": repo, "runner": job["runner"], "step": job["step"], "at": time.time()}
+    try:
+        fi.seek(0)
+        fi.truncate()
+        fi.write(json.dumps(rec) + "\n")
+        fi.flush()
+        if inline is not None:
+            inline()
+            return rec
+        path = WORK_DIR / "jobs" / f"{lock_file('issue', key).stem}.json"
+        write_atomic(path, json.dumps({**job, "lock_fds": [fi.fileno(), fr.fileno()]}) + "\n")
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "code", "--job", str(path)],
+                             stdin=subprocess.DEVNULL, pass_fds=(fi.fileno(), fr.fileno()), start_new_session=True,
+                             cwd=str(ROOT))
+        rec["pid"] = p.pid
+        log(f"{key}: {job['step']} run started as process {p.pid} with the {job['runner']} runner")
+        return rec
+    finally:
+        fr.close()                  # the child process has its own copies; inline, the run is over
+        fi.close()
+
+
+def run_job(job, ecc=None):
+    """The body of `iwb code --job FILE`: one coding or repair run that a pass chose and recorded. It reads the
+    state again (the pass that chose it may have long ended) and does nothing when the job is no longer current."""
+    key, step = job["key"], job["step"]
+    state, since = load_state()
+    entry = state.get(key)
+    try:
+        w = (entry.get("work") or {}) if isinstance(entry, dict) else {}
+        if w.get("job") != job["id"] or entry.get("blocked") or entry.get("closed") or entry.get("stale_plan"):
+            log(f"{key}: {step} job {job['id']} is no longer current; not running it")
+            return
+        if step == "code":
+            if w.get("status") != "approved":
+                log(f"{key}: coding job {job['id']} found the issue {w.get('status')}; not running it")
+                return
+            code_plan(key, entry, job["issue"], state, since, ecc or run_ecc)
+        else:
+            repair_round(key, entry, job["issue"], state, since, ecc or run_ecc, job["review"],
+                         [tuple(f) for f in job["findings"]], job["sha"], job["runner"])
+    except Exception as e:          # never leave the job to be picked again every pass
+        if step == "code" and isinstance(entry, dict):
+            entry["work_failed_at"] = time.time()
+        log(f"{key}: {step} could not run; retrying in {RETRY_AFTER // 60} minutes: {e!r}")
+    finally:
+        save_state(state, since)
+
+
+def cmd_job(path):
+    """`iwb code --job FILE` (started by a pass, never by hand): run the job, release its locks, then run a pass
+    of its own so the freed slot is used and open PRs are looked at, unless coding is off or paused."""
+    path = Path(path)
+    job = json.loads(path.read_text())
+    path.unlink(missing_ok=True)
+    try:
+        run_job(job)
+    finally:
+        for fd in job.get("lock_fds", []):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    conf = read_config()
+    if conf.get("coding_live") and not conf.get("paused"):
+        return cmd_code()
+    return 0
 
 
 PLAN_ERRORS = (OSError, ValueError, KeyError, TypeError)   # a plan file that is missing, unreadable or malformed
@@ -2829,11 +3117,17 @@ def prs_to_review(state, conf):
     return keys
 
 
-def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None, review=True, intake_q=None):
+def cmd_code(dry_run=False, limit=None, ecc=None, only=None, review=True, intake_q=None):
     """Step 4b: code plans that step 4a approved, in repositories listed in config.json "coding_repos". Then
-    step 5 for open PRs, unless `review` is False (a code-queue drain runs step 5 once, at its end)."""
+    step 5 for open PRs, unless `review` is False (a code-queue drain runs step 5 once, at its end). Each coding
+    or repair run starts as its own process (start_run) within the capacity: config.json "code_concurrency" runs
+    in all, one per repository, "max_parallel" per runner. `limit` caps the runs this pass starts. An `ecc`
+    callable (tests) runs them inside the pass instead."""
+    inline = ecc is not None or not SPAWN_RUNS
     ecc = ecc or run_ecc
     conf = read_config()
+    if limit is None:
+        limit = conf_count("code_concurrency", CODE_CONCURRENCY, conf)
     if conf.get("paused"):
         log("paused in config.json; no coding")
         return 0
@@ -2853,9 +3147,15 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None, review=True, 
     coding = set(conf.get("coding_repos", []))
     runs = 0
     try:
+        running = running_runs()
+        if running:
+            log(f"{len(running)} run{'s' if len(running) != 1 else ''} going: " + ", ".join(
+                f"{k} ({r.get('step', '?')}, {r.get('runner', '?')})" for k, r in sorted(running.items())))
         for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
             if only is not None and key not in only:
                 continue
+            if key in running:
+                continue                    # its run is alive in another process; it owns the entry until it ends
             if entry.get("blocked") or entry.get("closed") or (entry.get("analysis") or {}).get("decision") != "plan":
                 continue
             if entry.get("stale_plan"):
@@ -2886,19 +3186,19 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None, review=True, 
                 step = "code"
             if not step:
                 continue
+            runner = None
             if step == "code":
-                until = (state.get("_runner_quota") or {}).get(entry.get("agent"), 0)
-                if until > time.time():         # the runner that would author this plan is out of credits
+                runner, until = pick_runner(entry, state, conf)
+                if runner is None:              # the runner that would author this plan is out of credits
                     mark(key, "waiting", f"coding waits for the {entry.get('agent')} usage limit to reset at "
                          f"{time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(until))}")
                     continue
-                busy = sum(1 for e in state.values() if isinstance(e, dict) and not e.get("blocked")
-                           and (e.get("work") or {}).get("status") == "in-progress")
+                busy = capacity_problem(running, repo, runner, conf)
+                if busy:                        # other runs are going; that can take hours
+                    mark(key, "waiting", f"coding waits: {busy}")
+                    continue
                 if runs >= limit:
                     mark(key, "held", f"coding waits for the next pass (limit {limit})")
-                    continue
-                if busy >= IN_PROGRESS_LIMIT:     # other issues are being coded; that can take hours
-                    mark(key, "waiting", f"coding waits until fewer than {IN_PROGRESS_LIMIT} issues are being coded")
                     continue
             try:
                 issue = gh_json(["api", f"repos/{repo}/issues/{number}", "--jq",
@@ -2934,17 +3234,30 @@ def cmd_code(dry_run=False, limit=CODE_LIMIT, ecc=None, only=None, review=True, 
                 if step == "pr":
                     finish_pr(key, entry, issue, state, since)
                     continue
+                job = {"key": key, "step": "code", "runner": runner, "id": f"{time.time():.6f}.{os.getpid()}",
+                       "issue": issue}
+                entry["work"] = {"status": "approved", "plan_digest": ap["plan_digest"], "approver": ap["approver"],
+                                 "approved_at": ap["at"], "approval_comment": ap.get("comment", ""),
+                                 "runner": runner, "job": job["id"]}
+                if runner != entry["agent"]:
+                    entry["work"]["fallback_from"] = entry["agent"]
+                if not inline:
+                    save_state(state, since)    # the run's process reads the state again; it owns the entry now
                 runs += 1
                 SPENT["code"] += 1
-                entry["work"] = {"status": "approved", "plan_digest": ap["plan_digest"], "approver": ap["approver"],
-                                 "approved_at": ap["at"], "approval_comment": ap.get("comment", "")}
-                code_plan(key, entry, issue, state, since, ecc)
+                rec = start_run(job, (lambda: code_plan(key, entry, issue, state, since, ecc)) if inline else None)
+                if rec is None:
+                    runs -= 1
+                    SPENT["code"] -= 1
+                    mark(key, "waiting", "coding waits: its issue or repository lock is held")
+                elif not inline:
+                    running[key] = rec
             except (RuntimeError, subprocess.SubprocessError, SystemExit, OSError) as e:
                 entry["work_failed_at"] = time.time()
                 mark(key, "failed", f"{step} could not run; retrying in {RETRY_AFTER // 60} minutes: {e}")
         if review:                          # step 5, after the coding above: review, one repair round, merge
-            prs = [k for k in prs_to_review(state, conf) if only is None or k in only]
-            runs = review_prs(prs, state, since, ecc, dry_run, runs, limit, conf)
+            prs = [k for k in prs_to_review(state, conf) if (only is None or k in only) and k not in running]
+            runs = review_prs(prs, state, since, ecc, dry_run, runs, limit, conf, running, inline)
     finally:
         if not dry_run:
             save_state(state, since)
@@ -3279,7 +3592,7 @@ def sweep_pass(q, scope, groups, handed):
     try:
         for r in scope or [None]:
             cmd_intake(limit=LIMIT - SPENT["intake"], repo_filter=r, listed=listed)
-            cmd_analyze(limit=ANALYZE_LIMIT - SPENT["analyze"], repo_filter=r)
+            cmd_analyze(limit=analysis_limit() - SPENT["analyze"], repo_filter=r)
             if read_config().get("approval_live"):
                 cmd_approve(limit=APPROVE_LIMIT - SPENT["approve"], repo_filter=r)
     except (Exception, SystemExit) as e:
@@ -3359,7 +3672,7 @@ def cmd_drain(queue_dir):
             try:
                 cmd_intake(limit=LIMIT - SPENT["intake"], only={key})
                 if key not in OUTCOME:
-                    cmd_analyze(limit=ANALYZE_LIMIT - SPENT["analyze"], only={key})
+                    cmd_analyze(limit=analysis_limit() - SPENT["analyze"], only={key})
                 if key not in OUTCOME and read_config().get("approval_live"):
                     cmd_approve(limit=APPROVE_LIMIT - SPENT["approve"], only={key})
             except (Exception, SystemExit) as e:
@@ -3488,7 +3801,7 @@ def cmd_code_drain(queue_dir):
         return 0
     for key in groups:
         try:                              # cmd_code reads the issue again under work.lock before coding it
-            cmd_code(limit=CODE_LIMIT - SPENT["code"], only={key}, review=False, intake_q=intake_q)
+            cmd_code(limit=conf_count("code_concurrency", CODE_CONCURRENCY) - SPENT["code"], only={key}, review=False, intake_q=intake_q)
         except (Exception, SystemExit) as e:
             mark(key, "failed", f"coding hand-off failed: {e!r}")
     # Step 5 once for every open PR, not only the handed-off issues: while queued coding runs, tick's full cmd_code
@@ -3496,7 +3809,7 @@ def cmd_code_drain(queue_dir):
     try:
         prs = set(prs_to_review(read_state_file(), read_config()))
         if prs:                           # cmd_code selects them again under work.lock
-            cmd_code(limit=CODE_LIMIT - SPENT["code"], only=prs)
+            cmd_code(limit=conf_count("code_concurrency", CODE_CONCURRENCY) - SPENT["code"], only=prs)
     except (Exception, SystemExit) as e:
         log(f"code queue: step 5 failed: {e!r}")
     return settle(groups, deferred, rejected, "code queue")
@@ -3521,11 +3834,16 @@ def main(argv):
         limit = int(argv[argv.index("--limit") + 1]) if "--limit" in argv else LIMIT
         return cmd_intake(dry_run="--dry-run" in argv, baseline="--baseline" in argv, limit=limit)
     if argv[0] == "analyze":
-        limit = int(argv[argv.index("--limit") + 1]) if "--limit" in argv else ANALYZE_LIMIT
+        limit = int(argv[argv.index("--limit") + 1]) if "--limit" in argv else None
         return cmd_analyze(dry_run="--dry-run" in argv, limit=limit)
     if argv[0] == "approve":
         return cmd_approve(dry_run="--dry-run" in argv)
     if argv[0] == "code":
+        if "--job" in argv:             # one coding or repair run, started by a pass (start_run)
+            i = argv.index("--job") + 1
+            if i >= len(argv):
+                prbot.die("code --job needs the job file")
+            return cmd_job(argv[i])
         if "--from-queue" in argv:
             i = argv.index("--from-queue") + 1
             if i >= len(argv) or argv[i].startswith("-"):

@@ -90,6 +90,8 @@ def setUpModule():
     original = iwb.subprocess
     unittest.addModuleCleanup(setattr, iwb, "subprocess", original)
     iwb.subprocess = GuardedSubprocess(original)
+    unittest.addModuleCleanup(setattr, iwb, "SPAWN_RUNS", iwb.SPAWN_RUNS)
+    iwb.SPAWN_RUNS = False              # coding and repair runs inside the pass; ParallelCoding tests the processes
 
 
 class SubprocessGuard(unittest.TestCase):
@@ -500,6 +502,55 @@ class Analyze(unittest.TestCase):
 
     def state(self):
         return json.loads(iwb.STATE.read_text())[self.KEY]
+
+    def test_analyses_run_in_parallel_up_to_analysis_concurrency(self):
+        import threading
+        keys = [f"kennylhilljr/demo#{n}" for n in range(1, 6)]
+        iwb.STATE.write_text(json.dumps({k: {"agent": "claude", "picked_up_at": 1} for k in keys}))
+        iwb.CONFIG.write_text(json.dumps({"analysis_concurrency": 3}))
+        together = threading.Barrier(3, timeout=10)          # breaks unless 3 analyses run at the same time
+        lock, live, peak = threading.Lock(), [0], [0]
+
+        def model(agent, prompt, stdin, cwd):
+            with lock:
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+            together.wait()
+            time.sleep(0.05)
+            with lock:
+                live[0] -= 1
+            if cwd.startswith(self.failing_dir[0]):
+                raise RuntimeError("usage limit")
+            return answer({"decision": "no_change", "summary": "nothing to do"})
+        clones = []
+
+        def clone(repo, bot):
+            d = tempfile.mkdtemp(dir=self.tmp.name)
+            clones.append(d)
+            return d, "main", "abc123"
+        iwb.run_model, iwb.clone = model, clone
+        self.failing_dir = ["\0"]
+        log = self.run_pass()
+        self.assertEqual(peak[0], 3)
+        self.assertEqual(len(self.posts), 3)
+        self.assertIn("demo#4: analysis (new) waits for the next pass (limit 3)", log)
+        self.assertIn("demo#5: analysis (new) waits for the next pass (limit 3)", log)
+        state = json.loads(iwb.STATE.read_text())
+        self.assertEqual([k for k in keys if "analysis" in state[k]], keys[:3])
+        self.assertFalse(any(Path(d).exists() for d in clones))      # every clone removed
+        together.reset()
+        together = threading.Barrier(2, timeout=10)
+        self.failing_dir = [None]
+        def clone_failing_second(repo, bot):
+            d, *rest = clone(repo, bot)
+            if self.failing_dir[0] is None:
+                self.failing_dir[0] = d                          # the first clone of this pass: demo#4 fails
+            return (d, *rest)
+        iwb.clone = clone_failing_second
+        log = self.run_pass()
+        state = json.loads(iwb.STATE.read_text())
+        self.assertIn("analysis_failed_at", state[keys[3]])           # one failure doesn't lose the other answer
+        self.assertEqual(state[keys[4]]["analysis"]["decision"], "no_change")
 
     def test_plan_is_posted_and_saved(self):
         self.answers = [answer({"decision": "plan", "summary": "Add a retry loop.",
@@ -2119,6 +2170,183 @@ class Code(unittest.TestCase):
         self.run_pass()
         self.assertEqual(self.state()["work"]["status"], "pr-open")
 
+    # ---------- parallel coding (code_concurrency, max_parallel, one run per repository) ----------
+
+    def spawning(self):
+        """SPAWN_RUNS on with a fake Popen that keeps the run's inherited lock fds open, like a live child, until
+        self.finish(key). Returns the list of (argv, kwargs, job) it started."""
+        started, self.children = [], {}
+        test = self
+
+        class FakeSubprocess:
+            DEVNULL = iwb.subprocess.DEVNULL
+            SubprocessError = iwb.subprocess.SubprocessError
+
+            def Popen(self, argv, **kw):
+                job = json.loads(Path(argv[argv.index("--job") + 1]).read_text())
+                test.assertEqual(sorted(job["lock_fds"]), sorted(kw["pass_fds"]))
+                test.children[job["key"]] = [os.dup(fd) for fd in kw["pass_fds"]]
+                started.append((argv, kw, job))
+                return mock.Mock(pid=1000 + len(started))
+
+            def __getattr__(self, name):
+                return getattr(test.real_subprocess, name)
+        self.real_subprocess = iwb.subprocess
+        self.enterContext(mock.patch.object(iwb, "SPAWN_RUNS", True))
+        self.enterContext(mock.patch.object(iwb, "subprocess", FakeSubprocess()))
+        self.addCleanup(lambda: [os.close(fd) for fds in self.children.values() for fd in fds])
+        return started
+
+    def finish(self, key, status="pr-open"):
+        """The fake child for `key` ends: its locks go, and its state shows what it left."""
+        for fd in self.children.pop(key):
+            os.close(fd)
+        state = json.loads(iwb.STATE.read_text())
+        state[key]["work"].update(status=status, pr="https://x/pr")
+        iwb.STATE.write_text(json.dumps(state))
+
+    def spawn_pass(self, **kw):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            iwb.cmd_code(**kw)
+        return out.getvalue()
+
+    def test_parallel_runs_respect_the_total_the_runner_cap_and_one_per_repository(self):
+        repos = [f"kennylhilljr/r{i}" for i in range(1, 7)]
+        iwb.CONFIG.write_text(json.dumps({"coding_repos": repos, "code_concurrency": 4, "max_parallel": 3}))
+        for key, agent in (("kennylhilljr/r1#1", "claude"), ("kennylhilljr/r1#2", "claude"),
+                           ("kennylhilljr/r2#1", "claude"), ("kennylhilljr/r3#1", "claude"),
+                           ("kennylhilljr/r4#1", "claude"), ("kennylhilljr/r5#1", "codex"),
+                           ("kennylhilljr/r6#1", "codex")):
+            self.approve_plan([coding_unit()], key=key, agent=agent)
+        state = json.loads(iwb.STATE.read_text())
+        state.pop(self.KEY)
+        iwb.STATE.write_text(json.dumps(state))
+        started = self.spawning()
+        log = self.spawn_pass()
+        self.assertEqual([j["key"] for _, _, j in started],
+                         ["kennylhilljr/r1#1", "kennylhilljr/r2#1", "kennylhilljr/r3#1", "kennylhilljr/r5#1"])
+        self.assertIn("r1#2: coding waits: another run is going in kennylhilljr/r1", log)
+        self.assertIn("r4#1: coding waits: 3 claude runs are going (max_parallel 3)", log)
+        self.assertIn("r6#1: coding waits: 4 runs are going (code_concurrency 4)", log)
+        argv, kw, job = started[0]
+        self.assertEqual(argv[2:4], ["code", "--job"])
+        self.assertTrue(kw["start_new_session"])                       # launchd's job exit doesn't kill it
+        self.assertEqual((job["step"], job["runner"]), ("code", "claude"))
+        w = self.state("kennylhilljr/r1#1")["work"]
+        self.assertEqual((w["status"], w["runner"], w["job"]), ("approved", "claude", job["id"]))
+        self.assertEqual(self.ecc_calls, [])                            # nothing coded in the pass itself
+        self.spawn_pass()                                               # nothing new while they all run
+        self.assertEqual(len(started), 4)
+        self.assertNotIn("blocked", self.state("kennylhilljr/r1#1"))    # a live run is not "interrupted"
+        self.finish("kennylhilljr/r1#1")
+        self.spawn_pass()
+        self.assertEqual(started[-1][2]["key"], "kennylhilljr/r1#2")   # the repository's next issue, in its slot
+        self.assertEqual(len(started), 5)
+        self.finish("kennylhilljr/r5#1")
+        self.spawn_pass(limit=1)                                        # limit caps the runs one pass starts
+        self.assertEqual([j["key"] for _, _, j in started[5:]], ["kennylhilljr/r6#1"])
+
+    def test_a_held_repository_lock_keeps_its_issues_waiting(self):
+        held = iwb.try_lock(iwb.lock_file("repo", "kennylhilljr/demo"))   # e.g. a repair round in another process
+        self.addCleanup(held.close)
+        log = self.run_pass()
+        self.assertIn("coding waits: another run is going in kennylhilljr/demo", log)
+        self.assertEqual((self.ecc_calls, self.posts), ([], []))
+        held.close()
+        self.run_pass()
+        self.assertEqual(self.labels(), ["bot:in-progress", "bot:pr-open"])
+
+    def test_in_progress_is_interrupted_only_when_its_run_is_gone(self):
+        state = json.loads(iwb.STATE.read_text())
+        state[self.KEY]["work"] = {"status": "in-progress", "run_id": "r",
+                                   "plan_digest": state[self.KEY]["approval"]["plan_digest"]}
+        iwb.STATE.write_text(json.dumps(state))
+        alive = iwb.try_lock(iwb.lock_file("issue", self.KEY))
+        alive.write(json.dumps({"key": self.KEY, "repo": "kennylhilljr/demo", "runner": "claude"}))
+        alive.flush()
+        self.run_pass()
+        self.assertEqual(self.posts, [])                                 # its process still runs
+        self.assertNotIn("blocked", self.state())
+        alive.close()                                                    # the process died
+        self.run_pass()
+        self.assertIn("Coding was interrupted", self.posts[-1][2])
+        self.assertTrue(self.state()["blocked"])
+
+    def test_a_job_process_codes_and_releases_its_locks(self):
+        started = self.spawning()
+        self.spawn_pass()
+        ((argv, kw, job),) = started
+        path = Path(argv[argv.index("--job") + 1])
+        for fd in self.children.pop(self.KEY):                          # the fake child hands its fds to cmd_job
+            os.close(fd)
+        fds = [os.dup(os.open(os.devnull, os.O_RDONLY)) for _ in range(2)]
+        job["lock_fds"] = fds
+        path.write_text(json.dumps(job))
+        self.enterContext(mock.patch.object(iwb, "run_ecc", self.fake_ecc))
+        with redirect_stdout(io.StringIO()):
+            iwb.cmd_job(path)
+        self.assertFalse(path.exists())
+        for fd in fds:
+            with self.assertRaises(OSError):
+                os.fstat(fd)                                             # closed: the slot is free
+        self.assertEqual(self.state()["work"]["status"], "pr-open")
+        self.assertEqual(self.policy_of(self.ecc_calls[1])["author_providers"], ["claude"])
+        path.write_text(json.dumps({**job, "lock_fds": []}))            # the same job again: no longer current
+        calls = len(self.ecc_calls)
+        with redirect_stdout(io.StringIO()) as out:
+            iwb.cmd_job(path)
+        self.assertIn("not running it", out.getvalue())
+        self.assertEqual(len(self.ecc_calls), calls)
+
+    def limit_codex(self, approver, fallback=True):
+        self.approve_plan([REAL_TIER0_UNIT], agent="codex")
+        state = json.loads(iwb.STATE.read_text())
+        state[self.KEY]["approval"]["approver"] = approver
+        state["_runner_quota"] = {"codex": time.time() + 7200}
+        iwb.STATE.write_text(json.dumps(state))
+        iwb.CONFIG.write_text(json.dumps({**self.PILOT, "runner_fallback": fallback}))
+
+    def test_a_usage_limited_runner_hands_the_plan_to_the_other_one(self):
+        self.limit_codex("codex-pr-gh")                                  # approver of another family than claude
+        self.changed = ["README.md", "skills/README.md"]
+        self.run_pass()
+        self.assertEqual(self.labels(), ["bot:in-progress", "bot:pr-open"])
+        self.assertIn("Runner switched from `codex` to `claude`", self.posts[0][2])
+        self.assertIn("`codex-pr-gh`", self.posts[0][2])
+        self.assertEqual(self.policy_of(self.ecc_calls[1])["author_providers"], ["claude"])
+        w = self.state()["work"]
+        self.assertEqual((w["runner"], w["fallback_from"], w["status"]), ("claude", "codex", "pr-open"))
+        self.assertTrue(all(bot == "codex-dev" for bot, _, _ in self.posts))   # still the codex worker's issue
+
+    def test_no_fallback_when_the_approver_is_the_new_runners_family(self):
+        for approver, fallback in (("claude-pr-gh", True), ("codex-pr-gh", False), ("someone", True)):
+            with self.subTest(approver=approver, fallback=fallback):
+                self.limit_codex(approver, fallback)
+                log = self.run_pass()
+                self.assertIn("coding waits for the codex usage limit", log)
+                self.assertEqual((self.ecc_calls, self.posts), ([], []))
+        state = json.loads(iwb.STATE.read_text())
+        state["_runner_quota"]["claude"] = time.time() + 60             # both limited: wait even when allowed
+        state[self.KEY]["approval"]["approver"] = "codex-pr-gh"
+        iwb.STATE.write_text(json.dumps(state))
+        iwb.CONFIG.write_text(json.dumps({**self.PILOT, "runner_fallback": True}))
+        self.assertIn("coding waits for the codex usage limit", self.run_pass())
+        self.assertEqual(self.ecc_calls, [])
+
+    def test_runner_family(self):
+        for name, fam in (("codex-pr-gh", "codex"), ("gpt-6-astra", "codex"), ("claude-pr-gh", "claude"),
+                          ("opus", "claude"), ("claude", "claude"), ("codex", "codex"), ("kenny", None),
+                          (None, None), ("claude-vs-codex", None)):
+            self.assertEqual(iwb.runner_family(name), fam, name)
+
+    def test_bad_concurrency_config_falls_back_to_the_default(self):
+        for bad in (0, -1, "4", True, 2.5, 99):
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(iwb.conf_count("code_concurrency", 4, {"code_concurrency": bad}), 4)
+            self.assertIn("must be a whole number", out.getvalue())
+        self.assertEqual(iwb.conf_count("code_concurrency", 4, {"code_concurrency": 2}), 2)
+
     def test_quota_reset_time(self):
         now = time.mktime(time.strptime("2026-11-11 10:46", "%Y-%m-%d %H:%M"))
         at = iwb.quota_reset("try again at Nov 12th, 2026 11:21 PM.", now)
@@ -2157,8 +2385,8 @@ class Code(unittest.TestCase):
         self.assertEqual(self.ecc_calls, [])
         iwb.CONFIG.write_text(json.dumps(self.PILOT))
         self.approve_plan([coding_unit()], key="kennylhilljr/demo#2")
-        log = self.run_pass()
-        self.assertEqual(len(self.prs), 1)                              # one run per pass
+        log = self.run_pass(limit=1)
+        self.assertEqual(len(self.prs), 1)                              # one run per pass with limit 1
         self.assertIn("demo#2: coding waits for the next pass", log)
         state = json.loads(iwb.STATE.read_text())
         state["kennylhilljr/demo#2"]["work"] = {"status": "in-progress", "run_id": "r",
@@ -2641,6 +2869,35 @@ class StateFile(unittest.TestCase):
         iwb.save_state(state, since)
         self.assertEqual(json.loads(iwb.STATE.read_text())["a#1"],
                          {"agent": "claude", "work": {"status": "pr-open"}, "handled_at": 5})
+
+    def test_concurrent_writers_keep_each_others_changes(self):
+        # parallel coding: every run is its own process saving its own issue's entry and _runner_quota while the
+        # other runs and passes save theirs. Threads with their own lock file handles contend like processes.
+        import threading
+        self.use_tmp_state({"_last_agent": "claude"})
+        def writer(i):
+            for n in range(15):
+                state, since = iwb.load_state()
+                state.setdefault(f"r{i}#1", {"agent": "claude"})["n"] = n
+                state.setdefault("_runner_quota", {})[f"runner{i}"] = n          # a key none of them had
+                iwb.save_state(state, since)
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        disk = json.loads(iwb.STATE.read_text())
+        self.assertEqual({k: v["n"] for k, v in disk.items() if "#" in k}, {f"r{i}#1": 14 for i in range(6)})
+        self.assertEqual(disk["_runner_quota"], {f"runner{i}": 14 for i in range(6)})
+        self.assertEqual(disk["_last_agent"], "claude")
+
+    def test_a_key_both_writers_created_is_merged(self):
+        self.use_tmp_state({})
+        state, since = iwb.load_state()
+        state["_runner_quota"] = {"codex": 5}
+        iwb.STATE.write_text(json.dumps({"_runner_quota": {"claude": 7}}))   # another run, meanwhile
+        iwb.save_state(state, since)
+        self.assertEqual(json.loads(iwb.STATE.read_text())["_runner_quota"], {"claude": 7, "codex": 5})
 
     def test_save_waits_for_the_state_lock(self):
         # regression (Codex review of #5, P2): two passes saving at once could each read the file before the other
@@ -3346,6 +3603,7 @@ class Queue(unittest.TestCase):
         self.assertIn(f"held: {self.REPO}#5", out)
 
     def test_a_burst_drains_one_analysis_per_run(self):
+        self.enterContext(mock.patch.object(iwb, "ANALYZE_LIMIT", 1))   # one analysis per run, as before analysis_concurrency
         def analyze(only=None, limit=None, **kw):
             (key,) = only
             if limit <= 0:
@@ -3419,6 +3677,7 @@ class Queue(unittest.TestCase):
             self.assertNotIn(self.q, d.parents)
 
     def test_the_analysis_limit_is_shared_by_the_issues_in_a_run(self):
+        self.enterContext(mock.patch.object(iwb, "ANALYZE_LIMIT", 1))   # one analysis per run, as before analysis_concurrency
         seen = []
         iwb.cmd_analyze = lambda only=None, limit=None, **kw: seen.append(limit) or iwb.SPENT.update(analyze=1)
         self.event(1)
@@ -3644,6 +3903,7 @@ class Queue(unittest.TestCase):
 
     def test_a_sweep_uses_only_the_budget_the_queued_events_left(self):
         # regression (Codex review of #12, P2): a sweep reset the per-pass limits and could run extra analyses
+        self.enterContext(mock.patch.object(iwb, "ANALYZE_LIMIT", 1))   # one analysis per run, as before analysis_concurrency
         limits = []
 
         def analyze(only=None, limit=None, **kw):
@@ -3844,6 +4104,7 @@ class QueueRealSteps(Queue):
         # regression (Codex review of #12, P1): the first issue uses the analysis limit; the second has an older
         # approved plan and a new trusted comment that changes the requirements. Its analysis is held, so approval
         # and coding must not run: coding would implement the stale plan.
+        self.enterContext(mock.patch.object(iwb, "ANALYZE_LIMIT", 1))   # one analysis per run, as before analysis_concurrency
         iwb.cmd_analyze = Queue.real_analyze
         iwb.CONFIG.write_text(json.dumps({"approval_live": True, "coding_live": True}))
         saved = (iwb.post, iwb.prbot.openclaw_attention)
@@ -4645,6 +4906,44 @@ class AutoMerge(unittest.TestCase):
         self.assertEqual(self.pushed, [])
         self.assert_needs_kenny("the repair round failed")
         self.assertEqual(self.work()["repair"]["status"], "failed")
+
+    def test_repair_round_runs_as_its_own_process_one_per_repository(self):
+        self.reviews = [review(HEAD, P2_FINDING)]
+        started, kept = [], []
+        real = iwb.subprocess
+
+        class FakeSubprocess:
+            def Popen(self, argv, **kw):
+                kept.extend(os.dup(fd) for fd in kw["pass_fds"])           # alive until the test closes them
+                started.append(json.loads(Path(argv[argv.index("--job") + 1]).read_text()))
+                return mock.Mock(pid=4242)
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+        self.addCleanup(lambda: [os.close(fd) for fd in kept])
+        self.enterContext(mock.patch.object(iwb, "SPAWN_RUNS", True))
+        with mock.patch.object(iwb, "subprocess", FakeSubprocess()):     # undone before tearDown's RealCliGuard
+            self.repair_in_a_process(started)
+
+    def repair_in_a_process(self, started):
+        held = iwb.try_lock(iwb.lock_file("repo", "kennylhilljr/demo"))   # another issue of the repo is coding
+        with redirect_stdout(io.StringIO()) as out:
+            iwb.cmd_code()
+        self.assertIn("repair round waits: another run is going in kennylhilljr/demo", out.getvalue())
+        held.close()
+        with redirect_stdout(io.StringIO()):
+            iwb.cmd_code()
+        (job,) = started
+        self.assertEqual((job["step"], job["runner"], job["sha"]), ("repair", "claude", HEAD))
+        self.assertEqual(self.ecc_calls, [])                               # not in the pass
+        with redirect_stdout(io.StringIO()):
+            iwb.cmd_code()                                                  # its run is alive: left alone
+        self.assertEqual((len(started), self.posts), (1, []))
+        self.enterContext(mock.patch.object(iwb, "run_ecc", self.fake_ecc))
+        with redirect_stdout(io.StringIO()):
+            iwb.run_job(job)                                                # what `iwb code --job` runs
+        self.assertEqual(self.pushed, [("claude-dev", REPAIRED, self.BRANCH)])
+        self.assertEqual((self.work()["repair"]["status"], self.work()["repair"]["runner"]), ("pushed", "claude"))
 
     def test_repair_round_waits_for_the_coding_limit(self):
         self.reviews = [review(HEAD, P2_FINDING)]
