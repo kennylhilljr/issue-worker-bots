@@ -1512,7 +1512,7 @@ def filter_findings(findings):
     """Findings with confidence >= 80, the highest per fingerprint, by confidence descending. Inputs untouched."""
     best = {}
     for f in findings:
-        if f["confidence"] < 80:
+        if not f["confidence"] >= 80:          # also drops NaN
             continue
         kept = best.get(f["fingerprint"])
         if kept is None or f["confidence"] > kept["confidence"]:

@@ -1255,6 +1255,7 @@ class ScanRules(unittest.TestCase):
         self.assertEqual(json.dumps(found), before)                     # inputs untouched
         self.assertEqual(iwb.filter_findings([]), [])
         self.assertEqual([x["title"] for x in iwb.filter_findings([f(79.9, "a"), f(80.0, "b")])], ["b80.0"])
+        self.assertEqual([x["title"] for x in iwb.filter_findings([f(float("nan"), "a"), f(90, "a")])], ["a90"])
 
 
 class RedCheckSandbox(unittest.TestCase):
