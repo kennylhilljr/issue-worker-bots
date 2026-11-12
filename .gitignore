@@ -1,4 +1,6 @@
 .DS_Store
 __pycache__/
 *.pem
-.claude/
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
