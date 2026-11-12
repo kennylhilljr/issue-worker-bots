@@ -197,7 +197,7 @@ Comment on an issue the bots picked up. Comments from Kenny and trusted openers 
 
 | Comment | What happens |
 | --- | --- |
-| `resume`, `continue`, `go`, `proceed`, `approve`, `lgtm` | The bot answers with where things stand. No model run. |
+| `resume`, `continue`, `go`, `proceed`, `approve`, `lgtm` | The bot answers with the issue's current state: waiting for approval, approval or coding switched off, coding running or stopped, or a PR open or merged. No model run. |
 | `replan` | A fresh analysis. The command counts as handled only once that analysis is posted, so a pass the analysis limit holds, or one where the model fails, tries again later. |
 | `status` | The bot reports its last analysis. |
 | `stop` | The bot adds `bot:stop` and does nothing more until it's removed. |
@@ -255,7 +255,7 @@ Only comments from Kenny and trusted openers count. Comments from other bots, in
 
 ### The plan is ready but nothing happens
 
-Coding is step 4, which is not built yet. The bot says so when asked to `resume`. Until then, a plan can be carried out by hand or through an orchestrator run.
+A ready plan waits when `approval_live` is off, when `coding_live` is off, when the repository is missing from `coding_repos`, when the certifications file is missing, when the issue has `bot:stop`, or when config.json has `"paused": true`. Comment `status` and the bot's reply names the real state of the issue: which gate is closed, or whether coding is running, stopped or has a PR. Blocked, `bot:stop` and paused issues don't answer commands. The blocked comment explains a block, and removing `bot:blocked` restarts the issue from analysis.
 
 ### An analysis keeps failing
 

@@ -161,6 +161,8 @@ Merging (decided 2026-11-11, behind `"auto_merge": true` in `config.json`, off b
 
 The bots look at every open issue they picked up on each 5-minute pass; there are no webhooks for now. A review bot's verdict on a plan also goes into the next analysis, so a revise verdict reaches the planner. Once coding has started (`bot:in-progress` or `bot:pr-open`), comments on the issue no longer start a new analysis: feedback belongs on the PR from then on. A `replan` command, or a revise verdict, is acknowledged only when the new analysis is posted: a held pass, a model failure, an unusable answer or a failed post leaves the request pending for the next pass. These are the things that bring a bot back:
 
+When a trusted comment asks for `status` or tells the bot to `proceed`, the reply names the real state of the issue (which gate is closed, whether coding is running or stopped, whether a PR is open or merged) and runs no model. Issues with `bot:blocked` or `bot:stop`, and every issue while iwb is paused, do not answer commands: the blocked comment explains a block, and removing `bot:blocked` restarts from analysis.
+
 | Trigger | How it's detected | What the bot does |
 | --- | --- | --- |
 | A trusted comment after any bot answer (questions, no-code, plan, approval, blocked) | Comments from Kenny or a trusted opener newer than the bot's last post | Analysis again, with the comment as input; on a plan, a revised plan that goes through approval again |
