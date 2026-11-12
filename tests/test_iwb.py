@@ -2550,7 +2550,9 @@ class Checkout(unittest.TestCase):
         git("init", "-q", "-b", "main")
         Path(src, ".orchestration").mkdir()
         Path(src, ".orchestration/team.json").write_text(json.dumps(
-            {"merge_approval": "agents", "learning": {"enabled": True, "ledger": "LESSONS.md"}}))
+            {"merge_approval": "agents", "learning": {"enabled": True, "ledger": "LESSONS.md"},
+             "milestone": {"name": "M1", "docs": [{"path": "docs/M1-plan.md", "sections": ["1"]}],
+                           "gate_commands": ["tools/ci.sh"]}}))
         git("add", "-A")
         git("commit", "-qm", "init")
         saved = {k: getattr(iwb.prbot, k) for k in ("git_env", "installation_token", "gh_read")}
@@ -2567,7 +2569,20 @@ class Checkout(unittest.TestCase):
         team = json.loads(Path(d, ".orchestration/team.json").read_text())
         self.assertEqual(team["learning"], {"enabled": False, "ledger": "LESSONS.md"})
         self.assertEqual(team["merge_approval"], "agents")                         # the rest is the repository's
+        self.assertEqual(team["milestone"]["name"], "M1")                           # no issue given
         self.assertEqual(git("status", "--porcelain", cwd=d), "")                  # the edit stays out of git
+
+        # regression (research-mcp#1): the repository's milestone is its product plan; the product owners judged a
+        # one-unit issue against every M1 exit criterion and the repo-wide gate, and rejected it
+        units = [{"id": "u1", "title": "Do x", "acceptance": {"commands": ["node --test t.mjs"]}}]
+        d, _, _ = iwb.checkout("kennylhilljr/demo", "claude-dev", "bot/1-y", "1", {"title": "X", "body": "Want x."},
+                               units)
+        team = json.loads(Path(d, ".orchestration/team.json").read_text())
+        self.assertEqual(team["milestone"]["name"], "issue-1")
+        self.assertEqual(team["milestone"]["gate_commands"], ["node --test t.mjs"])
+        self.assertIn("Want x.", Path(d, team["milestone"]["docs"][0]["path"]).read_text())
+        self.assertEqual(team["learning"], {"enabled": False, "ledger": "LESSONS.md"})
+        self.assertEqual(git("status", "--porcelain", cwd=d), "")                  # the doc stays out of git too
 
     def test_renaming_a_protected_file_into_scope_is_refused(self):
         # regression: `git diff --name-only` listed only the new name of a rename, so moving .env into a file the

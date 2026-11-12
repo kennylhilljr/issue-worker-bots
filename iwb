@@ -1804,22 +1804,33 @@ def checkout(repo, bot, branch, number=None, issue=None, units=()):
         with open(d / ".git" / "info" / "exclude", "a") as f:
             f.write(f"\n/.orchestration/team.json\n/{MILESTONE_DOC}\n")
     else:
-        no_learning(d, team)
+        # the repository's own milestone is its product plan, not this issue: product owners judged a one-unit
+        # issue against every exit criterion of research-mcp's M1 and rejected it (product_rejected)
+        own = None
+        if issue is not None:
+            own, doc = milestone(number, issue, units)
+            (d / MILESTONE_DOC).write_text(doc)
+            with open(d / ".git" / "info" / "exclude", "a") as f:
+                f.write(f"\n/{MILESTONE_DOC}\n")
+        no_learning(d, team, own)
     return str(d), default, base
 
 
-def no_learning(d, team):
+def no_learning(d, team, own=None):
     """The repository's own team.json, with the practices pass turned off (NO_LEARNING) in iwb's clone only:
     skip-worktree keeps the edit out of git status, and the orchestrator commits only in its unit worktrees. A file
-    that isn't a JSON object is left alone; the orchestrator refuses it before anything runs."""
+    that isn't a JSON object is left alone; the orchestrator refuses it before anything runs. `own`, the issue's
+    milestone, replaces the repository's."""
     try:
         cfg = json.loads(team.read_text())
     except ValueError:
         return
     if not isinstance(cfg, dict):
         return
-    own = cfg.get("learning")
-    cfg["learning"] = {**(own if isinstance(own, dict) else {}), **NO_LEARNING}
+    learning = cfg.get("learning")
+    cfg["learning"] = {**(learning if isinstance(learning, dict) else {}), **NO_LEARNING}
+    if own is not None:
+        cfg["milestone"] = own
     team.write_text(json.dumps(cfg, indent=1) + "\n")
     subprocess.run(["git", "-C", str(d), "update-index", "--skip-worktree", ".orchestration/team.json"],
                    check=True, capture_output=True)
