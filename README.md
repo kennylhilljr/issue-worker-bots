@@ -198,7 +198,7 @@ Comment on an issue the bots picked up. Comments from Kenny and trusted openers 
 | Comment | What happens |
 | --- | --- |
 | `resume`, `continue`, `go`, `proceed`, `approve`, `lgtm` | The bot answers with where things stand. No model run. |
-| `replan` | A fresh analysis. |
+| `replan` | A fresh analysis. The command counts as handled only once that analysis is posted, so a pass the analysis limit holds, or one where the model fails, tries again later. |
 | `status` | The bot reports its last analysis. |
 | `stop` | The bot adds `bot:stop` and does nothing more until it's removed. |
 | Anything else | Treated as feedback: questions get answered, a plan gets revised. |
