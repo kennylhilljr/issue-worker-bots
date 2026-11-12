@@ -1008,60 +1008,70 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
 
 
 def finish_analyses(jobs, results, dry_run):
-    """Post each analysis's answer (or record its failure) on its issue's state entry, in order."""
-    for job, (answer, err) in zip(jobs, results):
-        key, entry, repo, number, issue = job["key"], job["entry"], job["repo"], job["number"], job["issue"]
-        digest, replan_at, bot, model = job["digest"], job["replan_at"], job["bot"], job["model"]
-        if isinstance(err, (RuntimeError, subprocess.SubprocessError, SystemExit)):
-            entry["analysis_failed_at"] = time.time()
-            mark(key, "failed", f"analysis could not run; retrying in {RETRY_AFTER // 60} minutes: {err}")
-            continue
-        if err is not None and not isinstance(err, ValueError):
-            entry["analysis_failed_at"] = time.time()          # was an uncaught crash of the whole pass
-            mark(key, "failed", f"analysis crashed; retrying in {RETRY_AFTER // 60} minutes: {err!r}")
-            continue
-        if err is not None:
-            e = err
-            entry["attempts"] = entry.get("attempts", 0) + 1
-            log(f"{key}: unusable answer ({e}); attempt {entry['attempts']} of {MAX_ATTEMPTS}")
-            if entry["attempts"] >= MAX_ATTEMPTS and not dry_run:
-                slug = prbot.bot_config(bot)["slug"]
-                url = post(bot, repo, number, f"{A_MARKER}\n`{slug}` could not produce a usable plan after "
-                           f"{MAX_ATTEMPTS} tries (last problem: {e}). Clarify the issue and remove `bot:blocked` "
-                           f"to try again.", "bot:blocked")
-                entry["blocked"] = True
-                prbot.openclaw_attention(f"blocked: {repo}#{number}",
-                                         {"url": url, "title": issue["title"], "worker": slug, "problem": str(e)})
-            else:
-                mark(key, "deferred")         # the next pass asks the model again
-            continue
-        slug = prbot.bot_config(bot)["slug"]
-        if answer["decision"] == "plan":
-            body, label = plan_comment(answer, slug, model), "bot:planned"
-        elif answer["decision"] == "no_change":
-            body, label = (f"{A_MARKER}\n### No code change from `{slug}`\n\n_Analysis by `{model}`._\n\n"
-                           f"{answer['summary']}\n\nComment if a change is wanted after all, "
-                           f"and the analysis runs again."), "bot:no-code"
+    """Post each analysis's answer (or record its failure) on its issue's state entry, in order. A failure to post
+    one answer marks that issue failed and goes on with the others."""
+    for job, result in zip(jobs, results):
+        try:
+            finish_analysis(job, *result, dry_run)
+        except Exception as e:      # retried on the next pass, as when this crashed the whole pass
+            mark(job["key"], "failed", f"analysis answer could not be posted; retrying next pass: "
+                 f"{type(e).__name__}: {short(e, 300)}")
+
+
+def finish_analysis(job, answer, err, dry_run):
+    key, entry, repo, number, issue = job["key"], job["entry"], job["repo"], job["number"], job["issue"]
+    digest, replan_at, bot, model = job["digest"], job["replan_at"], job["bot"], job["model"]
+    if isinstance(err, (RuntimeError, subprocess.SubprocessError, SystemExit)):
+        entry["analysis_failed_at"] = time.time()
+        mark(key, "failed", f"analysis could not run; retrying in {RETRY_AFTER // 60} minutes: {err}")
+        return
+    if err is not None and not isinstance(err, ValueError):
+        entry["analysis_failed_at"] = time.time()          # was an uncaught crash of the whole pass
+        mark(key, "failed", f"analysis crashed; retrying in {RETRY_AFTER // 60} minutes: "
+             f"{type(err).__name__}: {short(err, 300)}")
+        return
+    if err is not None:
+        e = err
+        entry["attempts"] = entry.get("attempts", 0) + 1
+        log(f"{key}: unusable answer ({e}); attempt {entry['attempts']} of {MAX_ATTEMPTS}")
+        if entry["attempts"] >= MAX_ATTEMPTS and not dry_run:
+            slug = prbot.bot_config(bot)["slug"]
+            url = post(bot, repo, number, f"{A_MARKER}\n`{slug}` could not produce a usable plan after "
+                       f"{MAX_ATTEMPTS} tries (last problem: {e}). Clarify the issue and remove `bot:blocked` "
+                       f"to try again.", "bot:blocked")
+            entry["blocked"] = True
+            prbot.openclaw_attention(f"blocked: {repo}#{number}",
+                                     {"url": url, "title": issue["title"], "worker": slug, "problem": str(e)})
         else:
-            body, label = questions_comment(answer, slug, model), "bot:needs-info"
-        if dry_run:
-            log(f"{key}: would post ({label}):\n{body}")
-            continue
-        url = post(bot, repo, number, body, label)
-        if answer["decision"] == "plan":
-            PLANS_DIR.mkdir(parents=True, exist_ok=True)
-            plan_file = PLANS_DIR / f"{repo.replace('/', '__')}__{number}.json"
-            write_atomic(plan_file, json.dumps({"units": answer["units"]}, indent=1) + "\n")
-            entry["plan_file"] = str(plan_file)
-        entry.pop("stale_plan", None)        # a fresh analysis replaces the out-of-date plan
-        entry.pop("reason", None)            # consumed only now: a held or failed analysis keeps them
-        entry.pop("replan", None)
-        if replan_at is not None:
-            entry["handled_at"] = replan_at
-        entry["analysis"] = {"decision": answer["decision"], "at": time.time(), "model": model, "comment": url,
-                             "digest": digest}
-        tell_openclaw(repo, number, issue["title"], slug, model, answer, url)
-        log(f"{key}: posted {answer['decision']} ({label}) {url}")
+            mark(key, "deferred")         # the next pass asks the model again
+        return
+    slug = prbot.bot_config(bot)["slug"]
+    if answer["decision"] == "plan":
+        body, label = plan_comment(answer, slug, model), "bot:planned"
+    elif answer["decision"] == "no_change":
+        body, label = (f"{A_MARKER}\n### No code change from `{slug}`\n\n_Analysis by `{model}`._\n\n"
+                       f"{answer['summary']}\n\nComment if a change is wanted after all, "
+                       f"and the analysis runs again."), "bot:no-code"
+    else:
+        body, label = questions_comment(answer, slug, model), "bot:needs-info"
+    if dry_run:
+        log(f"{key}: would post ({label}):\n{body}")
+        return
+    url = post(bot, repo, number, body, label)
+    if answer["decision"] == "plan":
+        PLANS_DIR.mkdir(parents=True, exist_ok=True)
+        plan_file = PLANS_DIR / f"{repo.replace('/', '__')}__{number}.json"
+        write_atomic(plan_file, json.dumps({"units": answer["units"]}, indent=1) + "\n")
+        entry["plan_file"] = str(plan_file)
+    entry.pop("stale_plan", None)        # a fresh analysis replaces the out-of-date plan
+    entry.pop("reason", None)            # consumed only now: a held or failed analysis keeps them
+    entry.pop("replan", None)
+    if replan_at is not None:
+        entry["handled_at"] = replan_at
+    entry["analysis"] = {"decision": answer["decision"], "at": time.time(), "model": model, "comment": url,
+                         "digest": digest}
+    tell_openclaw(repo, number, issue["title"], slug, model, answer, url)
+    log(f"{key}: posted {answer['decision']} ({label}) {url}")
 
 
 def tell_openclaw(repo, number, title, slug, model, answer, url):
@@ -1844,27 +1854,41 @@ def kill_group(p):
     p.wait()
 
 
+RUN_FDS = []    # lock files the orchestrator processes of this process's run inherit (cmd_job, orchestrator_in_use)
+
+
+class Terminated(BaseException):
+    """SIGTERM reached a run's process: not a failure of the plan, so nothing blocks the issue for it; the next
+    pass finds the run gone and handles it as interrupted."""
+
+
 def run_ecc(args, timeout=900, env=None, watch=None):
     """Run the orchestrator CLI in its own process group. Every POLL seconds `watch` may return a reason to stop.
     On a stop (Stopped) or the timeout (WorkError) the whole group is killed first. Returns (exit code, JSON
     envelope or {}, stderr tail). Tests replace this."""
     argv = [str(ecc_path())] + args
     with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
+        # the run's locks go to the orchestrator too: they stay held while any part of the run is alive
         p = subprocess.Popen(argv, stdout=out, stderr=err, stdin=subprocess.DEVNULL, text=True, env=env,
-                             start_new_session=True)
+                             start_new_session=True, pass_fds=tuple(RUN_FDS))
         deadline = time.time() + timeout
-        while True:
-            try:
-                p.wait(timeout=max(0.1, min(POLL, deadline - time.time())))
-                break
-            except subprocess.TimeoutExpired:
-                pass
-            why = "timeout" if time.time() >= deadline else watch() if watch else None
-            if why:
+        try:
+            while True:
+                try:
+                    p.wait(timeout=max(0.1, min(POLL, deadline - time.time())))
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                why = "timeout" if time.time() >= deadline else watch() if watch else None
+                if why:
+                    kill_group(p)
+                    if why == "timeout":
+                        raise WorkError(f"`ecc {args[0]}` timed out after {timeout // 60} minutes")
+                    raise Stopped(why)
+        except BaseException:
+            if p.poll() is None:            # this process is going away (a signal, a crash): take the run with it
                 kill_group(p)
-                if why == "timeout":
-                    raise WorkError(f"`ecc {args[0]}` timed out after {timeout // 60} minutes")
-                raise Stopped(why)
+            raise
         out.seek(0)
         err.seek(0)
         stdout, stderr = out.read(), err.read()
@@ -1972,6 +1996,18 @@ def orchestrator_in_use():
     return f
 
 
+class orchestrator_held:
+    """orchestrator_in_use for a `with` block, its file also inherited by the orchestrator processes."""
+    def __enter__(self):
+        self.f = orchestrator_in_use()
+        RUN_FDS.append(self.f.fileno())
+        return self
+
+    def __exit__(self, *exc):
+        RUN_FDS.remove(self.f.fileno())
+        self.f.close()
+
+
 def orchestrator_drift():
     """Why the orchestrator checkout isn't at origin/main, or None. iwb runs whatever is checked out there, and
     Kenny's working checkout may sit on a feature branch. A clean main that is only behind is fast-forwarded, but
@@ -1982,7 +2018,7 @@ def orchestrator_drift():
     held = try_lock(orchestrator_lock_path())
     if held is None:
         head, main = (git("rev-parse", "--verify", "-q", ref).stdout.strip() for ref in ("HEAD", "origin/main"))
-        if main and (head == main or fast_forwardable(git, head, main)):
+        if main and (head == main and tracked_clean(git) or fast_forwardable(git, head, main)):
             return None
         return (f"the orchestrator at {repo} is at {head[:10] or '?'}, not origin/main ({main[:10] or '?'}); "
                 f"update it or set ecc_path in config.json")
@@ -1990,6 +2026,10 @@ def orchestrator_drift():
         return checked_drift(repo, git)
     finally:
         held.close()
+
+
+def tracked_clean(git):
+    return git("status", "--porcelain", "--untracked-files=no").stdout.strip() == ""
 
 
 def checked_drift(repo, git):
@@ -2007,6 +2047,8 @@ def checked_drift(repo, git):
     if not main or head != main:
         return (f"the orchestrator at {repo} is at {head[:10] or '?'}, not origin/main ({main[:10] or '?'}); "
                 f"update it or set ecc_path in config.json")
+    if not tracked_clean(git):
+        return f"the orchestrator at {repo} has changes to tracked files; commit or undo them"
     return None
 
 
@@ -2308,6 +2350,9 @@ def code_plan(key, entry, issue, state, since, ecc):
     worker = WORKERS[agent]
     runner = w.get("runner") or agent   # another runner than the worker's own only by pick_runner's fallback
     units = json.loads(Path(entry["plan_file"]).read_text())["units"]
+    if plan_digest(units) != w.get("plan_digest"):
+        log(f"{key}: the plan file changed since its approval; not coding it")   # a new analysis replaced it
+        return
     free = [u["id"] for u in units if cost_problem(u)]
     if free:                        # approval pins the plan file, so a plan with no cost budget needs a new plan
         block(entry, worker, repo, number, issue["title"],
@@ -2327,7 +2372,7 @@ def code_plan(key, entry, issue, state, since, ecc):
     w.update(status="in-progress", branch=branch, run_id=run_id, started_at=time.time(), started_comment=url)
     save_state(state, since)        # a pass that dies mid-run leaves in-progress behind, which the next pass reports
     log(f"{key}: coding started, run {run_id}")
-    in_use = orchestrator_in_use()
+    in_use = orchestrator_held().__enter__()
     try:
         d, default, base = checkout(repo, worker, branch, number, issue, units)
         w["plan_sha256"] = drive_units(ecc, d, repo, number, runner, units, branch, run_id, w["approver"], conf,
@@ -2351,7 +2396,7 @@ def code_plan(key, entry, issue, state, since, ecc):
             runner = limited or runner
             state["_runner_quota"] = {**(state.get("_runner_quota") or {}), runner: until}
             if runner != (w.get("runner") or agent):
-                entry["work_failed_at"] = time.time()   # a reviewing runner: the author isn't limited, so wait anyway
+                entry["quota_wait"] = until   # a reviewing runner: the author isn't limited, so wait for its reset
             w.update(status="quota", at=time.time(), problem=f"{runner} usage limit")
             when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(until))
             try:
@@ -2366,7 +2411,7 @@ def code_plan(key, entry, issue, state, since, ecc):
               f"coding: {short(e, 300)}")
         return
     finally:
-        in_use.close()
+        in_use.__exit__()
     rows = "\n".join(f"| `{u['id']}` | {u['title']} | {u['routing']['initial_tier']} |" for u in units)
     body = (f"Closes #{number}\n\nPlanned by `{wslug}` ({entry['analysis'].get('comment', '')}), approved by "
             f"`{w['approver']}` ({w.get('approval_comment', '')}), coded by orchestrator run `{run_id}`"
@@ -2779,7 +2824,7 @@ def repair_round(key, entry, issue, state, since, ecc, review, findings, sha, ru
     except RuntimeError as e:
         log(f"{key}: could not post the repair note: {e}")
     log(f"{key}: repair round started, run {run_id}")
-    in_use = orchestrator_in_use()
+    in_use = orchestrator_held().__enter__()
     try:
         d, default, base = checkout_pr(repo, worker, w["branch"], sha, number, issue, units)
         drive_units(ecc, d, repo, number, runner, units, w["branch"], run_id, w["approver"], conf, cost, ecc_cfg)
@@ -2797,7 +2842,7 @@ def repair_round(key, entry, issue, state, since, ecc, review, findings, sha, ru
             state["_runner_quota"] = {**(state.get("_runner_quota") or {}), limited: until}
             w.pop("repair", None)
             if limited != runner:
-                entry["work_failed_at"] = time.time()
+                entry["quota_wait"] = until
             when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(until))
             try:
                 run_gh_as(worker, repo, ["issue", "comment", number, "-R", repo, "--body",
@@ -2812,7 +2857,7 @@ def repair_round(key, entry, issue, state, since, ecc, review, findings, sha, ru
         kenny_unless_landed(key, entry, f"the repair round failed ({short(e)})")
         return
     finally:
-        in_use.close()
+        in_use.__exit__()
     w["repair"].update(status="pushed", sha=new, done_at=time.time())
     try:
         run_gh_as(worker, repo, ["issue", "comment", number, "-R", repo, "--body",
@@ -2899,9 +2944,9 @@ def review_prs(keys, state, since, ecc, dry_run, runs, limit, conf, running=None
                     mark(key, "held", f"repair round waits for the next pass (limit {limit})")
                     continue
                 runner = pr_runner(entry)   # never another family: the PR's reviewer is chosen by its author
-                until = (state.get("_runner_quota") or {}).get(runner, 0)
+                until = max((state.get("_runner_quota") or {}).get(runner, 0), entry.get("quota_wait", 0))
                 if until > time.time():
-                    mark(key, "waiting", f"repair round waits for the {runner} usage limit to reset at "
+                    mark(key, "waiting", f"repair round waits for a usage limit ({runner} runs it) to reset at "
                          f"{time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(until))}")
                     continue
                 if time.time() - entry.get("work_failed_at", 0) < RETRY_AFTER:
@@ -2914,7 +2959,8 @@ def review_prs(keys, state, since, ecc, dry_run, runs, limit, conf, running=None
                 review, findings = detail
                 sha = facts["pr"]["sha"]
                 job = {"key": key, "step": "repair", "runner": runner, "id": f"{time.time():.6f}.{os.getpid()}",
-                       "issue": issue, "review": review, "findings": [list(f) for f in findings], "sha": sha}
+                       "issue": issue, "review": review, "findings": [list(f) for f in findings], "sha": sha,
+                       "plan_digest": w.get("plan_digest")}
                 if not inline:
                     w["job"] = job["id"]
                     save_state(state, since)
@@ -3119,6 +3165,10 @@ def run_job(job, ecc=None):
         if w.get("job") != job["id"] or entry.get("blocked") or entry.get("closed") or entry.get("stale_plan"):
             log(f"{key}: {step} job {job['id']} is no longer current; not running it")
             return
+        ap, _ = approved_plan(entry)    # the approval it was chosen for, of the plan file as it is now
+        if not ap or ap["plan_digest"] != job.get("plan_digest") or w.get("plan_digest") != job.get("plan_digest"):
+            log(f"{key}: {step} job {job['id']} is for a plan that is no longer the approved one; not running it")
+            return
         if step == "code":
             if w.get("status") != "approved":
                 log(f"{key}: coding job {job['id']} found the issue {w.get('status')}; not running it")
@@ -3130,9 +3180,34 @@ def run_job(job, ecc=None):
     except Exception as e:          # never leave the job to be picked again every pass
         if isinstance(entry, dict):
             entry["work_failed_at"] = time.time()
-        log(f"{key}: {step} could not run; retrying in {RETRY_AFTER // 60} minutes: {e!r}")
+        log(f"{key}: {step} could not run; retrying in {RETRY_AFTER // 60} minutes: "
+            f"{type(e).__name__}: {short(e, 300)}")
     finally:
         save_state(state, since)
+
+
+def job_problem(path, job):
+    """Why `iwb code --job` must not run this job, or None. Only a pass starts a job: its file is a regular file
+    in WORK_DIR/jobs, and the process inherited the job's issue and repository locks, held."""
+    import fcntl
+    if path.is_symlink() or not path.is_file() or path.resolve().parent != (WORK_DIR / "jobs").resolve():
+        return f"{path} is not a job file in {WORK_DIR / 'jobs'}"
+    if not isinstance(job, dict) or job.get("step") not in ("code", "repair") \
+            or job.get("runner") not in REQUIRED_RUNNERS or not isinstance(job.get("id"), str) \
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+#\d+", str(job.get("key"))):
+        return "malformed job"
+    fds, repo = job.get("lock_fds"), job["key"].rsplit("#", 1)[0]
+    if not isinstance(fds, list) or len(fds) != 2 or not all(isinstance(fd, int) for fd in fds):
+        return "the job names no lock files"
+    for fd, (kind, name) in zip(fds, (("issue", job["key"]), ("repo", repo))):
+        try:
+            mine, want = os.fstat(fd), os.stat(lock_file(kind, name))
+            if (mine.st_dev, mine.st_ino) != (want.st_dev, want.st_ino):
+                return f"file descriptor {fd} is not the {kind} lock"
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)     # already ours when inherited; else held elsewhere
+        except OSError as e:
+            return f"the {kind} lock is not this process's ({e.strerror})"
+    return None
 
 
 def cmd_job(path):
@@ -3140,12 +3215,29 @@ def cmd_job(path):
     of its own (after any pass holding work.lock) so the freed slot is used and open PRs are looked at, unless
     coding is off or paused."""
     path = Path(path)
-    job = json.loads(path.read_text())
+    try:
+        job = json.loads(path.read_text()) if path.is_file() and not path.is_symlink() else None
+    except (OSError, ValueError):
+        job = None
+    problem = job_problem(path, job)
+    if problem:
+        log(f"code --job: refused: {problem}")
+        return 2
     path.unlink(missing_ok=True)
+    RUN_FDS[:] = job["lock_fds"]
+
+    def terminated(signum, frame):
+        raise Terminated(f"signal {signum}")
+    before = signal.signal(signal.SIGTERM, terminated)
     try:
         run_job(job)
+    except Terminated as e:
+        log(f"{job['key']}: {job['step']} run terminated ({e}); its orchestrator processes were stopped")
+        return 1
     finally:
-        for fd in job.get("lock_fds", []):
+        signal.signal(signal.SIGTERM, before)
+        RUN_FDS.clear()
+        for fd in job["lock_fds"]:
             try:
                 os.close(fd)
             except OSError:
@@ -3276,6 +3368,10 @@ def cmd_code(dry_run=False, limit=None, ecc=None, only=None, review=True, intake
             if not step:
                 continue
             runner = None
+            if step == "code" and entry.get("quota_wait", 0) > time.time():
+                mark(key, "waiting", "coding waits for the usage limit of a runner its last run needed, until "
+                     f"{time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(entry['quota_wait']))}")
+                continue
             if step == "code":
                 runner, until = pick_runner(entry, state, conf)
                 if runner is None:              # the runner that would author this plan is out of credits
@@ -3299,7 +3395,10 @@ def cmd_code(dry_run=False, limit=None, ecc=None, only=None, review=True, intake
                 continue
             bot = WORKERS[entry["agent"]]
             if dry_run:
-                log(f"{key}: would {step}")
+                log(f"{key}: would {step}" + (f" with the {runner} runner" if runner else ""))
+                if step == "code":          # as if it started, so the capacity checks stay true to life
+                    runs += 1
+                    running[key] = {"key": key, "repo": repo, "runner": runner, "step": step}
                 continue
             # Only "code" runs the coder and pushes. "interrupted" never resumes: it blocks the issue, and removing
             # bot:blocked clears the analysis, so the plan is analyzed again. "pr" opens the PR for a branch already
@@ -3324,7 +3423,7 @@ def cmd_code(dry_run=False, limit=None, ecc=None, only=None, review=True, intake
                     finish_pr(key, entry, issue, state, since)
                     continue
                 job = {"key": key, "step": "code", "runner": runner, "id": f"{time.time():.6f}.{os.getpid()}",
-                       "issue": issue}
+                       "issue": issue, "plan_digest": ap["plan_digest"]}
                 entry["work"] = {"status": "approved", "plan_digest": ap["plan_digest"], "approver": ap["approver"],
                                  "approved_at": ap["at"], "approval_comment": ap.get("comment", ""),
                                  "runner": runner, "job": job["id"]}

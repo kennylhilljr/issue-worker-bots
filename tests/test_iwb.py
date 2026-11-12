@@ -549,8 +549,10 @@ class Analyze(unittest.TestCase):
         iwb.clone = clone_failing_second
         log = self.run_pass()
         state = json.loads(iwb.STATE.read_text())
-        self.assertIn("analysis_failed_at", state[keys[3]])           # one failure doesn't lose the other answer
-        self.assertEqual(state[keys[4]]["analysis"]["decision"], "no_change")
+        failed = [k for k in keys[3:] if "analysis_failed_at" in state[k]]  # whichever clone came first
+        self.assertEqual(len(failed), 1)                                # one failure doesn't lose the other answer
+        (ok,) = set(keys[3:]) - set(failed)
+        self.assertEqual(state[ok]["analysis"]["decision"], "no_change")
 
     def test_plan_is_posted_and_saved(self):
         self.answers = [answer({"decision": "plan", "summary": "Add a retry loop.",
@@ -1002,8 +1004,7 @@ class Analyze(unittest.TestCase):
             iwb.post, real_post = failing_post, iwb.post                                    # posting fails
             self.answers = [answer({"decision": "plan", "summary": "lost", "units": [unit()]})]
             try:
-                with self.assertRaises(RuntimeError):
-                    self.run_pass()
+                self.assertIn("analysis answer could not be posted", self.run_pass())
             finally:
                 iwb.post = real_post
             unchanged()
@@ -2278,26 +2279,59 @@ class Code(unittest.TestCase):
         self.spawn_pass()
         ((argv, kw, job),) = started
         path = Path(argv[argv.index("--job") + 1])
-        for fd in self.children.pop(self.KEY):                          # the fake child hands its fds to cmd_job
-            os.close(fd)
-        fds = [os.dup(os.open(os.devnull, os.O_RDONLY)) for _ in range(2)]
+        devnull = [os.open(os.devnull, os.O_RDONLY) for _ in range(2)]
+        self.addCleanup(lambda: [os.close(fd) for fd in devnull])
+        forged = iwb.WORK_DIR / "forged.json"
+        for where, fds in ((forged, job["lock_fds"]), (path, devnull)):   # outside jobs/, or without the locks
+            where.write_text(json.dumps({**job, "lock_fds": fds}))
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(iwb.cmd_job(where), 2)
+            self.assertIn("refused", out.getvalue())
+        self.assertEqual(self.ecc_calls, [])
+        fds = self.children.pop(self.KEY)                                # the fake child's copies of the locks
         job["lock_fds"] = fds
         path.write_text(json.dumps(job))
         self.enterContext(mock.patch.object(iwb, "run_ecc", self.fake_ecc))
         with redirect_stdout(io.StringIO()):
-            iwb.cmd_job(path)
+            self.assertEqual(iwb.cmd_job(path), 0)
         self.assertFalse(path.exists())
+        self.assertFalse(iwb.lock_busy("issue", self.KEY))
         for fd in fds:
             with self.assertRaises(OSError):
                 os.fstat(fd)                                             # closed: the slot is free
         self.assertEqual(self.state()["work"]["status"], "pr-open")
         self.assertEqual(self.policy_of(self.ecc_calls[1])["author_providers"], ["claude"])
-        path.write_text(json.dumps({**job, "lock_fds": []}))            # the same job again: no longer current
+        locks = [iwb.try_lock(iwb.lock_file(k, n)) for k, n in (("issue", self.KEY), ("repo", "kennylhilljr/demo"))]
+        path.write_text(json.dumps({**job, "lock_fds": [f.fileno() for f in locks]}))   # the same job again
         calls = len(self.ecc_calls)
         with redirect_stdout(io.StringIO()) as out:
-            iwb.cmd_job(path)
+            iwb.cmd_job(path)                                            # closes their fds as a job does
         self.assertIn("not running it", out.getvalue())
         self.assertEqual(len(self.ecc_calls), calls)
+        self.assertFalse(iwb.lock_busy("issue", self.KEY))
+        for f in locks:
+            with self.assertRaises(OSError):
+                f.close()                                                # already closed by cmd_job
+
+    def test_a_job_for_a_replaced_plan_does_not_run(self):
+        started = self.spawning()
+        self.spawn_pass()
+        ((argv, kw, job),) = started
+        plan = Path(self.state()["plan_file"])
+        plan.write_text(json.dumps({"units": [coding_unit("u2")]}))       # a new analysis wrote another plan
+        self.enterContext(mock.patch.object(iwb, "run_ecc", self.fake_ecc))
+        with redirect_stdout(io.StringIO()) as out:
+            iwb.run_job(job)
+        self.assertIn("no longer the approved one", out.getvalue())
+        self.assertEqual((self.ecc_calls, self.posts), ([], []))
+
+    def test_dry_run_counts_the_runs_it_would_start(self):
+        self.approve_plan([coding_unit()], key="kennylhilljr/demo#2")
+        self.spawning()
+        log = self.spawn_pass(dry_run=True)
+        self.assertIn("demo#1: would code with the claude runner", log)
+        self.assertIn("demo#2: coding waits: another run is going in kennylhilljr/demo", log)
+        self.assertEqual((self.ecc_calls, self.posts), ([], []))
 
     def limit_codex(self, approver, fallback=True):
         self.approve_plan([REAL_TIER0_UNIT], agent="codex")
@@ -2337,7 +2371,7 @@ class Code(unittest.TestCase):
         self.run_pass()
         e = self.state()
         self.assertEqual(e["work"]["status"], "quota")
-        self.assertIn("work_failed_at", e)
+        self.assertGreater(e["quota_wait"], time.time() + iwb.RETRY_AFTER - 5)   # until the reviewer's reset
         calls = len(self.ecc_calls)
         self.run_pass()
         self.assertEqual(len(self.ecc_calls), calls)                     # not again within the hour
@@ -2836,6 +2870,14 @@ class OrchestratorFastForward(unittest.TestCase):
         r, out = self.drift()
         self.assertIsNone(r)
         self.assertEqual(self.head(self.orch), self.head(self.src))
+
+    def test_a_dirty_checkout_at_origin_main_is_refused(self):
+        self.assertIsNone(self.drift()[0])                                 # fast-forwarded to origin/main
+        Path(self.orch, "bin", "ecc").write_text("local edit\n")
+        self.assertIn("changes to tracked files", self.drift()[0])
+        held = iwb.orchestrator_in_use()                                   # also while a run holds it
+        self.addCleanup(held.close)
+        self.assertIn("not origin/main", self.drift()[0])
 
     def test_changed_tracked_file_is_refused(self):
         before = self.head(self.orch)
@@ -5032,7 +5074,7 @@ class AutoMerge(unittest.TestCase):
         iwb.STATE.write_text(json.dumps(state))
         self.config(runner_fallback=True)
         log = self.run_pass()
-        self.assertIn("repair round waits for the codex usage limit", log)
+        self.assertIn("repair round waits for a usage limit (codex runs it)", log)
         self.assertEqual((self.ecc_calls, self.posts), ([], []))
         state = json.loads(iwb.STATE.read_text())
         state["_runner_quota"] = {}
@@ -5078,7 +5120,7 @@ class AutoMerge(unittest.TestCase):
         self.assertIn("claude", json.loads(iwb.STATE.read_text())["_runner_quota"])
         self.assertTrue(any("Repair round paused" in a[-1] for _, a in self.gh_calls))
         log = self.run_pass()
-        self.assertIn("repair round waits for the claude usage limit", log)
+        self.assertIn("repair round waits for a usage limit (claude runs it)", log)
 
     def test_repair_round_waits_for_the_coding_limit(self):
         self.reviews = [review(HEAD, P2_FINDING)]
