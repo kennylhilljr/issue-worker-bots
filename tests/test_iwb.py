@@ -512,6 +512,30 @@ class Analyze(unittest.TestCase):
         self.run_pass()
         self.assertEqual(len(self.posts), 1)   # a planned issue is not analyzed again
 
+    def test_only_the_latest_plan_reaches_the_planner(self):
+        """Each replan reposts the whole plan; pr-review-bots#5 piled up 18 of them (290KB) and the planner stopped
+        following the answer format. Earlier plans are replaced by a one-line note; the owner's comments and the
+        review verdicts stay in full."""
+        self.issue["labels"] = []
+        plan = lambda n: f"{iwb.A_MARKER}\n### Plan from `claude-dev-gh`\n\nPLAN-BODY-{n} " + "x" * 5000
+        self.comments = [
+            {"user": "claude-dev-gh[bot]", "body": plan(1), "at": "2026-01-01T00:00:00Z"},
+            {"user": "codex-dev-gh[bot]", "body": f"{iwb.A_MARKER}\n### Plan needs changes VERDICT-1",
+             "at": "2026-01-01T00:01:00Z"},
+            {"user": OWNER, "body": "CLARIFICATION-1", "at": "2026-01-01T00:02:00Z"},
+            {"user": "claude-dev-gh[bot]", "body": plan(2), "at": "2026-01-01T00:03:00Z"},
+            {"user": "claude-dev-gh[bot]", "body": f"{iwb.W_MARKER}\nCoding stopped WORK-NOTE",
+             "at": "2026-01-01T00:04:00Z"},
+            {"user": "claude-dev-gh[bot]", "body": plan(3), "at": "2026-01-01T00:05:00Z"}]
+        _, _, text = iwb.issue_text("kennylhilljr/demo", 1, {OWNER}, {"claude-dev-gh[bot]", "codex-dev-gh[bot]"})
+        self.assertNotIn("PLAN-BODY-1", text)
+        self.assertNotIn("PLAN-BODY-2", text)
+        self.assertIn("PLAN-BODY-3", text)
+        self.assertEqual(text.count("(an earlier plan, replaced by a later one; omitted)"), 2)
+        for kept in ("VERDICT-1", "CLARIFICATION-1", "WORK-NOTE"):
+            self.assertIn(kept, text)
+        self.assertLess(len(text), 7000)
+
     def test_questions_then_owner_reply_reruns(self):
         self.answers = [answer({"decision": "questions", "summary": "Unclear.", "questions": ["Which uploads?"]}),
                         answer({"decision": "plan", "summary": "Now clear.", "units": [unit()]})]

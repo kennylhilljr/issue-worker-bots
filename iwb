@@ -491,16 +491,27 @@ def analysis_model(agent):
 
 def issue_text(repo, number, trusted, bot_logins, approver_logins=()):
     """Title, body, and comments by trusted accounts only, so strangers' comments never reach the model. The
-    review bots' plan verdicts count too, so a revise verdict reaches the planner."""
+    review bots' plan verdicts count too, so a revise verdict reaches the planner. Only the latest plan a worker bot
+    posted is kept in full: each replan reposts the whole plan, and an issue revised many times grew past 290KB of
+    superseded plans, after which the planner stopped following the answer format."""
     i = gh_json(["api", f"repos/{repo}/issues/{number}", "--jq", "{title, body, state, user: .user.login, labels: [.labels[].name]}"])[0]
     comments = gh_json(["api", f"repos/{repo}/issues/{number}/comments?per_page=100", "--paginate",
                         "--jq", ".[] | {user: .user.login, body: .body, at: .created_at}"])
     kept = [c for c in comments if c["user"] in trusted or c["user"] in bot_logins
             or c["user"] in approver_logins and "<!-- iwb:approval -->" in (c["body"] or "")]
+    plans = [n for n, c in enumerate(kept) if c["user"] in bot_logins and is_plan_comment(c["body"])]
     text = f"# {i['title']}\n\n{i['body'] or '(no description)'}\n"
-    for c in kept:
+    for n, c in enumerate(kept):
+        if n in plans[:-1]:
+            text += f"\n--- comment by {c['user']} at {c['at']} ---\n(an earlier plan, replaced by a later one; omitted)\n"
+            continue
         text += f"\n--- comment by {c['user']} at {c['at']} ---\n{(c['body'] or '').replace(MARKER, '').replace(A_MARKER, '').replace(R_MARKER, '').replace('<!-- iwb:approval -->', '')}\n"
     return i, comments, text
+
+
+def is_plan_comment(body):
+    """Whether a comment is a plan the analysis step posted (see plan_comment)."""
+    return (body or "").lstrip().startswith(f"{A_MARKER}\n### Plan from ")
 
 
 def clone(repo, bot):
