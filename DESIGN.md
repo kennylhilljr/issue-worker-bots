@@ -294,6 +294,10 @@ The runtime's validation is unchanged either way: binding fields, plan hash and 
 3. Phase C once step 4 creates real runs.
 4. Phase B only if the 5-minute delay turns out to matter.
 
+## Repository checks
+
+`scripts/check.py` is the one check for this repository, locally and in CI. It byte-compiles `iwb` and every Python file under `tests/` and stops there on a syntax error, then runs unittest discovery with a fresh `TMPDIR` under `/tmp` and `PRBOT_PATH` set to the bundled `tests/prbot_stub.py`, so no sibling pr-review-bots checkout or credentials are needed. The GitHub Actions workflow that runs it is documented in [docs/ci.md](docs/ci.md); Kenny installs it by hand because `.github/workflows/**` is always blocked for bots.
+
 ## Where it lives
 
 A new repository, `issue-worker-bots`, holds the intake watcher, the analysis prompt and its output schema, the clarity gate, and the glue that starts orchestrator runs and opens PRs. It depends on two existing pieces:
