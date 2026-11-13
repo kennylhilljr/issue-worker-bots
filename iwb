@@ -1766,7 +1766,7 @@ its evidence.
 """
 REVIEW_DAYS = 90               # how far back bot-review findings are read for a scan
 REVIEW_CHARS = 4000            # the most characters of review findings a scan prompt gets
-REVIEW_BOTS = ["claude-pr-gh[bot]", "codex-pr-gh[bot]"]   # default config.json scan.review_bot_logins
+SCAN_REVIEW_BOTS = ["claude-pr-gh[bot]", "codex-pr-gh[bot]"]   # default config.json scan.review_bot_logins
 
 
 def scan_repo(repo, *, manual=False, force=False, dry_run=False):
@@ -2154,12 +2154,12 @@ def file_findings(repo, bot, kept, *, dry_run=False):
 
 
 def review_bot_logins(conf):
-    """config.json scan.review_bot_logins, or REVIEW_BOTS when it is missing or not a list of logins."""
+    """config.json scan.review_bot_logins, or SCAN_REVIEW_BOTS when it is missing or not a list of logins."""
     scan = conf.get("scan")
-    logins = scan.get("review_bot_logins", REVIEW_BOTS) if isinstance(scan, dict) else REVIEW_BOTS
+    logins = scan.get("review_bot_logins", SCAN_REVIEW_BOTS) if isinstance(scan, dict) else SCAN_REVIEW_BOTS
     if not isinstance(logins, list) or not all(isinstance(x, str) for x in logins):
-        log(f"config.json scan.review_bot_logins must be a list of logins, not {logins!r}; using {REVIEW_BOTS}")
-        return list(REVIEW_BOTS)
+        log(f"config.json scan.review_bot_logins must be a list of logins, not {logins!r}; using {SCAN_REVIEW_BOTS}")
+        return list(SCAN_REVIEW_BOTS)
     return logins
 
 

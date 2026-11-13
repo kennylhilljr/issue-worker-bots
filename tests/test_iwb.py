@@ -2508,7 +2508,7 @@ class ScanReviews(ScanFixture):
         self.assertIn("by another bot", p)
         self.assertNotIn("by claude", p)
         with redirect_stdout(io.StringIO()):
-            self.assertEqual(iwb.review_bot_logins({"scan": {"review_bot_logins": "x"}}), iwb.REVIEW_BOTS)
+            self.assertEqual(iwb.review_bot_logins({"scan": {"review_bot_logins": "x"}}), iwb.SCAN_REVIEW_BOTS)
 
     def test_truncation(self):
         now = time.time()
