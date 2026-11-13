@@ -575,6 +575,14 @@ def revision_pending(entry):
     return ap.get("at", 0) >= plan_at
 
 
+def backfill_plan_at(entry):
+    """Give an entry from before "plan_at" existed the time of its plan analysis, before anything replaces or
+    drops that analysis, so revision_pending never mistakes a newer plan for none."""
+    a = entry.get("analysis") or {}
+    if "plan_at" not in entry and a.get("decision") == "plan" and "at" in a:
+        entry["plan_at"] = a["at"]
+
+
 def is_plan_comment(body):
     """Whether a comment is a plan the analysis step posted (see plan_comment)."""
     return (body or "").lstrip().startswith(f"{A_MARKER}\n### Plan from ")
@@ -956,6 +964,7 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
         if "agent" not in entry or paused or only is not None and key not in only \
                 or repo_filter is not None and not key.startswith(repo_filter + "#"):
             continue
+        backfill_plan_at(entry)
         if time.time() - entry.get("analysis_failed_at", 0) < RETRY_AFTER:
             mark(key, "waiting")              # the hour after a model failure; a queued event retries later
             continue
@@ -983,7 +992,7 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
                 continue
             entry.pop("blocked")
             entry["attempts"] = 0
-            if entry.pop("blocked_label", None):
+            if entry.pop("blocked_label", None) == "bot:needs-kenny":
                 entry["replan"] = True    # Kenny removed bot:needs-kenny: analyze again; budgets and plan are kept
             else:                         # the owner removed bot:blocked: try again from scratch
                 entry.pop("analysis", None)

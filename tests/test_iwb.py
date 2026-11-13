@@ -836,7 +836,8 @@ class Analyze(unittest.TestCase):
         e["plan_at"] = e["analysis"]["at"]
         e["approval"] = {"verdict": "revise", "source_digest": "d", "at": e["analysis"]["at"] + 60,
                          "comment": "https://x/review"}   # what cmd_approve stores when it sends a plan back
-        e["review_revisions"], e["replan"] = 1, True
+        e["review_revisions"], e["lint_revisions"], e["replan"] = 1, 1, True
+        self.plan_file = e["plan_file"]
         iwb.STATE.write_text(json.dumps(state))
         self.comments = [
             {"user": "claude-dev-gh[bot]", "at": "2026-11-06T06:17:44Z",
@@ -886,6 +887,8 @@ class Analyze(unittest.TestCase):
         self.assertNotIn("blocked", self.state())
         self.assertNotIn("blocked_label", self.state())
         self.assertEqual(self.state()["review_revisions"], 1)   # the reviewer's one send-back stays spent
+        self.assertEqual(self.state()["lint_revisions"], 1)
+        self.assertEqual(self.state()["plan_file"], self.plan_file)
         self.assertIn("no_change is not allowed here", self.full_prompts[-1])
         self.assertNotIn("bot:no-code", [label for _, label, _ in self.posts])
         self.answers = [answer({"decision": "plan", "summary": "v2", "units": [unit()]})]
@@ -905,6 +908,22 @@ class Analyze(unittest.TestCase):
         self.assertNotIn("bot:no-code", [label for _, label, _ in self.posts])
         self.assertIn("no_change is not allowed here", self.full_prompts[-1])
         self.assertEqual(self.state()["analysis"]["decision"], "questions")
+
+    def test_legacy_entry_keeps_its_newer_plan_when_questions_replace_it(self):
+        self.plan_first()                                        # an entry from before plan_at: revise, then v2
+        state = json.loads(iwb.STATE.read_text())
+        e = state[self.KEY]
+        del e["plan_at"]
+        e["approval"] = {"verdict": "revise", "source_digest": "d", "at": e["analysis"]["at"] - 60}
+        iwb.STATE.write_text(json.dumps(state))
+        self.comments = [{"user": OWNER, "body": "Which uploads?", "at": self.later()}]
+        self.answers = [answer({"decision": "questions", "summary": "?", "questions": ["Which?"]})]
+        self.run_pass()
+        self.assertFalse(iwb.revision_pending(self.state()))     # the plan's time survived the questions
+        self.comments.append({"user": OWNER, "body": "None, it's done already.", "at": self.later(2)})
+        self.answers = [answer({"decision": "no_change", "summary": "Already done."})]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:no-code")
 
     def test_entry_from_before_plan_at_still_counts_its_plan(self):
         e = {"analysis": {"decision": "plan", "at": 100}, "approval": {"verdict": "revise", "at": 160}}
