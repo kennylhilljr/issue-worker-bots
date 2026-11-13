@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import shutil
@@ -5,11 +6,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, ".claude", "hooks", "check_tool.py")
 PAYLOAD = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
 PRE_COMMAND = 'python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/check_tool.py" --mode pre'
+POST_COMMAND = 'python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/check_tool.py" --mode post'
 EXPECTED_HOOKS = {
     "PreToolUse": [
         {
@@ -19,6 +22,12 @@ EXPECTED_HOOKS = {
         {
             "matcher": "Bash",
             "hooks": [{"type": "command", "command": PRE_COMMAND}],
+        },
+    ],
+    "PostToolUse": [
+        {
+            "matcher": "Write|Edit|MultiEdit",
+            "hooks": [{"type": "command", "command": POST_COMMAND, "timeout": 660}],
         },
     ],
 }
@@ -341,6 +350,141 @@ class LiveCommands(unittest.TestCase):
 
     def test_missing_command_allowed(self):
         self.assertEqual(self.call("Bash", {}).returncode, 0)
+
+
+FAKE_PYTHON = """#!{python}
+import json, os, sys, time
+here = os.path.dirname(os.path.abspath(__file__))
+tmpdir = os.environ.get("TMPDIR", "")
+with open(os.path.join(here, "calls.log"), "a") as log:
+    log.write(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd(), "tmpdir": tmpdir,
+                          "tmpdir_exists": os.path.isdir(tmpdir)}}) + "\\n")
+if not os.path.isdir(tmpdir):
+    sys.exit(97)
+print("FAKE-STDOUT")
+print("FAKE-STDERR", file=sys.stderr)
+sys.stdout.flush()
+sys.stderr.flush()
+time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
+sys.exit(int(os.environ.get("FAKE_RC", "0")))
+"""
+
+
+def load_hook_module():
+    spec = importlib.util.spec_from_file_location("check_tool_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class PostEdit(unittest.TestCase):
+    """A fake python3 on PATH stands in for the suite; the real suite never runs here."""
+
+    RUN_PATHS = ("iwb", "tests/test_iwb.py", os.path.join(ROOT, "tests", "x.py"))
+    QUIET_PATHS = ("README.md", "docs/x.md", ".claude/settings.json", "/elsewhere/tests/x.py")
+    EDIT_TOOLS = ("Write", "Edit", "MultiEdit")
+
+    def setUp(self):
+        self.fake_dir = tempfile.mkdtemp(dir="/tmp")
+        self.cwd = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, self.fake_dir, True)
+        self.addCleanup(shutil.rmtree, self.cwd, True)
+        self.fake = os.path.join(self.fake_dir, "python3")
+        with open(self.fake, "w") as fh:
+            fh.write(FAKE_PYTHON.format(python=sys.executable))
+        os.chmod(self.fake, 0o755)
+        self.log = os.path.join(self.fake_dir, "calls.log")
+
+    def calls(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def reset_log(self):
+        if os.path.exists(self.log):
+            os.remove(self.log)
+
+    def env(self, path=None, **extra):
+        env = {k: v for k, v in os.environ.items() if k not in ("FAKE_RC", "FAKE_SLEEP")}
+        env["PATH"] = path if path is not None else self.fake_dir + os.pathsep + os.environ.get("PATH", "")
+        env.update(extra)
+        return env
+
+    def run_hook(self, tool, tool_input, env=None):
+        return subprocess.run(
+            [sys.executable, SCRIPT, "--mode", "post"],
+            cwd=self.cwd,
+            input=json.dumps({"tool_name": tool, "tool_input": tool_input}),
+            capture_output=True,
+            text=True,
+            env=env if env is not None else self.env(),
+        )
+
+    def assert_one_run(self):
+        calls = self.calls()
+        self.assertEqual(len(calls), 1, calls)
+        call = calls[0]
+        self.assertEqual(call["argv"], ["-m", "unittest", "discover", "-s", "tests"])
+        self.assertEqual(os.path.realpath(call["cwd"]), os.path.realpath(ROOT))
+        self.assertTrue(call["tmpdir"].startswith("/tmp/"), call["tmpdir"])
+        self.assertTrue(call["tmpdir_exists"])
+        self.assertFalse(os.path.exists(call["tmpdir"]), "TMPDIR folder left behind")
+        return call
+
+    def test_edits_to_iwb_and_tests_run_the_suite(self):
+        for tool in self.EDIT_TOOLS:
+            for path in self.RUN_PATHS:
+                with self.subTest(tool=tool, path=path):
+                    self.reset_log()
+                    result = self.run_hook(tool, {"file_path": path})
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    self.assert_one_run()
+
+    def test_failing_suite_is_reported(self):
+        for path in self.RUN_PATHS:
+            with self.subTest(path=path):
+                self.reset_log()
+                result = self.run_hook("Edit", {"file_path": path}, env=self.env(FAKE_RC="1"))
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("Tests failed", result.stderr)
+                self.assertIn(os.path.basename(path), result.stderr)
+                self.assertIn("FAKE-STDOUT", result.stderr)
+                self.assertIn("FAKE-STDERR", result.stderr)
+                self.assert_one_run()
+
+    def test_failure_message_names_the_edited_path(self):
+        result = self.run_hook("Write", {"file_path": "tests/test_iwb.py"}, env=self.env(FAKE_RC="1"))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Tests failed after editing tests/test_iwb.py", result.stderr)
+
+    def test_other_edits_and_tools_run_nothing(self):
+        cases = [(tool, {"file_path": path}) for tool in self.EDIT_TOOLS for path in self.QUIET_PATHS]
+        cases.append(("Bash", {"command": "./iwb --help"}))
+        for tool, tool_input in cases:
+            with self.subTest(tool=tool, tool_input=tool_input):
+                result = self.run_hook(tool, tool_input, env=self.env(FAKE_RC="1"))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(self.calls(), [])
+
+    def test_missing_python3_is_reported(self):
+        empty = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, empty, True)
+        result = self.run_hook("Edit", {"file_path": "iwb"}, env=self.env(path=empty))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("could not run", result.stderr)
+
+    def test_timeout_is_reported_and_cleaned_up(self):
+        module = load_hook_module()
+        env = self.env(FAKE_SLEEP="30")
+        with mock.patch.dict(os.environ, env, clear=True):
+            code, message = module.run_tests("iwb", timeout=1)
+        self.assertEqual(code, 2)
+        self.assertIn("timed out", message)
+        self.assertIn("iwb", message)
+        self.assert_one_run()
 
 
 if __name__ == "__main__":

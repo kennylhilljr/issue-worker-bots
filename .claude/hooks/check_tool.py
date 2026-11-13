@@ -3,17 +3,25 @@
 
 --mode pre blocks Write/Edit/MultiEdit calls on secret-shaped files, and Bash
 commands that would run the live pipeline (iwb), install-intake.sh or change
-launchd jobs. --mode post currently allows everything.
+launchd jobs. --mode post runs the test suite after an edit to iwb or tests/ and reports failures.
 """
 import argparse
 import io
 import json
 import os
 import shlex
+import shutil
+import signal
+import subprocess
 import sys
-from pathlib import PurePosixPath
+import tempfile
+from pathlib import Path, PurePosixPath
 
 EDIT_TOOLS = ("Write", "Edit", "MultiEdit")
+ROOT = Path(__file__).resolve().parents[2]     # the checkout: .claude/hooks/check_tool.py
+TEST_COMMAND = ["python3", "-m", "unittest", "discover", "-s", "tests"]
+TEST_TIMEOUT = 600
+OUTPUT_TAIL = 4000
 
 PUNCTUATION = ";&|<>()`\n"
 BLANKS = " \t\r"
@@ -484,6 +492,68 @@ def check_pre(payload):
     return 0, ""
 
 
+def edited_test_target(file_path, root=ROOT):
+    """Return file_path relative to root when it is iwb or under tests/, else None."""
+    if not isinstance(file_path, str) or not file_path:
+        return None
+    if os.path.isabs(file_path):
+        # realpath on both sides: /tmp is a symlink to /private/tmp on macOS.
+        try:
+            relative = os.path.relpath(os.path.realpath(file_path), os.path.realpath(str(root)))
+        except ValueError:
+            return None
+    else:
+        relative = os.path.normpath(file_path)
+    parts = PurePosixPath(relative).parts
+    if not parts or parts[0] in ("..", "/"):
+        return None
+    if parts == ("iwb",) or (parts[0] == "tests" and len(parts) > 1):
+        return relative
+    return None
+
+
+def run_tests(edited, timeout=TEST_TIMEOUT, root=ROOT):
+    """Run the suite in a fresh TMPDIR; return (exit_code, message) for the PostToolUse hook."""
+    tmpdir = tempfile.mkdtemp(prefix="iwb-hook-", dir="/tmp")
+    try:
+        env = dict(os.environ, TMPDIR=tmpdir)
+        try:
+            # Own session so a timeout can kill the whole process group, not only the runner.
+            process = subprocess.Popen(TEST_COMMAND, cwd=str(root), env=env, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, start_new_session=True)
+        except OSError as error:
+            return 2, f"Tests could not run after editing {edited}: {error}"
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            process.communicate()
+            return 2, f"Tests timed out after {timeout} seconds after editing {edited}; the run was stopped."
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    if process.returncode != 0:
+        out = stdout.decode("utf-8", "replace")[-OUTPUT_TAIL:]
+        err = stderr.decode("utf-8", "replace")[-OUTPUT_TAIL:]
+        return 2, f"Tests failed after editing {edited}:\n{out}\n{err}"
+    return 0, ""
+
+
+def check_post(payload):
+    """Return (exit_code, message) for a PostToolUse payload."""
+    if not isinstance(payload, dict) or payload.get("tool_name") not in EDIT_TOOLS:
+        return 0, ""
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return 0, ""
+    edited = edited_test_target(tool_input.get("file_path"))
+    if edited is None:
+        return 0, ""
+    return run_tests(edited)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Claude Code tool hook")
     parser.add_argument("--mode", required=True, choices=["pre", "post"])
@@ -492,12 +562,10 @@ def main(argv=None):
         payload = json.load(sys.stdin)
     except ValueError:
         return 0
-    if args.mode == "pre":
-        code, message = check_pre(payload)
-        if message:
-            print(message, file=sys.stderr)
-        return code
-    return 0
+    code, message = check_pre(payload) if args.mode == "pre" else check_post(payload)
+    if message:
+        print(message, file=sys.stderr)
+    return code
 
 
 if __name__ == "__main__":
