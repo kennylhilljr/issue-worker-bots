@@ -242,6 +242,8 @@ class LiveCommands(unittest.TestCase):
         "bash -euo pipefail -c './iwb tick'", "bash -eo pipefail -c './iwb tick'",
         "bash -euo pipefail install-intake.sh", "env - ./iwb tick", "env -iS './iwb tick'",
         "python3 -m trace --ignore-dir /usr iwb tick",
+        "python3 -m trace --trace iwb tick", "python3 -m trace --count iwb tick",
+        "python3 -m cProfile -- iwb tick",
     )
 
     ALLOWED = (

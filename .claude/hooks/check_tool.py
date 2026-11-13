@@ -58,6 +58,8 @@ LAUNCHCTL_READ_ONLY = ("list", "print", "print-cache", "print-disabled", "blame"
 IWB_SUBCOMMANDS = ("tick", "intake", "analyze", "approve", "code")
 # python -m modules whose first operand is a script they run.
 SCRIPT_RUNNING_MODULES = ("cProfile", "profile", "pdb", "trace")
+MODULE_VALUE_OPTIONS = ("-o", "-s", "-c", "-f", "-C", "--outfile", "--sort", "--command", "--file",
+                        "--coverdir", "--ignore-module", "--ignore-dir")
 EXPANSION_CHARS = "$`{*?["
 
 IWB_MESSAGE = ("Blocked: iwb {sub} runs the live pipeline from this checkout (launchd owns it). "
@@ -299,9 +301,10 @@ def _python_operand(args):
                         return None     # a module, not a script path
                     rest = index + (1 if arg[position + 1:] else 2)
                     while rest < len(args) and args[rest].startswith("-"):
-                        takes_value = args[rest] in ("-o", "-s", "-c") or (
-                            args[rest].startswith("--") and "=" not in args[rest])
-                        rest += 2 if takes_value else 1
+                        if args[rest] == "--":
+                            rest += 1
+                            break
+                        rest += 2 if args[rest] in MODULE_VALUE_OPTIONS else 1
                     return rest if rest < len(args) else None
                 if flag == "c":
                     return None     # inline code
