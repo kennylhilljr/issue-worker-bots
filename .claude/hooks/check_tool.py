@@ -5,6 +5,10 @@
 commands that would run the live pipeline (iwb), install-intake.sh or change
 launchd jobs. --mode post runs the test suite after an edit to iwb or tests/
 and reports failures.
+
+File and program names are compared case-insensitively: the checkout sits on a
+case-insensitive APFS volume, where ./IWB and .ENV name the same files as ./iwb
+and .env.
 """
 import argparse
 import io
@@ -16,6 +20,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+import unicodedata
+from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 
 EDIT_TOOLS = ("Write", "Edit", "MultiEdit")
@@ -69,6 +75,10 @@ IWB_SUBCOMMANDS = ("tick", "intake", "analyze", "approve", "code")
 SCRIPT_RUNNING_MODULES = ("cProfile", "profile", "pdb", "trace")
 GUARDED_PROGRAMS = ("iwb", "install-intake.sh", "launchctl")
 EXPANSION_CHARS = "$`{*?["
+# launchctl subcommands that change jobs; a variable program followed by one of them is refused.
+LAUNCHCTL_WRITE = ("load", "unload", "bootstrap", "bootout", "enable", "disable", "kickstart",
+                   "kill", "submit", "remove", "start", "stop", "setenv", "unsetenv", "asuser",
+                   "bsexec", "attach", "debug", "reboot", "limit", "config", "uncache")
 
 IWB_MESSAGE = ("Blocked: iwb {sub} runs the live pipeline from this checkout (launchd owns it). "
                "Use --dry-run on intake/analyze/approve/code (never with --from-queue or --job); "
@@ -78,6 +88,8 @@ IWB_DYNAMIC_MESSAGE = ("Blocked: iwb arguments that use shell expansion or comma
                        "Spell out the arguments.")
 IWB_XARGS_MESSAGE = ("Blocked: iwb run through xargs takes its arguments from stdin, so it "
                      "cannot be checked; iwb runs the live pipeline from this checkout.")
+PROGRAM_PATTERN_MESSAGE = ("Blocked: the program {word!r} uses shell expansion and may run {name} "
+                           "(iwb, install-intake.sh, launchctl rules); spell out the program name.")
 INSTALL_MESSAGE = ("Blocked: install-intake.sh installs the live launchd job; "
                    "do not run it from an agent session.")
 LAUNCHCTL_MESSAGE = ("Blocked: launchctl {sub} can change launchd jobs; "
@@ -92,9 +104,14 @@ class Unparsable(Exception):
     """The command cannot be split reliably; the hook fails closed."""
 
 
+def fold(text):
+    """Case-fold a name the way a case-insensitive APFS volume compares it."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", text).casefold())
+
+
 def is_secret_path(file_path):
     """Return True when file_path looks like a secret file, mirroring iwb's ALWAYS_BLOCKED secrets."""
-    parts = PurePosixPath(file_path).parts
+    parts = PurePosixPath(fold(file_path)).parts
     if not parts:
         return False
     name = parts[-1]
@@ -251,7 +268,92 @@ def _substitutions(body):
 
 
 def _basename(word):
-    return os.path.basename(word.rstrip("/")) if word else ""
+    """The case-folded file name of a program word: ./IWB and iwb name the same program."""
+    return fold(os.path.basename(word.rstrip("/"))) if word else ""
+
+
+def _skip_expansion(word, index):
+    """Return the index after the $... or `...` expansion that starts at word[index]."""
+    if word[index] == "`":
+        stop = word.find("`", index + 1)
+        return len(word) if stop < 0 else stop + 1
+    if word.startswith("$(", index) or word.startswith("${", index):
+        opening, closing = word[index + 1], ")" if word[index + 1] == "(" else "}"
+        depth, stop = 0, index + 1
+        while stop < len(word):
+            if word[stop] == opening:
+                depth += 1
+            elif word[stop] == closing:
+                depth -= 1
+                if depth == 0:
+                    return stop + 1
+            stop += 1
+        return len(word)
+    stop = index + 1
+    if stop < len(word) and not (word[stop].isalnum() or word[stop] == "_"):
+        return stop + 1         # $1, $@, $?, ...
+    while stop < len(word) and (word[stop].isalnum() or word[stop] == "_"):
+        stop += 1
+    return stop
+
+
+def _brace_expand(pattern, limit=64):
+    """Expand {a,b} alternatives, nested ones included; past limit, braces become '*'."""
+    results, pending = [], [pattern]
+    while pending:
+        if len(results) + len(pending) > limit:
+            return [pattern.replace("{", "*").replace("}", "*").replace(",", "*")]
+        item = pending.pop()
+        start = item.find("{")
+        while start >= 0:
+            depth, stop, commas = 0, start, []
+            while stop < len(item):
+                if item[stop] == "{":
+                    depth += 1
+                elif item[stop] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif item[stop] == "," and depth == 1:
+                    commas.append(stop)
+                stop += 1
+            if stop < len(item) and commas:
+                bounds = [start] + commas + [stop]
+                for left, right in zip(bounds, bounds[1:]):
+                    pending.append(item[:start] + item[left + 1:right] + item[stop + 1:])
+                break
+            start = item.find("{", start + 1)
+        else:
+            results.append(item)
+    return results
+
+
+def _program_patterns(word):
+    """Glob patterns for the file name a program word may expand to.
+
+    Every $NAME, ${...}, $(...) and `...` becomes '*'; braces are expanded.
+    """
+    out, index = [], 0
+    while index < len(word):
+        if word[index] in "$`":
+            out.append("*")
+            index = _skip_expansion(word, index)
+        else:
+            out.append(word[index])
+            index += 1
+    return [fold(os.path.basename(pattern.rstrip("/"))) for pattern in _brace_expand("".join(out))]
+
+
+def _may_name(word, program):
+    """True when the program word uses shell expansion that can produce program's file name."""
+    if not any(ch in word for ch in EXPANSION_CHARS):
+        return False
+    return any(fnmatchcase(program, pattern) for pattern in _program_patterns(word))
+
+
+def _only_expansion(word):
+    """True when the program's file name is nothing but expansions and wildcards ($cmd, ./*)."""
+    return all(set(pattern) <= set("*?") for pattern in _program_patterns(word))
 
 
 def _is_assignment(word):
@@ -356,6 +458,10 @@ def _check_program(program_word, program_body, args, arg_bodies, via_xargs, term
     if program not in TEST_PROGRAMS and any(ch in program_body for ch in EXPANSION_CHARS) and \
             any(arg in IWB_SUBCOMMANDS for arg in args):
         return IWB_DYNAMIC_MESSAGE   # $cmd tick, ./i*b tick: the program may be iwb
+    if program not in TEST_PROGRAMS and program not in GUARDED_PROGRAMS:
+        message = _check_program_pattern(program_word, args)
+        if message:
+            return message
     if program == "install-intake.sh":
         return INSTALL_MESSAGE
     if program == "launchctl":
@@ -364,6 +470,29 @@ def _check_program(program_word, program_body, args, arg_bodies, via_xargs, term
             return LAUNCHCTL_MESSAGE.format(sub=subcommands[0])
         if not subcommands:     # commands from stdin or xargs
             return LAUNCHCTL_MESSAGE.format(sub="without a subcommand")
+    return None
+
+
+def _check_program_pattern(program_word, args):
+    """Refuse a program word whose expansion may name install-intake.sh, or launchctl with a write.
+
+    ./install-intake.s?, /bin/launchct? load x and ./IWB{,} are refused. A word that is only
+    an expansion ("$cmd") could be any program, so it is refused only when a launchctl
+    write subcommand follows; iwb subcommands are handled before this.
+    """
+    subcommands = [arg for arg in args if not arg.startswith("-")]
+    if _only_expansion(program_word):
+        if subcommands and subcommands[0] in LAUNCHCTL_WRITE:
+            return PROGRAM_PATTERN_MESSAGE.format(word=program_word, name="launchctl")
+        return None
+    for name in GUARDED_PROGRAMS:
+        if not _may_name(program_word, name):
+            continue
+        if name == "launchctl" and subcommands and subcommands[0] in LAUNCHCTL_READ_ONLY:
+            continue
+        if name == "iwb" and _check_program("iwb", "iwb", args, args, False, "", MAX_DEPTH) is None:
+            continue
+        return PROGRAM_PATTERN_MESSAGE.format(word=program_word, name=name)
     return None
 
 
@@ -494,13 +623,22 @@ def check_pre(payload):
 
 
 def edited_test_target(file_path, root=ROOT):
-    """Return file_path relative to root when it is iwb or under tests/, else None."""
+    """Return file_path relative to root when it is iwb or under tests/, else None.
+
+    Names compare case-insensitively (IWB, Tests/x.py), like the volume the checkout is on.
+    """
     if not isinstance(file_path, str) or not file_path:
         return None
     if os.path.isabs(file_path):
         # realpath on both sides: /tmp is a symlink to /private/tmp on macOS.
         try:
-            relative = os.path.relpath(os.path.realpath(file_path), os.path.realpath(str(root)))
+            real_file, real_root = os.path.realpath(file_path), os.path.realpath(str(root))
+            relative = os.path.relpath(real_file, real_root)
+            if relative.split(os.sep)[0] == "..":
+                # /Users/X/Issue-Worker-Bots/iwb is the checkout too when only the case differs.
+                folded = os.path.relpath(fold(real_file), fold(real_root))
+                if folded.split(os.sep)[0] != "..":
+                    relative = folded
         except ValueError:
             return None
     else:
@@ -508,7 +646,8 @@ def edited_test_target(file_path, root=ROOT):
     parts = PurePosixPath(relative).parts
     if not parts or parts[0] in ("..", "/"):
         return None
-    if parts == ("iwb",) or (parts[0] == "tests" and len(parts) > 1):
+    names = tuple(fold(part) for part in parts)
+    if names == ("iwb",) or (names[0] == "tests" and len(names) > 1):
         return relative
     return None
 
