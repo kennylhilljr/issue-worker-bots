@@ -4389,6 +4389,79 @@ class Queue(unittest.TestCase):
         self.assertEqual(self.drain()[0], 0)
         self.assertEqual(sorted(json.loads(f.read_text())["number"] for f in self.cq.iterdir()), [7, 8])
 
+    def pending_then_event(self, folder, content=None, raw=None, name="20261103T141500123Z-x-kennylhilljr__demo-issue-7-comment.json"):
+        """Put a file in `folder`, then queue a comment on #7 (ready to code) and drain. Returns (whether a new
+        hand-off was written for it, the drain's output)."""
+        folder.mkdir(exist_ok=True)
+        (folder / name).write_text(raw if raw is not None else json.dumps(content))
+        ev = self.event(7, "comment")
+        code, out = self.drain()
+        self.assertEqual(code, 0)
+        return (self.cq / ev.name).exists(), out
+
+    def clear_code_queues(self):
+        for d in (self.cq, self.cdeferred):
+            if d.is_symlink():
+                d.unlink()
+            elif d.is_dir():
+                for f in d.iterdir():
+                    f.unlink()
+
+    def test_a_pending_hand_off_stops_a_duplicate(self):
+        # regression: sweeps and queued events wrote a new hand-off each time; issues built up six in the deferred
+        # folder within four minutes
+        iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
+        self.save({7: self.approved(7)})
+        pending = {"repo": self.REPO, "number": 7, "kind": "issue", "event": "comment", "stage": "code", "version": 1}
+        for folder in (self.cq, self.cdeferred):
+            with self.subTest(folder=folder.name):
+                written, out = self.pending_then_event(folder, pending, name="arbitrary-name.json")
+                self.assertFalse(written)
+                self.assertEqual(len(self.left(self.cq)) + len(self.left(self.cdeferred)), 1)
+                self.assertIn(f"{self.REPO}#7: ready to code; hand-off already pending", out)
+                self.clear_code_queues()
+
+    def test_a_hand_off_is_written_when_the_pending_file_does_not_match(self):
+        # a wrong match would suppress a hand-off the issue needs
+        iwb.CONFIG.write_text(json.dumps({"coding_live": True}))
+        self.save({7: self.approved(7)})
+        good = {"repo": self.REPO, "number": 7, "kind": "issue", "event": "comment", "stage": "code", "version": 1}
+        cases = {
+            "another repo, misleading name": dict(good, repo="kennylhilljr/other"),
+            "another number": dict(good, number=8),
+            "not an issue event": dict(good, kind="pull_request"),
+            "not a coding hand-off": {k: v for k, v in good.items() if k != "stage"},
+            "an intake stage": dict(good, stage="intake"),
+            "a bool number": dict(good, number=True),
+        }
+        for why, content in cases.items():
+            for folder in (self.cq, self.cdeferred):
+                with self.subTest(why=why, folder=folder.name):
+                    self.assertTrue(self.pending_then_event(folder, content)[0])
+                    self.clear_code_queues()
+        with self.subTest(why="malformed JSON"):
+            self.assertTrue(self.pending_then_event(self.cdeferred, raw='{"repo": "kennylhilljr/demo", "number": 7,')[0])
+            self.clear_code_queues()
+        outside = Path(self.tmp.name, "outside")
+        outside.mkdir()
+        (outside / "h.json").write_text(json.dumps(good))
+        with self.subTest(why="a symlinked file"):
+            for folder in (self.cq, self.cdeferred):
+                folder.mkdir(exist_ok=True)
+                (folder / "link.json").symlink_to(outside / "h.json")
+            ev = self.event(7, "comment")
+            self.assertEqual(self.drain()[0], 0)
+            self.assertTrue((self.cq / ev.name).exists())
+            self.clear_code_queues()
+        with self.subTest(why="a symlinked folder"):
+            self.cdeferred.rmdir()
+            self.cdeferred.symlink_to(outside)
+            ev = self.event(7, "comment")
+            self.assertEqual(self.drain()[0], 0)
+            self.assertTrue((self.cq / ev.name).exists())
+            self.clear_code_queues()
+        self.assertEqual(self.left(outside), ["h.json"])              # never touched
+
     def test_a_sweep_never_changes_the_outcome_of_queued_events(self):
         self.event(1)
         self.sweep(None)

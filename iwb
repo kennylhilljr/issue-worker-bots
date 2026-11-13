@@ -3833,7 +3833,10 @@ def iwb_event(repo, number, event):
 
 
 def queued_hand_offs(code_q):
-    """The "owner/repo#n" keys that already have a hand-off waiting in the code queue or its deferred folder."""
+    """The "owner/repo#n" keys that already have a hand-off waiting in the code queue or its deferred folder, by
+    content, never by file name. Only a valid coding hand-off counts ("kind": "issue", "stage": "code", a repo
+    name and an int issue number >= 1, not a bool): a wrong match would suppress a hand-off the issue needs.
+    Symlinked folders and entries are never followed; unreadable or malformed files are skipped."""
     keys = set()
     for d in (code_q, sibling(code_q, "deferred")):
         if d.is_symlink() or not d.is_dir():
@@ -3843,8 +3846,11 @@ def queued_hand_offs(code_q):
                 ev = read_event(f) if is_event_file(f) else None
             except OSError:
                 continue
-            if ev and ev.get("number"):
-                keys.add(f"{ev['repo']}#{ev['number']}")
+            if not ev or ev.get("kind") != "issue" or ev.get("stage") != "code":
+                continue
+            repo, number = ev.get("repo"), ev.get("number")
+            if isinstance(repo, str) and REPO_NAME.fullmatch(repo) and type(number) is int and number >= 1:
+                keys.add(f"{repo}#{number}")
     return keys
 
 
@@ -3858,13 +3864,17 @@ def hand_off_ready(q, keys, handed):
     except OSError:
         queued = set()
     for key, (name, ev) in keys.items():
-        if key in OUTCOME or key in handed or key in queued:
+        if key in OUTCOME or key in handed:
             continue
         try:
             if not needs_coding(state.get(key)):
                 continue
         except PLAN_ERRORS as e:
             mark(key, "failed", f"could not read the plan file: {e!r}")
+            continue
+        if key in queued:
+            handed.add(key)
+            log(f"{key}: ready to code; hand-off already pending in the code queue or its deferred folder")
             continue
         try:
             target = hand_off_to_coding(sibling(q, "code"), name, ev)
