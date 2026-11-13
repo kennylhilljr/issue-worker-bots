@@ -316,6 +316,7 @@ class LiveCommands(unittest.TestCase):
         "./x#iwb tick", "./i[w]#b tick", "./i[w]b~x tick",
         # zsh braceccl: {w} and {v-x} are character classes
         "setopt braceccl; ./i{w}b tick", "./i{v-x}b* tick", "./i{w}? tick",
+        "./iw{[:lower:]} tick", "./i{[[:lower:]]}b tick", "./i{]w}b tick",
         # zsh = expansion looks iwb up in PATH, quoted empty prefixes included
         "''=iw{b..b} tick", '""=i[w]b tick', "=i?b tick",
         # with nullglob a glob that matches nothing disappears and the next word runs
