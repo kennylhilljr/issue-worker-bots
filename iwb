@@ -1825,7 +1825,7 @@ def scan_repo(repo, *, manual=False, force=False, dry_run=False):
     if conf.get("paused"):
         log(f"scan {repo}: paused in config.json; no scan")
         return 0
-    lock = try_lock(lock_file("scan", repo))
+    lock = try_lock(lock_file("scan", repo.lower()))   # GitHub names ignore case: O/R and o/r are one repository
     if lock is None:
         log(f"scan {repo}: another scan of it is running; no scan")
         return 0

@@ -2062,6 +2062,17 @@ class Scan(ScanFixture):
         self.assertEqual(len(self.cmds), 1)
         self.assertTrue(any(w[1][2][:2] == ["issue", "create"] for w in self.writes if w[0] == "run_gh_as"))
 
+    def test_scan_lock_ignores_case(self):
+        held = iwb.try_lock(iwb.lock_file("scan", self.REPO.lower()))
+        try:
+            with redirect_stdout(io.StringIO()) as out:
+                code = iwb.scan_repo(self.REPO.upper(), manual=True)
+        finally:
+            held.close()
+        self.assertEqual(code, 0)
+        self.assertIn("another scan of it is running", out.getvalue())
+        self.assertEqual(self.cmds, [])
+
     def test_scan_lock_is_per_repository(self):
         held = iwb.try_lock(iwb.lock_file("scan", "o/other"))
         try:
