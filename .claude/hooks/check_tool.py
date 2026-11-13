@@ -24,10 +24,13 @@ SEPARATORS = ("&&", "||", ";;", "|&", ";", "&", "|", "(", ")", "`", "\n")
 OPERATORS = sorted(REDIRECTIONS + SEPARATORS, key=len, reverse=True)
 
 WRAPPERS = ("env", "sudo", "nohup", "time", "command", "exec", "nice", "caffeinate", "xargs",
-            "timeout", "gtimeout")
+            "timeout", "gtimeout", "watch", "arch")
+# Shell keywords that can start a simple command once ; and newlines have split it.
+RESERVED_WORDS = ("{", "}", "!", "if", "then", "elif", "else", "fi", "do", "done", "while", "until",
+                  "case", "esac", "coproc", "[[", "]]")
 # Wrapper options that take the next word as their value (so it is not the program).
 WRAPPER_VALUE_OPTIONS = {
-    "env": ("-u", "-C", "-P", "-S"),
+    "env": ("-u", "-C", "-P"),
     "sudo": ("-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T"),
     "nice": ("-n",),
     "caffeinate": ("-t", "-w"),
@@ -35,10 +38,16 @@ WRAPPER_VALUE_OPTIONS = {
     "xargs": ("-I", "-J", "-L", "-n", "-P", "-s", "-E", "-d", "-a", "-R", "-S"),
     "timeout": ("-s", "-k", "--signal", "--kill-after"),
     "gtimeout": ("-s", "-k", "--signal", "--kill-after"),
+    "watch": ("-n", "--interval", "-q", "--equexit"),
+    "arch": ("-e",),
 }
-SHELLS = ("sh", "bash", "zsh", "dash")
+SHELLS = ("sh", "bash", "zsh", "dash", "ksh", "mksh", "fish")
 IWB_DRY_RUN_COMMANDS = ("intake", "analyze", "approve", "code")
-LAUNCHCTL_CHANGES = ("load", "unload", "bootstrap", "bootout", "kickstart", "enable")
+# launchctl subcommands that only read; every other one (load, bootout, kickstart, submit, ...) is blocked.
+LAUNCHCTL_READ_ONLY = ("list", "print", "print-cache", "print-disabled", "blame", "dumpstate",
+                       "managerpid", "manageruid", "managername", "error", "variant", "version",
+                       "help", "getenv", "hostinfo")
+IWB_SUBCOMMANDS = ("tick", "intake", "analyze", "approve", "code")
 EXPANSION_CHARS = "$`{*?["
 
 IWB_MESSAGE = ("Blocked: iwb {sub} runs the live pipeline from this checkout (launchd owns it). "
@@ -51,8 +60,11 @@ IWB_XARGS_MESSAGE = ("Blocked: iwb run through xargs takes its arguments from st
                      "cannot be checked; iwb runs the live pipeline from this checkout.")
 INSTALL_MESSAGE = ("Blocked: install-intake.sh installs the live launchd job; "
                    "do not run it from an agent session.")
-LAUNCHCTL_MESSAGE = ("Blocked: launchctl {sub} changes launchd jobs; "
-                     "only launchctl list and print are allowed from an agent session.")
+LAUNCHCTL_MESSAGE = ("Blocked: launchctl {sub} can change launchd jobs; "
+                     "only read-only launchctl subcommands such as list and print are allowed.")
+SHELL_STDIN_MESSAGE = ("Blocked: a shell reading its commands from stdin or a file descriptor "
+                       "cannot be checked (iwb, install-intake.sh, launchctl rules); "
+                       "pass the command with -c instead.")
 PARSE_MESSAGE = "Blocked: this command could not be parsed ({reason}), so it is not allowed."
 
 
@@ -225,63 +237,43 @@ def _shell_command_string(args):
     return has_c, index
 
 
-def check_simple(words, bodies, terminator, depth):
-    """Return a block message for one simple command, or None."""
-    index, wrapper, via_xargs = 0, None, False
-    while index < len(words):
-        word = words[index]
-        base = _basename(word)
-        if _is_assignment(word):
+def _python_operand(args):
+    """Index of the script argument for python args, or None for -c/-m/stdin."""
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            return index + 1 if index + 1 < len(args) else None
+        if arg.startswith("--"):
             index += 1
-        elif base in WRAPPERS:
-            wrapper = base
-            via_xargs = via_xargs or base == "xargs"
-            index += 1
-            if base in ("timeout", "gtimeout"):
-                while index < len(words) and words[index].startswith("-"):
-                    index += 2 if words[index] in WRAPPER_VALUE_OPTIONS[base] else 1
-                index += 1  # the duration
-        elif word.startswith("-") and len(word) > 1:
-            index += 2 if word in WRAPPER_VALUE_OPTIONS.get(wrapper, ()) else 1
-        else:
-            break
-    words, bodies = words[index:], bodies[index:]
-    if not words:
+            continue
+        if arg.startswith("-") and len(arg) > 1:
+            takes_value = False
+            for position, flag in enumerate(arg[1:], start=1):
+                if flag in "cm":
+                    return None     # inline code or a module, not a script path
+                if flag in "WX":
+                    takes_value = position == len(arg) - 1
+                    break
+            index += 2 if takes_value else 1
+            continue
+        return index
+    return None
+
+
+def _check_program(program_word, program_body, args, arg_bodies, via_xargs, terminator, depth):
+    """Apply the iwb, install-intake.sh, launchctl and launcher rules to one program."""
+    program = _basename(program_word)
+    if program == "find":
+        for index, arg in enumerate(args):
+            if arg in ("-exec", "-execdir", "-ok", "-okdir"):
+                stop = index + 1
+                while stop < len(args) and args[stop] not in (";", "+"):
+                    stop += 1
+                message = check_simple(args[index + 1:stop], arg_bodies[index + 1:stop], "", depth + 1)
+                if message:
+                    return message
         return None
-    program, args, arg_bodies = _basename(words[0]), words[1:], bodies[1:]
-
-    if program in SHELLS:
-        has_c, operand = _shell_command_string(args)
-        if has_c:
-            if operand >= len(args):
-                return None
-            return check_command(args[operand], depth + 1)
-        if operand >= len(args):
-            return None
-        program, args, arg_bodies = _basename(args[operand]), args[operand + 1:], arg_bodies[operand + 1:]
-    elif program == "eval":
-        return check_command(" ".join(args), depth + 1)
-    elif _is_python(program):
-        operand = 0
-        while operand < len(args):
-            arg = args[operand]
-            if arg in ("-c", "-m") or (arg.startswith("-") and not arg.startswith("--")
-                                       and ("c" in arg[1:] or "m" in arg[1:])):
-                return None     # inline code or a module, not a script path
-            if arg in ("-W", "-X"):
-                operand += 2
-            elif arg.startswith("-") and len(arg) > 1:
-                operand += 1
-            else:
-                break
-        if operand >= len(args):
-            return None
-        program, args, arg_bodies = _basename(args[operand]), args[operand + 1:], arg_bodies[operand + 1:]
-    elif program in (".", "source"):
-        if not args:
-            return None
-        program, args, arg_bodies = _basename(args[0]), args[1:], arg_bodies[1:]
-
     if program == "iwb":
         if via_xargs:
             return IWB_XARGS_MESSAGE
@@ -297,15 +289,89 @@ def check_simple(words, bodies, terminator, depth):
                 return None
             return IWB_MESSAGE.format(sub=sub)
         return None
+    if any(ch in program_body for ch in EXPANSION_CHARS) and \
+            any(arg in IWB_SUBCOMMANDS for arg in args):
+        return IWB_DYNAMIC_MESSAGE   # $cmd tick, ./i*b tick: the program may be iwb
     if program == "install-intake.sh":
         return INSTALL_MESSAGE
     if program == "launchctl":
         subcommands = [arg for arg in args if not arg.startswith("-")]
-        if subcommands and subcommands[0] in LAUNCHCTL_CHANGES:
+        if subcommands and subcommands[0] not in LAUNCHCTL_READ_ONLY:
             return LAUNCHCTL_MESSAGE.format(sub=subcommands[0])
         if via_xargs and not subcommands:
             return LAUNCHCTL_MESSAGE.format(sub="run through xargs")
     return None
+
+
+def check_simple(words, bodies, terminator, depth):
+    """Return a block message for one simple command, or None."""
+    if depth > MAX_DEPTH:
+        return PARSE_MESSAGE.format(reason="commands nested too deeply")
+    index, wrapper, via_xargs = 0, None, False
+    while index < len(words):
+        word = words[index]
+        base = _basename(word)
+        if word in RESERVED_WORDS:
+            index += 1
+        elif word == "function":
+            index += 2      # function NAME { ... }
+        elif _is_assignment(word):
+            index += 1
+        elif base in WRAPPERS:
+            wrapper = base
+            via_xargs = via_xargs or base == "xargs"
+            index += 1
+            if base in ("timeout", "gtimeout"):
+                while index < len(words) and words[index].startswith("-"):
+                    index += 2 if words[index] in WRAPPER_VALUE_OPTIONS[base] else 1
+                index += 1  # the duration
+            elif base == "watch":
+                while index < len(words) and words[index].startswith("-"):
+                    index += 2 if words[index] in WRAPPER_VALUE_OPTIONS[base] else 1
+                return check_command(" ".join(words[index:]), depth + 1)  # watch runs sh -c
+        elif wrapper == "env" and (word.startswith("-S") or word.startswith("--split-string")):
+            # env -S runs its value as a command line, followed by the remaining words.
+            if word in ("-S", "--split-string"):
+                rest = words[index + 1:]
+            else:
+                rest = [word.split("=", 1)[1] if word.startswith("--") else word[2:]] + words[index + 1:]
+            return check_command(" ".join(rest), depth + 1)
+        elif word.startswith("-") and len(word) > 1:
+            index += 2 if word in WRAPPER_VALUE_OPTIONS.get(wrapper, ()) else 1
+        else:
+            break
+    words, bodies = words[index:], bodies[index:]
+    if not words:
+        return None
+    program, program_body = _basename(words[0]), bodies[0]
+    args, arg_bodies = words[1:], bodies[1:]
+
+    if program in SHELLS:
+        has_c, operand = _shell_command_string(args)
+        if has_c:
+            if operand >= len(args):
+                return None
+            return check_command(args[operand], depth + 1)
+        if operand >= len(args):
+            return SHELL_STDIN_MESSAGE
+        program_word, program_body = args[operand], arg_bodies[operand]
+        args, arg_bodies = args[operand + 1:], arg_bodies[operand + 1:]
+    elif program == "eval":
+        return check_command(" ".join(args), depth + 1)
+    elif _is_python(program):
+        operand = _python_operand(args)
+        if operand is None:
+            return None
+        program_word, program_body = args[operand], arg_bodies[operand]
+        args, arg_bodies = args[operand + 1:], arg_bodies[operand + 1:]
+    elif program in (".", "source"):
+        if not args:
+            return SHELL_STDIN_MESSAGE
+        program_word, program_body = args[0], arg_bodies[0]
+        args, arg_bodies = args[1:], arg_bodies[1:]
+    else:
+        program_word = words[0]
+    return _check_program(program_word, program_body, args, arg_bodies, via_xargs, terminator, depth)
 
 
 def check_command(command, depth=0):

@@ -218,7 +218,17 @@ class LiveCommands(unittest.TestCase):
         "nice -n 10 ./iwb tick", "sudo -u root ./iwb tick", "gtimeout 600 ./iwb tick",
         "echo tick | xargs ./iwb", "bash -lc './iwb tick'", ". ./install-intake.sh",
         "python3 -W ignore ./iwb tick",
-        "bash -c \"bash -c 'bash -c \\\"bash -c ls\\\"'\"",
+        "bash -c \"bash -c 'bash -c \\\"bash -c ls\\\"'\"",        "{ ./iwb tick; }", "! ./iwb tick", "if true; then ./iwb tick; fi",
+        "for i in 1; do ./iwb tick; done", "while true; do ./iwb tick; done",
+        "f() { ./iwb tick; }", "function f { ./iwb tick; }",
+        "env -S './iwb tick'", "env -S'./iwb tick'",
+        "cmd=./iwb; $cmd tick", "./iw? tick", "./i*b tick",
+        "echo './iwb tick' | bash", "bash <<< './iwb tick'", "source <(echo ./iwb tick)",
+        "find . -exec ./iwb tick \\;", "watch ./iwb tick", "watch -n 5 './iwb tick'",
+        "arch -arm64 ./iwb tick", "ksh -c './iwb tick'",
+        "launchctl asuser 501 launchctl load x", "launchctl submit -l x -- ./iwb tick",
+        "launchctl remove x", "launchctl start x", "launchctl stop x",
+        "python3 -Wignore::DeprecationWarning iwb tick", "python3 -W ignore iwb tick",
     )
 
     ALLOWED = (
@@ -244,7 +254,10 @@ class LiveCommands(unittest.TestCase):
         "python3 -m unittest discover -s tests", "python3 -B -m unittest tests.test_iwb",
         "git diff iwb", "git log -- iwb", "sed -n 1,40p iwb",
         # reading is fine
-        "cat install-intake.sh", "launchctl list", "launchctl print gui/501/x", "ls launchd/",
+        "cat install-intake.sh", "launchctl list", "launchctl print gui/501/x", "ls launchd/",        # stricter rules leave ordinary commands alone
+        "find . -name '*.py' -exec grep -l iwb {} +", "launchctl help",
+        "python3 -Wignore::DeprecationWarning -m unittest discover -s tests",
+        "if true; then echo ok; fi", "env FOO=1 git status", "for f in tests/*.py; do wc -l $f; done",
     )
 
     def setUp(self):
