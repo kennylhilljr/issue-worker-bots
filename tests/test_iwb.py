@@ -885,6 +885,7 @@ class Analyze(unittest.TestCase):
         self.assertEqual(len(self.prompts), 4)
         self.assertNotIn("blocked", self.state())
         self.assertNotIn("blocked_label", self.state())
+        self.assertEqual(self.state()["review_revisions"], 1)   # the reviewer's one send-back stays spent
         self.assertIn("no_change is not allowed here", self.full_prompts[-1])
         self.assertNotIn("bot:no-code", [label for _, label, _ in self.posts])
         self.answers = [answer({"decision": "plan", "summary": "v2", "units": [unit()]})]

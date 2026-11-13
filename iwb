@@ -981,13 +981,15 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
         if entry.get("blocked"):
             if entry.get("blocked_label", "bot:blocked") in issue["labels"]:
                 continue
-            entry.pop("blocked")          # the owner removed bot:blocked: try again from scratch
-            entry.pop("blocked_label", None)
+            entry.pop("blocked")
             entry["attempts"] = 0
-            entry.pop("analysis", None)
-            entry.pop("work", None)
-            for k in ("revisions", "lint_revisions", "review_revisions"):
-                entry.pop(k, None)
+            if entry.pop("blocked_label", None):
+                entry["replan"] = True    # Kenny removed bot:needs-kenny: analyze again; budgets and plan are kept
+            else:                         # the owner removed bot:blocked: try again from scratch
+                entry.pop("analysis", None)
+                entry.pop("work", None)
+                for k in ("revisions", "lint_revisions", "review_revisions"):
+                    entry.pop(k, None)
         digest = issue_digest(issue)
         a = entry.get("analysis")
         replan_at = None                      # a replan command is acknowledged only once its analysis posts
