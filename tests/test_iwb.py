@@ -1730,7 +1730,7 @@ class ScanRules(unittest.TestCase):
         self.assertEqual([x["title"] for x in iwb.filter_findings([f(float("nan"), "a"), f(90, "a")])], ["a90"])
 
 
-class Scan(unittest.TestCase):
+class ScanFixture(unittest.TestCase):
     """scan_repo with clone and run_cli faked: the read-only boundary, the state record and no GitHub writes."""
     REPO = "o/r"
     GOOD = ScanRules.GOOD
@@ -1740,7 +1740,10 @@ class Scan(unittest.TestCase):
         self.saved = {k: getattr(iwb, k) for k in ("STATE", "CONFIG", "clone", "run_cli", "run_gh_as", "post")}
         self.saved_attention = iwb.prbot.openclaw_attention
         self.saved_gh_read = iwb.prbot.gh_read
+        self.saved_load_config = iwb.prbot.load_config
         iwb.prbot.gh_read = lambda args: ""      # no issue carries a marker yet; ScanFiling covers the reads
+        iwb.prbot.load_config = lambda: {"claude-dev": {"owner": OWNER, "slug": "claude-dev-gh"},
+                                         "codex-dev": {"owner": OWNER, "slug": "codex-dev-gh"}}
         iwb.STATE = Path(self.tmp.name, "state.json")
         iwb.CONFIG = Path(self.tmp.name, "config.json")
         iwb.CONFIG.write_text(json.dumps({"scan_repos": [self.REPO]}))
@@ -1771,6 +1774,7 @@ class Scan(unittest.TestCase):
             setattr(iwb, k, v)
         iwb.prbot.openclaw_attention = self.saved_attention
         iwb.prbot.gh_read = self.saved_gh_read
+        iwb.prbot.load_config = self.saved_load_config
         self.tmp.cleanup()
 
     def good(self, *findings):
@@ -1790,6 +1794,10 @@ class Scan(unittest.TestCase):
 
     def left(self):
         return [d for d in self.clones if os.path.exists(d)]
+
+
+class Scan(ScanFixture):
+    """scan_repo: the read-only boundary, the state record and what reaches GitHub."""
 
     def test_readonly_argv(self):
         self.scan(force=True)
@@ -1968,7 +1976,7 @@ class Scan(unittest.TestCase):
         self.assertEqual(self.left(), [])
 
 
-class ScanFiling(Scan):
+class ScanFilingFixture(ScanFixture):
     """Filing kept findings: marker dedup through gh_json with paginated gh output, bot:proposed and intake."""
     FP = ScanRules.GOOD["fingerprint"]
     MARKER = "<!-- iwb-scan:" + ScanRules.GOOD["fingerprint"] + " -->"
@@ -1978,22 +1986,28 @@ class ScanFiling(Scan):
         self.issues = {}          # repo -> [{"number", "body", "pull_request"?}], what the fake GitHub holds
         self.reads, self.search_error, self.list_error = [], False, False
         self.search_hits = None   # None: search answers from self.issues like GitHub would
+        self.meta_hits = None     # the proposal search's answer, when a test sets it
         iwb.prbot.gh_read = self.fake_gh_read
 
         def fake_gh_as(bot, repo, args, permissions=None):
             self.writes.append(("run_gh_as", (bot, repo, args)))
             if args[:2] == ["issue", "create"]:
                 items = self.issues.setdefault(repo, [])
-                items.append({"number": len(items) + 1, "body": args[args.index("--body") + 1]})
+                items.append({"number": len(items) + 1, "body": args[args.index("--body") + 1],
+                              "labels": [args[args.index("--label") + 1]]})
                 return f"https://github.com/{repo}/issues/{len(items)}"
+            if args[:2] == ["issue", "edit"] and "--body" in args:
+                n = int(args[2])
+                next(i for i in self.issues[repo] if i["number"] == n)["body"] = args[args.index("--body") + 1]
             return ""
         iwb.run_gh_as = fake_gh_as
 
     @staticmethod
     def project(items):
         """What `gh api --jq FILED_JQ` prints: one compact JSON value per line."""
-        return "".join(json.dumps({"number": i["number"], "body": i["body"], "pr": "pull_request" in i}) + "\n"
-                       for i in items)
+        return "".join(json.dumps({"number": i["number"], "body": i["body"], "state": i.get("state", "open"),
+                                   "user": i.get("user", "claude-dev-gh[bot]"), "labels": i.get("labels", []),
+                                   "pr": "pull_request" in i}) + "\n" for i in items)
 
     def fake_gh_read(self, args):
         self.reads.append(args)
@@ -2004,6 +2018,10 @@ class ScanFiling(Scan):
             q = next(a for a in args if a.startswith("q="))
             repo = q.split()[0][len("q=repo:"):]
             self.assertIn("is:issue", q)
+            if self.meta_hits is not None and "iwb-scan-meta" in q:
+                self.assertIn("is:open", q)
+                self.assertIn("label:bot:proposed", q)
+                return self.project(self.meta_hits)
             if self.search_hits is not None:
                 return self.project(self.search_hits)
             key = q.split('"')[1]
@@ -2026,6 +2044,10 @@ class ScanFiling(Scan):
     def filler(self, n):
         return [{"number": i, "body": f"issue {i} <!-- iwb-scan:other:{i} -->"} for i in range(1, n + 1)]
 
+
+class ScanFiling(ScanFilingFixture):
+    """Filing kept findings: marker dedup, bot:proposed and intake."""
+
     def test_files_one_issue_per_finding_with_marker_and_label(self):
         second = dict(self.GOOD, confidence=95, fingerprint="dead-code:a.py:helper", title="Remove helper")
         self.answers = [self.good(self.GOOD, second)]
@@ -2037,7 +2059,8 @@ class ScanFiling(Scan):
             self.assertEqual((bot, repo), ("claude-dev", self.REPO))
             self.assertEqual(args[args.index("--label") + 1], "bot:proposed")
         body = made[1][2][made[1][2].index("--body") + 1]
-        self.assertTrue(body.rstrip().endswith(self.MARKER))
+        self.assertIn(self.MARKER + "\n\n<!-- iwb-scan-meta: ", body)
+        self.assertTrue(body.rstrip().endswith(" -->"))
         for part in ("README.md:3", "**Why:** w", "**Suggested change:** c", "**Acceptance:** a"):
             self.assertIn(part, body)
         labels = [w[1][2] for w in self.writes if w[1][2][:2] == ["label", "create"]]
@@ -2136,8 +2159,9 @@ class ScanFiling(Scan):
         self.scan(force=True)
         body = self.created()[0][2][self.created()[0][2].index("--body") + 1]
         self.assertNotIn("<!-- iwb-scan:dead-code:a.py:helper -->", body)
-        self.assertEqual(body.count("<!--"), 1)
-        self.assertEqual(body.count("-->"), 1)
+        self.assertEqual(body.count("<!--"), 2)                  # its marker and its meta block
+        self.assertEqual(body.count("-->"), 2)
+        self.assertEqual(len(iwb.MARKER_RE.findall(body)), 1)
 
     def test_intake_pass_leaves_proposals_alone(self):
         bot = "claude-dev-gh[bot]"
@@ -2170,6 +2194,179 @@ class ScanFiling(Scan):
         self.assertFalse(iwb.qualifies(self.REPO, issue(5, user=bot, labels=("bot:proposed", "bot:work")),
                                        owner, {bot})[0])
         self.assertTrue(iwb.qualifies(self.REPO, issue(7, user=owner), owner, {bot})[0])   # Kenny's own issues
+
+
+class ScanGrouping(ScanFilingFixture):
+    """Combining compatible findings into one checklist issue, splitting big groups, and appending new findings to
+    open proposals."""
+
+    def f(self, slug, area="README.md", cause=None, category="stale-docs", group=None, conf=90):
+        d = dict(self.GOOD, title="fix " + slug, area=area, root_cause=cause, category=category, confidence=conf,
+                 fingerprint=f"{category}:{area}:{slug}")
+        if group is not None:
+            d["group"] = group
+        return d
+
+    def proposal(self, number, members, labels=("bot:proposed",), state="open", user="claude-dev-gh[bot]"):
+        return {"number": number, "body": iwb.group_body(members) if len(members) > 1 else
+                iwb.finding_body(members[0]), "labels": list(labels), "state": state, "user": user}
+
+    def run_with(self, *findings, **kw):
+        self.answers = [self.good(*findings)]
+        return self.scan(force=True, **kw)
+
+    def bodies(self):
+        return [m[2][m[2].index("--body") + 1] for m in self.created()]
+
+    def edits(self):
+        return [w[1][2] for w in self.writes if w[1][2][:2] == ["issue", "edit"]]
+
+    def keys(self, body):
+        return sorted(iwb.MARKER_RE.findall(body))
+
+    def test_similar_combined_dissimilar_separate(self):
+        a, b = self.f("a", group="readme"), self.f("b", group="readme", conf=85)
+        c = self.f("c", area="iwb", category="dead-code", group="readme")
+        d = self.f("d", area="DESIGN.md")
+        code, _ = self.run_with(a, b, c, d)
+        self.assertEqual(code, 0)
+        bodies = self.bodies()
+        self.assertEqual(len(bodies), 3)
+        combined = next(x for x in bodies if len(iwb.MARKER_RE.findall(x)) == 2)
+        self.assertEqual(self.keys(combined), [a["fingerprint"], b["fingerprint"]])
+        for f in (a, b):   # each member's marker sits on its own checklist line
+            line = next(l for l in combined.splitlines() if iwb.scan_marker(f["fingerprint"]) in l)
+            self.assertTrue(line.startswith("- [ ] "), line)
+        title = self.created()[[self.bodies().index(x) for x in bodies if x is combined][0]][2]
+        self.assertIn("2 findings in README.md", title[title.index("--title") + 1])
+        meta = json.loads(iwb.META_RE.search(combined).group(1))
+        self.assertEqual((meta["category"], meta["area"], meta["root_cause"]), ("stale-docs", "README.md", None))
+        for single in (x for x in bodies if x is not combined):
+            self.assertEqual(len(iwb.MARKER_RE.findall(single)), 1)
+            self.assertIsNotNone(iwb.META_RE.search(single))
+
+    def test_largest_valid_subset_kept(self):
+        xr, yr = self.f("xr", area="X", cause="R", group="g"), self.f("yr", area="Y", cause="R", group="g")
+        zr = self.f("zr", area="Z", cause="R", group="g")
+        xs = self.f("xs", area="X", cause="S", group="g")       # compatible with xr only
+        groups = iwb.group_findings([xr, yr, zr, xs])
+        self.assertEqual(sorted(sorted(f["fingerprint"] for f in g) for g in groups),
+                         sorted([[xs["fingerprint"]], sorted(f["fingerprint"] for f in (xr, yr, zr))]))
+        for g in groups:
+            self.assertTrue(all(iwb.compatible(p, q) for p in g for q in g))
+        self.assertEqual(iwb.group_findings([self.f("n1", cause=None, area="A", group="g"),
+                                             self.f("n2", cause=None, area="B", group="g")]),
+                         [[self.f("n1", cause=None, area="A", group="g")],
+                          [self.f("n2", cause=None, area="B", group="g")]])   # null causes never match
+
+    def test_group_of_nine_or_more_is_split(self):
+        for n in (9, 12, 20):
+            with self.subTest(n=n):
+                fs = [self.f(f"s{i}", area=f"file{i % 3}.py", cause="no timeout", group="timeouts",
+                             conf=99 - i) for i in range(n)]
+                groups = iwb.group_findings(fs)
+                self.assertTrue(all(len(g) <= iwb.GROUP_MAX for g in groups), [len(g) for g in groups])
+                self.assertEqual(sorted(f["fingerprint"] for g in groups for f in g),
+                                 sorted(f["fingerprint"] for f in fs))
+                self.assertGreater(len(groups), 1)
+                for g in groups:
+                    self.assertTrue(all(iwb.compatible(p, q) for p in g for q in g))
+                    areas = [f["area"] for f in g]
+                    self.assertTrue(all(areas.count(x) == sum(f["area"] == x for f in fs) or len(g) == 8
+                                        for x in set(areas)))   # an area stays whole unless it fills a group
+        same_area = [self.f(f"t{i}", group="g") for i in range(9)]
+        self.assertEqual(sorted(len(g) for g in iwb.group_findings(same_area)), [1, 8])
+
+    def test_non_transitive_set_does_not_append(self):
+        xr, yr = self.f("xr", area="X", cause="R"), self.f("yr", area="Y", cause="R")
+        self.issues[self.REPO] = [self.proposal(1, [xr, yr])]
+        new = self.f("xs", area="X", cause="S")
+        self.run_with(new)
+        self.assertEqual(self.edits(), [])
+        self.assertEqual(len(self.created()), 1)
+        self.assertEqual(self.keys(self.bodies()[0]), [new["fingerprint"]])
+
+    def test_append_to_proposal(self):
+        xr, yr = self.f("xr", area="X", cause="R"), self.f("yr", area="Y", cause="R")
+        self.issues[self.REPO] = [self.proposal(1, [xr, yr])]
+        new = self.f("zr", area="Z", cause="R")
+        code, out = self.run_with(new)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.created(), [])
+        (edit,) = self.edits()
+        self.assertEqual(edit[2], "1")
+        body = edit[edit.index("--body") + 1]
+        self.assertEqual(self.keys(body), sorted(f["fingerprint"] for f in (xr, yr, new)))
+        self.assertEqual(len(iwb.read_members(body)), 3)
+        self.assertEqual(iwb.META_RE.findall(body).__len__(), 1)
+        self.assertIn("added", out)
+        self.issues[self.REPO][0]["body"] = body              # the next scan finds it filed, adds nothing
+        self.writes = []
+        self.run_with(new)
+        self.assertEqual(self.writes, [])
+
+    def test_single_finding_proposal_takes_an_append(self):
+        self.issues[self.REPO] = [self.proposal(4, [self.f("a")])]
+        self.run_with(self.f("b"))
+        (edit,) = self.edits()
+        self.assertEqual(len(iwb.read_members(edit[edit.index("--body") + 1])), 2)
+
+    def test_no_append_to_bot_work_or_others(self):
+        old = self.f("a")
+        cases = {"bot:work": self.proposal(1, [old], labels=("bot:proposed", "bot:work")),
+                 "not proposed": self.proposal(1, [old], labels=()),
+                 "closed": self.proposal(1, [old], state="closed"),
+                 "not the scanner": self.proposal(1, [old], user=OWNER),
+                 "full": self.proposal(1, [self.f(f"m{i}") for i in range(iwb.GROUP_MAX)]),
+                 "no meta": {"number": 1, "body": "old\n" + iwb.scan_marker(old["fingerprint"]),
+                             "labels": ["bot:proposed"]}}
+        for name, existing in cases.items():
+            with self.subTest(name):
+                self.issues = {self.REPO: [existing]}
+                self.writes = []
+                self.run_with(self.f("b"))
+                self.assertEqual(self.edits(), [])
+                self.assertEqual(len(self.created()), 1)
+
+    def test_search_unrelated_fallback_has_target(self):
+        unrelated = self.proposal(1, [self.f("u", area="iwb", category="dead-code")])
+        target = self.proposal(2, [self.f("a")])
+        self.meta_hits = [unrelated]
+        self.issues[self.REPO] = [unrelated] + [dict(i, number=i["number"] + 2) for i in self.filler(150)] + [
+            dict(target, number=153)]
+        self.run_with(self.f("b"))
+        self.assertEqual([e[2] for e in self.edits()], ["153"])
+        self.assertEqual(self.created(), [])
+
+    def test_search_error_fallback_has_target(self):
+        self.search_error = True
+        self.issues[self.REPO] = [self.proposal(1, [self.f("a")])]
+        self.run_with(self.f("b"))
+        self.assertEqual([e[2] for e in self.edits()], ["1"])
+
+    def test_closed_combined_issue_blocks_each_member(self):
+        a, b = self.f("a"), self.f("b")
+        self.issues[self.REPO] = [self.proposal(1, [a, b], state="closed")]
+        for f in (a, b):
+            with self.subTest(f["fingerprint"]):
+                self.writes = []
+                self.run_with(dict(f, group="again"))
+                self.assertEqual(self.writes, [])
+        self.writes = []
+        self.run_with(a, b, self.f("c"))
+        self.assertEqual([self.keys(x) for x in self.bodies()], [[self.f("c")["fingerprint"]]])
+
+    def test_dry_run_append_posts_nothing(self):
+        self.issues[self.REPO] = [self.proposal(1, [self.f("a")])]
+        _, out = self.run_with(self.f("b"), dry_run=True)
+        self.assertEqual(self.writes, [])
+        self.assertIn("would add", out)
+
+    def test_meta_escapes_model_text(self):
+        f = self.f("a", cause="x --> <!-- iwb-scan:evil -->")
+        body = iwb.finding_body(f)
+        self.assertEqual(self.keys(body), [f["fingerprint"]])
+        self.assertEqual(iwb.read_members(body)[0]["root_cause"], f["root_cause"])
 
 
 class ScanWiring(unittest.TestCase):
@@ -2302,7 +2499,8 @@ class ScanDocs(unittest.TestCase):
                "one hour", "next_eligible_at", "iwb tick", "at most one", "--repo", "--force", "--dry-run",
                "JSON", "read-only", "Read Grep Glob", "MCP", "-s read-only", "at least 80", "fingerprint",
                "highest confidence", "bot:proposed", "<!-- iwb-scan:<fingerprint> -->", "open or closed",
-               "never filed blind", "bot:work")
+               "never filed blind", "bot:work", "iwb-scan-meta", "compatible", "at most 8", "split by area",
+               "checklist")
 
     def check(self, name):
         text = (ROOT / name).read_text()

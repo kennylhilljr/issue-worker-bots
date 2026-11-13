@@ -1743,6 +1743,9 @@ Each finding has these keys:
 - "confidence": a number from 0 to 100 for how sure you are that it is a real improvement.
 - "fingerprint": a short stable key, category:path:slug, for example stale-docs:README.md:install, that stays
   the same when the same finding is reported again.
+- "group" (optional): the same short name on findings that one change should fix together, for example five
+  stale sections of one README or the same missing timeout in three callers. Group only findings of the same
+  category that share an area or a root cause; leave it out otherwise.
 
 Answer with one JSON object in a ```json fenced block and nothing after it:
 {{"findings": [{{"title": "...", "category": "...", "area": "...", "root_cause": null, "evidence": "...",
@@ -1817,12 +1820,20 @@ def scan_repo(repo, *, manual=False, force=False, dry_run=False):
 
 
 PROPOSED = ("bot:proposed", "C5DEF5", "Proposed by iwb scan; add bot:work to have a worker build it")
-FILED_JQ = ".[] | {number, body, pr: (.pull_request != null)}"
+FILED_JQ = ".[] | {number, body, state, user: .user.login, labels: [.labels[].name], pr: (.pull_request != null)}"
+MARKER_RE = re.compile(r"<!-- iwb-scan:([A-Za-z0-9._:/-]*) -->")
+META_RE = re.compile(r"<!-- iwb-scan-meta: (\{.*?\}) -->")
+GROUP_MAX = 8              # findings per combined issue: a plan has at most 8 units
+
+
+def scan_key(fingerprint):
+    """The fingerprint as it appears in markers: characters that could end the HTML comment are replaced."""
+    return re.sub(r"[^A-Za-z0-9._:/-]", "-", fingerprint)
 
 
 def scan_marker(fingerprint):
-    """The hidden marker a filed finding carries. Characters that could end the HTML comment are replaced."""
-    return f"<!-- iwb-scan:{re.sub(r'[^A-Za-z0-9._:/-]', '-', fingerprint)} -->"
+    """The hidden marker a filed finding carries."""
+    return f"<!-- iwb-scan:{scan_key(fingerprint)} -->"
 
 
 def scan_text(text):
@@ -1831,77 +1842,272 @@ def scan_text(text):
     return TOKENISH.sub("[redacted]", str(text)).replace("<!--", "&lt;!--").replace("-->", "--&gt;")
 
 
+def compatible(a, b):
+    """Two findings (or members) may share an issue: the same category, and the same area or the same root cause."""
+    return a["category"] == b["category"] and (a["area"] == b["area"] or
+                                               a["root_cause"] is not None and a["root_cause"] == b["root_cause"])
+
+
+def scan_meta(members):
+    """The hidden block describing an issue's findings: the category, the area and root cause they all share
+    (else null), and each member's area and root cause by marker key. < and > are escaped inside the JSON."""
+    one = lambda k: members[0][k] if all(m[k] == members[0][k] for m in members) else None
+    meta = {"category": members[0]["category"], "area": one("area"), "root_cause": one("root_cause"),
+            "members": {scan_key(m["fingerprint"]): {"area": m["area"], "root_cause": m["root_cause"]}
+                        for m in members}}
+    return "<!-- iwb-scan-meta: " + json.dumps(meta).replace("<", "\\u003c").replace(">", "\\u003e") + " -->"
+
+
+def read_members(body):
+    """The members of an issue the scanner filed, from its meta block and its markers, or None if it has no
+    readable meta block or a marker the block does not describe."""
+    m = META_RE.search(body or "")
+    try:
+        meta = json.loads(m.group(1)) if m else None
+        keys = MARKER_RE.findall(body)
+        if not isinstance(meta, dict) or not isinstance(meta.get("category"), str) or not keys:
+            return None
+        found = meta.get("members") or {}
+        members = []
+        for k in keys:
+            d = found.get(k) or ({"area": meta["area"], "root_cause": meta["root_cause"]} if len(keys) == 1 else None)
+            if not isinstance(d, dict) or not isinstance(d.get("area"), str) \
+                    or not (d.get("root_cause") is None or isinstance(d["root_cause"], str)):
+                return None
+            members.append({"fingerprint": k, "category": meta["category"], "area": d["area"],
+                            "root_cause": d["root_cause"]})
+        return members
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def finding_item(f):
+    """One finding as a checklist item, its marker on the checklist line."""
+    cause = f" Root cause: {scan_text(f['root_cause'])}." if f.get("root_cause") else ""
+    return (f"- [ ] **{scan_text(f['title'])}** (confidence {f['confidence']}, `{scan_text(f['area'])}`) "
+            f"{scan_marker(f['fingerprint'])}\n  - **Evidence:** {scan_text(f['evidence'])}\n"
+            f"  - **Why:** {scan_text(f['why'])}{cause}\n  - **Suggested change:** {scan_text(f['change'])}\n"
+            f"  - **Acceptance:** {scan_text(f['acceptance'])}\n")
+
+
 def finding_body(f):
-    """The issue body for one finding: what, evidence, why, the suggested change and acceptance, then the marker."""
+    """The issue body for one finding: what, evidence, why, the suggested change and acceptance, the marker and
+    the meta block."""
     cause = f"\n\n**Root cause:** {scan_text(f['root_cause'])}" if f.get("root_cause") else ""
     return (f"Proposed by `iwb scan` (confidence {f['confidence']}). Add `bot:work` to have a worker bot build "
             f"it, or close the issue to keep it from being proposed again.\n\n"
             f"**Finding:** {scan_text(f['title'])}\n\n**Category:** `{scan_text(f['category'])}` in "
             f"`{scan_text(f['area'])}`{cause}\n\n**Evidence:** {scan_text(f['evidence'])}\n\n"
             f"**Why:** {scan_text(f['why'])}\n\n**Suggested change:** {scan_text(f['change'])}\n\n"
-            f"**Acceptance:** {scan_text(f['acceptance'])}\n\n{scan_marker(f['fingerprint'])}\n")
+            f"**Acceptance:** {scan_text(f['acceptance'])}\n\n{scan_marker(f['fingerprint'])}\n\n{scan_meta([f])}\n")
+
+
+def group_body(group):
+    """The issue body for a combined issue: a checklist with one item (and marker) per finding, then the meta."""
+    return (f"Proposed by `iwb scan`: {len(group)} related findings. Add `bot:work` to have a worker bot build them, "
+            f"or close the issue to keep all of them from being proposed again.\n\n"
+            + "".join(finding_item(f) for f in group) + f"\n{scan_meta(group)}\n")
+
+
+def group_title(group):
+    if len(group) == 1:
+        return short(scan_text(group[0]["title"]), 200)
+    a, c = group[0]["area"], group[0]["root_cause"]
+    where = f"in {a}" if all(f["area"] == a for f in group) else f"from one cause: {c}"
+    return short(scan_text(f"{group[0]['category']}: {len(group)} findings {where}"), 200)
+
+
+def with_items(body, group, members):
+    """`body` with `group` appended as checklist items and its meta block rewritten for `members`."""
+    m = META_RE.search(body)
+    head = body[:m.start()].rstrip("\n")
+    return f"{head}\n\n" + "".join(finding_item(f) for f in group) + f"\n{scan_meta(members)}\n" + body[m.end():]
+
+
+def split_group(group):
+    """A group of at most GROUP_MAX findings, or its parts split by area (whole areas packed together, highest
+    confidence first; an area with more than GROUP_MAX findings is cut into chunks). Any part of a valid group is
+    valid."""
+    if len(group) <= GROUP_MAX:
+        return [group]
+    by_area = {}
+    for f in group:
+        by_area.setdefault(f["area"], []).append(f)
+    parts = []
+    for fs in by_area.values():
+        for i in range(0, len(fs), GROUP_MAX):
+            chunk = fs[i:i + GROUP_MAX]
+            fit = next((p for p in parts if len(p) + len(chunk) <= GROUP_MAX), None)
+            if fit is None:
+                parts.append(list(chunk))
+            else:
+                fit.extend(chunk)
+    return [sorted(p, key=lambda f: f["confidence"], reverse=True) for p in parts]
+
+
+def group_findings(findings):
+    """Issues to file, each a list of findings (highest confidence first, issues ordered by their best finding).
+    Findings the model put in the same `group` are combined only as far as every pair is compatible: the largest
+    valid subset is kept, then the largest of the rest, and so on; whatever is left is filed on its own. Pairwise
+    compatibility means a valid group shares one area or one root cause, so the candidates are exactly those
+    buckets."""
+    proposed, units = {}, []
+    for f in findings:
+        g = f.get("group")
+        if isinstance(g, str) and g.strip():
+            proposed.setdefault(g.strip(), []).append(f)
+        else:
+            units.append([f])
+    for fs in proposed.values():
+        left = list(fs)
+        while left:
+            buckets = {}
+            for f in left:
+                buckets.setdefault(("area", f["category"], f["area"]), []).append(f)
+                if f["root_cause"] is not None:
+                    buckets.setdefault(("cause", f["category"], f["root_cause"]), []).append(f)
+            best = max(buckets.values(), key=lambda b: (len(b), sum(f["confidence"] for f in b)))
+            if len(best) < 2:
+                units.extend([f] for f in left)
+                break
+            units.extend(split_group(best))
+            left = [f for f in left if not any(f is b for b in best)]
+    units = [sorted(u, key=lambda f: f["confidence"], reverse=True) for u in units]
+    return sorted(units, key=lambda u: u[0]["confidence"], reverse=True)
 
 
 class FiledIssues:
-    """Which markers already appear in a repository's issues, open or closed (pull requests never count). Each
-    marker is searched for first; when search fails or finds no exact match, every issue is listed once per run
-    and checked. Neither working raises RuntimeError: a finding is never filed blind."""
+    """What a repository's issues hold, open or closed (pull requests never count): which markers they carry, and
+    which open proposals can take more findings. Search is tried first; when it fails or finds nothing usable,
+    every issue is listed once per run and checked. Neither working raises RuntimeError: a finding is never filed
+    blind."""
 
     def __init__(self, repo):
-        self.repo, self.listed = repo, None
+        self.repo, self.listed, self.scanners, self.created, self.changed = repo, None, None, set(), {}
 
-    def search(self, marker):
-        key = marker[len("<!-- iwb-scan:"):-len(" -->")]
-        hits = gh_json(["api", "-X", "GET", "search/issues", "-f",
-                        f'q=repo:{self.repo} is:issue in:body "iwb-scan:{key}"', "-f", "per_page=100",
-                        "--jq", ".items" + FILED_JQ[1:]])
-        return any(not h["pr"] and marker in (h["body"] or "") for h in hits)
+    def search(self, query):
+        return gh_json(["api", "-X", "GET", "search/issues", "-f", f"q=repo:{self.repo} is:issue {query}",
+                        "-f", "per_page=100", "--jq", ".items" + FILED_JQ[1:]])
 
     def listing(self):
         if self.listed is None:
-            issues = gh_json(["api", f"repos/{self.repo}/issues?state=all&per_page=100", "--paginate",
-                              "--jq", FILED_JQ])
-            self.listed = [i["body"] or "" for i in issues if not i["pr"]]
+            try:
+                issues = gh_json(["api", f"repos/{self.repo}/issues?state=all&per_page=100", "--paginate",
+                                  "--jq", FILED_JQ])
+            except (SystemExit, ValueError) as e:
+                raise RuntimeError(f"could not list the issues of {self.repo}: {short(e, 200)}")
+            self.listed = [i for i in issues if isinstance(i, dict) and not i.get("pr")]
         return self.listed
 
     def has(self, marker):
         try:
-            if self.search(marker):
+            if any(not h["pr"] and marker in (h["body"] or "") for h in self.search(f'in:body "{marker[5:-4]}"')):
                 return True
         except (SystemExit, ValueError, KeyError, TypeError) as e:
             log(f"scan {self.repo}: issue search failed ({short(e, 200)}); listing the issues instead")
         try:
-            return any(marker in body for body in self.listing())
-        except (SystemExit, ValueError, KeyError, TypeError) as e:
-            raise RuntimeError(f"could not list the issues of {self.repo}: {short(e, 200)}")
+            return any(marker in (i.get("body") or "") for i in self.listing())
+        except (KeyError, TypeError, AttributeError) as e:
+            raise RuntimeError(f"could not read the issues of {self.repo}: {short(e, 200)}")
 
-    def add(self, body):
-        if self.listed is not None:
-            self.listed.append(body)
+    def scanner_logins(self):
+        if self.scanners is None:
+            try:
+                cfg = prbot.load_config()
+                self.scanners = {cfg[b]["slug"] + "[bot]" for b in WORKERS.values() if b in cfg}
+            except (SystemExit, KeyError, TypeError) as e:
+                raise RuntimeError(f"could not read the worker bots' logins: {short(e, 200)}")
+        return self.scanners
+
+    def target(self, i, group):
+        """The members of `i` if new findings `group` may be appended to it, else None: an open issue the scanner
+        filed, labeled bot:proposed and not bot:work, with room left, whose every member is compatible with every
+        new finding."""
+        try:
+            if i.get("pr") or i.get("state") != "open":
+                return None
+            if i.get("number") in self.created or i.get("user") not in self.scanner_logins():
+                return None             # this run's own issues were grouped as the model proposed already
+            labels = i.get("labels") or []
+            if PROPOSED[0] not in labels or "bot:work" in labels:
+                return None
+            members = read_members(i.get("body"))
+        except (KeyError, TypeError, AttributeError):
+            return None
+        if not members or len(members) + len(group) > GROUP_MAX:
+            return None
+        if not all(compatible(m, f) for m in members for f in group):
+            return None
+        return members
+
+    def open_target(self, group):
+        """(issue, members) to append `group` to, or None. Search first; the listing when search fails or offers
+        no valid target."""
+        try:
+            hits = self.search(f'is:open label:{PROPOSED[0]} in:body "iwb-scan-meta"')
+        except (SystemExit, ValueError, KeyError, TypeError) as e:
+            log(f"scan {self.repo}: proposal search failed ({short(e, 200)}); listing the issues instead")
+            hits = []
+        for pool in (hits, None):
+            for i in (self.listing() if pool is None else pool):
+                if not isinstance(i, dict):
+                    continue
+                i = self.changed.get(i.get("number"), i)   # appended to this run: newer than search or listing
+                members = self.target(i, group)
+                if members:
+                    return i, members
+        return None
+
+    def add(self, issue):
+        """Record a proposal this run appended to, so later checks in the same run see its new members."""
+        self.changed[issue["number"]] = issue
 
 
 def file_findings(repo, bot, kept, *, dry_run=False):
-    """File each kept finding (highest confidence first, no cap) as an issue labeled bot:proposed, opened by `bot`,
-    unless an issue in `repo` already carries its marker. Returns False when a finding was skipped because the
-    marker could not be checked or the issue could not be opened; the others are still filed."""
-    filed, ok, labeled = FiledIssues(repo), True, False
+    """File kept findings not already filed in `repo`, opened by `bot` and labeled bot:proposed, with no cap:
+    findings the model grouped are combined as far as group_findings allows; a new group or finding that fits an
+    open proposal (FiledIssues.target) is appended to it as checklist items instead. Returns False when a finding
+    was skipped because its marker or the proposals could not be checked, or the issue could not be written; the
+    others are still filed."""
+    filed, ok, labeled, fresh = FiledIssues(repo), True, False, []
     for f in kept:
-        marker = scan_marker(f["fingerprint"])
         try:
-            if filed.has(marker):
+            if filed.has(scan_marker(f["fingerprint"])):
                 log(f"scan {repo}: already filed {short(f['fingerprint'])}")
                 continue
         except RuntimeError as e:
             log(f"scan {repo}: skipped {short(f['fingerprint'])} this run, will retry: {e}")
             ok = False
             continue
-        title, body = short(scan_text(f["title"]), 200), finding_body(f)
-        if dry_run:
-            log(f"scan {repo}: would file '{title}' with {PROPOSED[0]}")
-            print(body)
-            filed.add(body)
+        if any(scan_key(x["fingerprint"]) == scan_key(f["fingerprint"]) for x in fresh):
+            continue
+        fresh.append(f)
+    for group in group_findings(fresh):
+        names = ", ".join(short(f["fingerprint"]) for f in group)
+        try:
+            found = filed.open_target(group)
+        except RuntimeError as e:
+            log(f"scan {repo}: skipped {names} this run, will retry: {e}")
+            ok = False
             continue
         try:
+            if found:
+                issue, members = found
+                body = with_items(issue["body"], group, members + group)
+                if dry_run:
+                    log(f"scan {repo}: would add {names} to #{issue['number']}")
+                    print(body)
+                else:
+                    run_gh_as(bot, repo, ["issue", "edit", str(issue["number"]), "-R", repo, "--body", body])
+                    log(f"scan {repo}: added {names} to #{issue['number']}")
+                filed.add(dict(issue, body=body))
+                continue
+            title = group_title(group)
+            body = finding_body(group[0]) if len(group) == 1 else group_body(group)
+            if dry_run:
+                log(f"scan {repo}: would file '{title}' with {PROPOSED[0]}")
+                print(body)
+                continue
             if not labeled:   # its own label, not in LABELS, so post() never strips it from an issue
                 name, color, desc = PROPOSED
                 run_gh_as(bot, repo, ["label", "create", name, "-R", repo, "--color", color, "--description", desc,
@@ -1910,11 +2116,13 @@ def file_findings(repo, bot, kept, *, dry_run=False):
             url = run_gh_as(bot, repo, ["issue", "create", "-R", repo, "--title", title, "--body", body,
                                         "--label", PROPOSED[0]])
         except (RuntimeError, SystemExit, OSError) as e:   # prbot dies (SystemExit) when a token can't be had
-            log(f"scan {repo}: could not file {short(f['fingerprint'])}, will retry: {short(e, 300)}")
+            log(f"scan {repo}: could not file {names}, will retry: {short(e, 300)}")
             ok = False
             continue
-        filed.add(body)
-        log(f"scan {repo}: filed {short(f['fingerprint'])} {url}")
+        n = re.search(r"/issues/(\d+)", url or "")
+        if n:
+            filed.created.add(int(n.group(1)))
+        log(f"scan {repo}: filed {names} {url}")
     return ok
 
 
