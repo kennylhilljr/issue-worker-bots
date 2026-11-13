@@ -722,15 +722,23 @@ def _may_name_iwb(source):
     counts as may: a $ or ` expansion (its value may hold a slash or be split into words), a
     zsh = expansion (any =, since quotes before it vanish: ''=iwb), a tilde, bash extglob or
     zsh alternation, zsh extendedglob (^x, x~y, x#), or too many brace names. zsh braceccl
-    makes {wx} and {[:lower:]} character classes, so braces are also tried as brackets.
+    turns {wx} into one word per character, so each brace group is also tried as '?'.
     """
     if any(ch in source for ch in "=()|^~#") or _has_active_expansion(source):
         return True
-    patterns = _program_patterns(source)
-    classes = _program_patterns(source.replace("{", "[").replace("}", "]"))
-    if patterns is None or classes is None:
+    single = source
+    while True:
+        replaced = re.sub(r"\{[^{}]*\}", "?", single)
+        if replaced == single:
+            break
+        single = replaced
+    if "{" in single or "}" in single:
         return True
-    return any(fnmatchcase("iwb", pattern) for pattern in patterns + classes)
+    patterns = _program_patterns(source)
+    characters = _program_patterns(single)
+    if patterns is None or characters is None:
+        return True
+    return any(fnmatchcase("iwb", pattern) for pattern in patterns + characters)
 
 
 def _check_program_pattern(program_source, args):
