@@ -1928,6 +1928,17 @@ class Scan(unittest.TestCase):
         self.assertIn("90 stale-docs:README.md:install t", lines[0])
         self.assertNotIn("dead-code:a.py:x", out)
 
+    def test_model_text_redacted(self):
+        secret = "ghp_" + "a1B2" * 10
+        leak = dict(self.GOOD, title="leaked " + secret, evidence="config.py:1 token = " + secret)
+        self.answers = [self.good(leak)]
+        _, out = self.scan(force=True, dry_run=True)
+        self.assertNotIn(secret, out)
+        self.assertIn("[redacted]", out)
+        self.answers = [RuntimeError("claude failed: " + secret)]
+        _, out = self.scan(force=True)
+        self.assertNotIn(secret, out)
+
     def test_no_github_writes(self):
         self.scan()
         self.scan(manual=True)

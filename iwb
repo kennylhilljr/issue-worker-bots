@@ -1771,7 +1771,7 @@ def scan_repo(repo, *, manual=False, force=False, dry_run=False):
                 problem = str(e)
     except (RuntimeError, subprocess.SubprocessError, SystemExit, OSError) as e:
         record["failed_at"] = now
-        log(f"scan {repo}: failed, will retry in an hour: {e}")
+        log(f"scan {repo}: failed, will retry in an hour: {short(e, 300)}")
         if not dry_run:
             save_state(state, since)
         return 1
@@ -1781,7 +1781,7 @@ def scan_repo(repo, *, manual=False, force=False, dry_run=False):
     if found is None:
         record.pop("failed_at", None)
         record["next_eligible_at"] = now + interval * 86400
-        log(f"scan {repo}: two unusable answers ({problem}); next scheduled scan in {interval} days")
+        log(f"scan {repo}: two unusable answers ({short(problem, 300)}); next scheduled scan in {interval} days")
     else:
         kept = filter_findings(found)
         record["at"] = now
@@ -1789,9 +1789,9 @@ def scan_repo(repo, *, manual=False, force=False, dry_run=False):
         record.pop("next_eligible_at", None)
         log(f"scan {repo}: {len(kept)} of {len(found)} findings kept")
         for f in kept:
-            log(f"scan {repo}: {f['confidence']} {' '.join(f['fingerprint'].split())} {' '.join(f['title'].split())}")
-        if dry_run:
-            print(json.dumps(kept, indent=1))
+            log(f"scan {repo}: {f['confidence']} {short(f['fingerprint'])} {short(f['title'], 300)}")
+        if dry_run:   # model text can quote a committed secret: token-shaped strings never reach the output
+            print(TOKENISH.sub("[redacted]", json.dumps(kept, indent=1)))
     if not dry_run:
         save_state(state, since)
     return 0
