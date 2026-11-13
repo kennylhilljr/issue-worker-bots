@@ -248,6 +248,8 @@ class LiveCommands(unittest.TestCase):
         "python3 -m trace --ignore-d /usr iwb tick", "python3 -m cProfile --out x iwb tick",
         "python3 -m cProfile ./i*b tick", "python3 -m cProfile -o x ./iw? tick",
         'python3 -m cProfile -o "$O" install-intake.sh', 'python3 -m cProfile -o "$O" launchctl load x',
+        "python3 -m cProfile ./i*b tick iwb", "python3 -m cProfile ${X} tick iwb",
+        "python3 -m cProfile ./i*b code --dry-run x/iwb",
     )
 
     ALLOWED = (
@@ -279,6 +281,7 @@ class LiveCommands(unittest.TestCase):
         "if true; then echo ok; fi", "env FOO=1 git status", "for f in tests/*.py; do wc -l $f; done",        '[ "$1" = approve ]', 'if [ "$m" = code ]; then echo ok; fi', '[[ $x = tick ]]',
         'echo "$(git status --short)"', "echo $((1 + 2))",
         "python3 - <<'EOF'\nprint(1)\nEOF",        "bash -euo pipefail -c 'echo ok'",
+        "python3 -m cProfile -o out.prof app.py", "python3 -m pdb tests/test_iwb.py",
     )
 
     def setUp(self):

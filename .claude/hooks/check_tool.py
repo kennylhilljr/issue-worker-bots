@@ -282,12 +282,12 @@ def _shell_command_string(args):
 
 
 def _python_operand(args):
-    """Index of the script argument for python args, or None for -c/-m/stdin."""
+    """Candidate script indexes for python args: [] for -c, other -m modules and stdin."""
     index = 0
     while index < len(args):
         arg = args[index]
         if arg == "--":
-            return index + 1 if index + 1 < len(args) else None
+            return [index + 1] if index + 1 < len(args) else []
         if arg.startswith("--"):
             index += 2 if arg == "--check-hash-based-pycs" else 1
             continue
@@ -297,28 +297,23 @@ def _python_operand(args):
                 if flag == "m":
                     module = arg[position + 1:] or (args[index + 1] if index + 1 < len(args) else "")
                     if module not in SCRIPT_RUNNING_MODULES:
-                        return None     # a module, not a script path
-                    # Their own options vary (and argparse accepts abbreviations), so the
-                    # script is taken to be the first later word that names a guarded program
-                    # or may expand to one.
+                        return []       # a module, not a script path
+                    # Their own options vary (and argparse accepts abbreviations), so every
+                    # later word that names a guarded program or may expand to one is a
+                    # candidate script, and each candidate is checked.
                     rest = index + (1 if arg[position + 1:] else 2)
-                    later = range(rest, len(args))
-                    for candidate in later:
-                        if _basename(args[candidate]) in GUARDED_PROGRAMS:
-                            return candidate
-                    for candidate in later:
-                        if any(ch in args[candidate] for ch in EXPANSION_CHARS):
-                            return candidate
-                    return None
+                    return [candidate for candidate in range(rest, len(args))
+                            if _basename(args[candidate]) in GUARDED_PROGRAMS
+                            or any(ch in args[candidate] for ch in EXPANSION_CHARS)]
                 if flag == "c":
-                    return None     # inline code
+                    return []       # inline code
                 if flag in "WX":
                     takes_value = position == len(arg) - 1
                     break
             index += 2 if takes_value else 1
             continue
-        return index
-    return None
+        return [index]
+    return []
 
 
 def _check_program(program_word, program_body, args, arg_bodies, via_xargs, terminator, depth):
@@ -430,11 +425,12 @@ def check_simple(words, bodies, terminator, depth):
     elif program == "eval":
         return check_command(" ".join(args), depth + 1)
     elif _is_python(program):
-        operand = _python_operand(args)
-        if operand is None:
-            return None
-        program_word, program_body = args[operand], arg_bodies[operand]
-        args, arg_bodies = args[operand + 1:], arg_bodies[operand + 1:]
+        for operand in _python_operand(args):
+            message = _check_program(args[operand], arg_bodies[operand], args[operand + 1:],
+                                     arg_bodies[operand + 1:], via_xargs, terminator, depth)
+            if message:
+                return message
+        return None
     elif program in (".", "source"):
         if not args:
             return SHELL_STDIN_MESSAGE
