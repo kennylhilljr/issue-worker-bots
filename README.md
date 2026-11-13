@@ -241,6 +241,7 @@ Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bo
 - **How often.** Each repository at most once every `scan_interval_days` (default 7).
 - **Scheduled.** `iwb tick` scans the first repository in `scan_repos` order that is due, at most one per pass, after approval. Nothing is scanned while `config.json` has `paused`.
 - **By hand.** `iwb scan` scans every repository in `scan_repos`, ignoring the interval. `--repo owner/repo` scans just that one, even if it isn't listed. `--force` also ignores the backoff after a failure. `--dry-run` prints the kept findings as JSON and the issues it would file, posts nothing and saves no state. Exits 1 if a scan failed or a finding was skipped.
+- **One scan at a time.** A scheduled scan and `iwb scan` take the repository's scan lock (`locks/scan-<repo>-<hash>.lock` under `~/.local/state/issue-worker-bots/`) without waiting and hold it from the due check through filing. While another scan of the same repository holds it, the second one logs that a scan is already running and returns without cloning, running a model or filing, so two scans never file the same finding twice. Different repositories scan at once.
 - **When a scan is due.** The state file keeps `state["_scan"][repo] = {at, failed_at, next_eligible_at}`. The first rule that applies wins:
   1. With `--force`, the scan always runs.
   2. After a clone, model, issue-read or filing failure, `failed_at` makes the next scan, scheduled or by hand, wait one hour.

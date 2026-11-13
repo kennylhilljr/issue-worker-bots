@@ -1860,7 +1860,8 @@ class ScanFixture(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.saved = {k: getattr(iwb, k) for k in ("STATE", "CONFIG", "clone", "run_cli", "run_gh_as", "post")}
+        self.saved = {k: getattr(iwb, k) for k in ("STATE", "CONFIG", "WORK_DIR", "clone", "run_cli", "run_gh_as",
+                                                   "post")}
         self.saved_attention = iwb.prbot.openclaw_attention
         self.saved_gh_read = iwb.prbot.gh_read
         self.saved_load_config = iwb.prbot.load_config
@@ -1869,6 +1870,7 @@ class ScanFixture(unittest.TestCase):
                                          "codex-dev": {"owner": OWNER, "slug": "codex-dev-gh"}}
         iwb.STATE = Path(self.tmp.name, "state.json")
         iwb.CONFIG = Path(self.tmp.name, "config.json")
+        iwb.WORK_DIR = Path(self.tmp.name, "work")        # its locks/scan-*.lock
         iwb.CONFIG.write_text(json.dumps({"scan_repos": [self.REPO]}))
         self.writes, self.clones, self.cmds, self.answers = [], [], [], []
         iwb.run_gh_as = lambda *a, **k: self.writes.append(("run_gh_as", a)) or "https://x/issues/9"
@@ -2040,6 +2042,39 @@ class Scan(ScanFixture):
         self.assertNotIn("unusable", out)
         self.assertAlmostEqual(self.record()["at"], time.time(), delta=60)
         self.assertNotIn("next_eligible_at", self.record())
+
+    def test_scan_skips_while_another_scan_holds_the_lock(self):
+        held = iwb.try_lock(iwb.lock_file("scan", self.REPO))   # the scheduled scan in tick, in another process
+        self.assertIsNotNone(held)
+        try:
+            for kw in ({}, {"manual": True}, {"force": True}):
+                with self.subTest(**kw):
+                    code, out = self.scan(**kw)
+                    self.assertEqual(code, 0)
+                    self.assertIn("another scan of it is running; no scan", out)
+            self.assertEqual(self.clones, [])
+            self.assertEqual(self.cmds, [])
+            self.assertEqual(self.writes, [])
+            self.assertFalse(iwb.STATE.exists())
+        finally:
+            held.close()
+        self.scan(manual=True)                                  # released: the next scan runs and files
+        self.assertEqual(len(self.cmds), 1)
+        self.assertTrue(any(w[1][2][:2] == ["issue", "create"] for w in self.writes if w[0] == "run_gh_as"))
+
+    def test_scan_lock_is_per_repository(self):
+        held = iwb.try_lock(iwb.lock_file("scan", "o/other"))
+        try:
+            self.scan(manual=True)
+        finally:
+            held.close()
+        self.assertEqual(len(self.cmds), 1)
+
+    def test_scan_releases_its_lock(self):
+        self.scan(force=True)
+        self.answers = [RuntimeError("claude timed out")]
+        self.assertEqual(self.scan(force=True)[0], 1)
+        self.assertFalse(iwb.lock_busy("scan", self.REPO))
 
     def test_paused_runs_no_model(self):
         iwb.CONFIG.write_text(json.dumps({"scan_repos": [self.REPO], "paused": True}))
@@ -2814,7 +2849,7 @@ class ScanDocs(unittest.TestCase):
                "JSON", "read-only", "Read Grep Glob", "MCP", "-s read-only", "at least 80", "fingerprint",
                "highest confidence", "bot:proposed", "<!-- iwb-scan:<fingerprint> -->", "open or closed",
                "never filed blind", "bot:work", "iwb-scan-meta", "compatible", "at most 8", "split by area",
-               "checklist")
+               "checklist", "scan lock")
 
     def check(self, name):
         text = (ROOT / name).read_text()
