@@ -14,6 +14,7 @@ import argparse
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -76,9 +77,15 @@ SCRIPT_RUNNING_MODULES = ("cProfile", "profile", "pdb", "trace")
 GUARDED_PROGRAMS = ("iwb", "install-intake.sh", "launchctl")
 EXPANSION_CHARS = "$`{*?["
 # launchctl subcommands that change jobs; a variable program followed by one of them is refused.
-LAUNCHCTL_WRITE = ("load", "unload", "bootstrap", "bootout", "enable", "disable", "kickstart",
-                   "kill", "submit", "remove", "start", "stop", "setenv", "unsetenv", "asuser",
-                   "bsexec", "attach", "debug", "reboot", "limit", "config", "uncache")
+# Only verbs other programs rarely use, so "$GIT" config or "$NPM" start stay allowed.
+LAUNCHCTL_WRITE = ("load", "unload", "bootstrap", "bootout", "bootshell", "kickstart", "submit",
+                   "remove", "enable", "disable", "setenv", "unsetenv", "asuser", "bsexec",
+                   "reboot", "uncache")
+# $NAME and ${NAME}: a variable whose value an assignment in the same command may show.
+VARIABLE_RE = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})")
+MAX_RESOLVED = 16
+# Values assigned in the command being checked, nested shells included: name -> list of values.
+_VARIABLES = {}
 
 IWB_MESSAGE = ("Blocked: iwb {sub} runs the live pipeline from this checkout (launchd owns it). "
                "Use --dry-run on intake/analyze/approve/code (never with --from-queue or --job); "
@@ -341,7 +348,11 @@ def _program_patterns(word):
         else:
             out.append(word[index])
             index += 1
-    return [fold(os.path.basename(pattern.rstrip("/"))) for pattern in _brace_expand("".join(out))]
+    pattern = "".join(out)
+    # {a..z} sequences and [[:lower:]]-style classes: fnmatch knows neither, so overmatch.
+    pattern = re.sub(r"\{[^{},]*\.\.[^{},]*\}", "*", pattern)
+    pattern = re.sub(r"\[!?\]?(?:\[:[a-z]+:\]|[^\]])*\]", "?", pattern)
+    return [fold(os.path.basename(item.rstrip("/"))) for item in _brace_expand(pattern)]
 
 
 def _may_name(word, program):
@@ -427,8 +438,40 @@ def _python_operand(args):
     return []
 
 
-def _check_program(program_word, program_body, args, arg_bodies, via_xargs, terminator, depth):
+def _resolved_words(word):
+    """Program words that word becomes with the values assigned to its variables in the command."""
+    words = [word]
+    for match in VARIABLE_RE.finditer(word):
+        name = match.group(1) or match.group(2)
+        values = _VARIABLES.get(name)
+        if not values:
+            continue
+        words = [candidate.replace(match.group(0), value, 1)
+                 for candidate in words for value in values][:MAX_RESOLVED]
+    return [candidate for candidate in words if candidate != word]
+
+
+def _record_variables(commands):
+    """Remember NAME=value words (export and local included) and for NAME in words loops."""
+    for words, _bodies, _terminator in commands:
+        for index, word in enumerate(words):
+            if _is_assignment(word):
+                name, _, value = word.partition("=")
+                _VARIABLES.setdefault(name, []).append(value)
+            elif word == "for" and index + 2 < len(words) and words[index + 2] == "in":
+                _VARIABLES.setdefault(words[index + 1], []).extend(words[index + 3:])
+
+
+def _check_program(program_word, program_body, args, arg_bodies, via_xargs, terminator, depth,
+                   resolve=True):
     """Apply the iwb, install-intake.sh, launchctl and launcher rules to one program."""
+    if resolve:
+        # cmd=./install-intake.sh; "$cmd": check the program the variable was given too.
+        for candidate in _resolved_words(program_word):
+            message = _check_program(candidate, program_body, args, arg_bodies, via_xargs,
+                                     terminator, depth, resolve=False)
+            if message:
+                return message
     program = _basename(program_word)
     if program == "find":
         for index, arg in enumerate(args):
@@ -547,6 +590,11 @@ def check_simple(words, bodies, terminator, depth):
     words, bodies = words[index:], bodies[index:]
     if not words:
         return None
+    for candidate in _resolved_words(words[0]):
+        # S=bash; "$S" -c '...': check the command with the assigned program too.
+        message = check_simple([candidate] + words[1:], bodies, terminator, depth + 1)
+        if message:
+            return message
     program, program_body = _basename(words[0]), bodies[0]
     args, arg_bodies = words[1:], bodies[1:]
 
@@ -583,10 +631,13 @@ def check_command(command, depth=0):
     """Return a block message for a Bash command string, or None to allow it."""
     if depth > MAX_DEPTH:
         return PARSE_MESSAGE.format(reason="shells nested too deeply")
+    if depth == 0:
+        _VARIABLES.clear()
     try:
         commands, all_bodies = split_commands(command)
     except Unparsable as error:
         return PARSE_MESSAGE.format(reason=error)
+    _record_variables(commands)
     for body in all_bodies:
         for inner in _substitutions(body):   # "$(./iwb tick)" runs even inside quotes
             message = check_command(inner, depth + 1)
@@ -629,6 +680,8 @@ def edited_test_target(file_path, root=ROOT):
     """
     if not isinstance(file_path, str) or not file_path:
         return None
+    if not os.path.isabs(file_path) and os.path.normpath(file_path).split(os.sep)[0] == "..":
+        file_path = os.path.abspath(file_path)     # ../Checkout/IWB may come back in
     if os.path.isabs(file_path):
         # realpath on both sides: /tmp is a symlink to /private/tmp on macOS.
         try:

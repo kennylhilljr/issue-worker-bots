@@ -282,6 +282,14 @@ class LiveCommands(unittest.TestCase):
         "/bin/launchct? load x.plist", "/bin/launch* bootout gui/501/x", "/bin/launchc{tl,x} load x",
         'cmd=launchctl; "$cmd" load x.plist', "$L bootout gui/501/x", "${L} kickstart -k x",
         '"$(which launchctl)" load x', "./IW{B,X} tick", "./iwb{,} tick",
+        "./install-intake.s{h..h}", "./install-intake.s[[:lower:]]", "./install-intake.[a-z]h",
+        "/bin/launchct{l..l} load x.plist", "/bin/launchct[!x] load x.plist",
+        # variables assigned in the same command
+        'cmd=./install-intake.sh; "$cmd"', 'cmd=./iwb; sub=tick; "$cmd" "$sub"',
+        'export C=./IWB; $C tick', 'L=/bin/launchctl; "$L" bootshell continue',
+        "L=launchctl; $L stop x", 'S=bash; "$S" -c "./iwb tick"', 'W=sudo; $W ./iwb tick',
+        'c=./install-intake.sh; bash "$c"', 'c=./install-intake.sh; bash -c "$c"',
+        "for c in ./install-intake.sh; do $c; done", 'P=install-intake; ./$P.sh',
     )
 
     ALLOWED = (
@@ -320,6 +328,10 @@ class LiveCommands(unittest.TestCase):
         "/bin/launchct? list", '"$PYTHON" -m unittest discover -s tests', "$EDITOR README.md",
         '"$(git rev-parse --show-toplevel)/scripts/check.py"', "$cmd status", "./*.py",
         "./scripts/{check,x}.py", "./i?b --help",
+        # ordinary variable programs whose first word is not a launchctl write
+        'GIT=git; "$GIT" config --get user.name', '"$NPM" start', "$X stop", "$X kill 1",
+        "PY=python3; $PY -m unittest discover -s tests", "L=launchctl; $L list",
+        "for f in a b; do echo $f; done", "./tests/test_[a-z]*.py",
     )
 
     def setUp(self):
@@ -517,6 +529,14 @@ class PostEdit(unittest.TestCase):
 
     def test_edited_test_target_ignores_case(self):
         module = load_hook_module()
+        parent = os.path.basename(ROOT).swapcase()
+        cwd = os.getcwd()
+        os.chdir(ROOT)
+        self.addCleanup(os.chdir, cwd)
+        for path in (os.path.join("..", parent, "IWB"), os.path.join("..", parent, "Tests", "x.py")):
+            with self.subTest(path=path):
+                self.assertIsNotNone(module.edited_test_target(path))
+        self.assertIsNone(module.edited_test_target(os.path.join("..", parent + "-other", "IWB")))
         cases = {"IWB": "IWB", "Tests/test_iwb.py": "Tests/test_iwb.py", "iwb": "iwb",
                  "IWB.md": None, "Tests": None, "docs/IWB": None, "../IWB": None}
         for path, expected in cases.items():
