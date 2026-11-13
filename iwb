@@ -58,6 +58,7 @@
       scans the first due repository in "scan_repos", at most one per pass, every "scan_interval_days" (default 7). By hand a scan ignores the
       interval but waits out the hour after a failed scan; --force ignores that too. --dry-run prints the kept
       findings as JSON and the issues it would file, posts nothing and saves no state. Exits 1 if a scan failed.
+      A repository whose scan lock another scan (tick's or another iwb scan) holds is skipped with a log line.
       The model also gets the P1 and P2 findings of the last 90 days of bot reviews (config.json
       scan.review_bot_logins, default claude-pr-gh[bot] and codex-pr-gh[bot]) to propose repeat-review fixes.
 
@@ -1817,11 +1818,23 @@ def scan_repo(repo, *, manual=False, force=False, dry_run=False):
     bot:proposed issue unless one already carries its marker (file_findings). Records state["_scan"][repo]: at (last
     scan whose findings were all filed or found filed), failed_at (a clone, model, issue read or filing failure:
     retried after RETRY_AFTER), next_eligible_at (two unusable answers: the next scheduled scan waits a full
-    interval). Returns 1 after a failure, else 0."""
+    interval). Returns 1 after a failure, else 0. One scan of a repository at a time: the scheduled scan in tick
+    and `iwb scan` both hold its scan lock (non-blocking) from the due check through filing, so two scans can't
+    file the same finding twice; while another process holds it, this one logs that and returns 0."""
     conf = read_config()
     if conf.get("paused"):
         log(f"scan {repo}: paused in config.json; no scan")
         return 0
+    lock = try_lock(lock_file("scan", repo.lower()))   # GitHub names ignore case: O/R and o/r are one repository
+    if lock is None:
+        log(f"scan {repo}: another scan of it is running; no scan")
+        return 0
+    with lock:
+        return scan_locked(repo, conf, manual=manual, force=force, dry_run=dry_run)
+
+
+def scan_locked(repo, conf, *, manual, force, dry_run):
+    """scan_repo's work, called only while holding the repository's scan lock."""
     interval = conf.get("scan_interval_days", SCAN_INTERVAL_DAYS)
     state, since = load_state()
     record = state.setdefault("_scan", {}).setdefault(repo, {})
@@ -3570,7 +3583,8 @@ SPAWN_RUNS = True          # False runs each one inside the pass, one after anot
 
 
 def lock_file(kind, name):
-    """The lock file of an issue ("owner/repo#n") or a repository ("owner/repo") under WORK_DIR/locks."""
+    """The lock file of an issue ("owner/repo#n"), a repository ("owner/repo") or a repository's scan ("scan",
+    "owner/repo") under WORK_DIR/locks."""
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
     return WORK_DIR / "locks" / f"{kind}-{safe}-{hashlib.sha256(name.encode()).hexdigest()[:8]}.lock"
 

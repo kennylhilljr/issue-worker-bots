@@ -301,6 +301,8 @@ The pipeline only works on the issues Kenny writes. `iwb scan` is a read-only pa
 
 **Which repositories, and how often.** Only repositories listed in `scan_repos` in `config.json`, so scanning is off by default. Each one is scanned at most once every `scan_interval_days` (default 7). `iwb tick` checks the list after approval and scans the first due repository, at most one per pass, so no extra launchd job is needed. A paused config scans nothing, not even by hand. `iwb scan` runs it by hand over the whole list, or `--repo` over one repository, listed or not.
 
+**One scan per repository at a time.** The marker dedup checks GitHub and then creates the issue, and a scan holds its model call for minutes, so two scans of one repository at once (the scheduled one in `tick` and `iwb scan`, or two `iwb scan` runs) would both find the marker missing and file it twice. `tick.lock` does not cover `iwb scan`, so each scan takes the repository's own scan lock under `locks/`, non-blocking, from the due check through filing. A scan that finds it held logs that another scan is running and returns without cloning, running a model or filing.
+
 **The record.** Each repository has `state["_scan"][repo] = {at, failed_at, next_eligible_at}`:
 - `at` is when the last usable scan finished with every kept finding filed or found already filed.
 - `failed_at` is set when the clone or the model CLI fails, including a CLI that will not start. It is also set when a finding could not be checked or filed. All of these are transient failures, so `at` stays where it was.
