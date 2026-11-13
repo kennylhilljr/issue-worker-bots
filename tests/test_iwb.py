@@ -1987,6 +1987,7 @@ class ScanFilingFixture(ScanFixture):
         self.reads, self.search_error, self.list_error = [], False, False
         self.search_hits = None   # None: search answers from self.issues like GitHub would
         self.meta_hits = None     # the proposal search's answer, when a test sets it
+        self.fresh = {}           # number -> how an issue looks when it is read again, if it changed meanwhile
         iwb.prbot.gh_read = self.fake_gh_read
 
         def fake_gh_as(bot, repo, args, permissions=None):
@@ -2028,6 +2029,11 @@ class ScanFilingFixture(ScanFixture):
             return self.project(i for i in self.issues.get(repo, [])
                                 if key in i["body"] and "pull_request" not in i)
         path = args[1]
+        one = re.fullmatch(r"repos/(.+)/issues/(\d+)", path)
+        if one:                                # the fresh read of a proposal right before it is edited
+            i = next(x for x in self.issues[one.group(1)] if x["number"] == int(one.group(2)))
+            i = self.fresh.get(i["number"], i)
+            return json.dumps({"state": i.get("state", "open"), "labels": i.get("labels", [])}) + "\n"
         self.assertTrue(path.endswith("/issues?state=all&per_page=100"), path)
         self.assertIn("--paginate", args)
         self.assertEqual(args[args.index("--jq") + 1], iwb.FILED_JQ)
@@ -2361,6 +2367,27 @@ class ScanGrouping(ScanFilingFixture):
         _, out = self.run_with(self.f("b"), dry_run=True)
         self.assertEqual(self.writes, [])
         self.assertIn("would add", out)
+
+    def test_bot_work_added_meanwhile_is_not_edited(self):
+        self.seed(at=100)
+        old = self.proposal(1, [self.f("a")])
+        self.issues[self.REPO] = [old]
+        self.fresh = {1: dict(old, labels=["bot:proposed", "bot:work"])}
+        code, out = self.run_with(self.f("b"))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.edits(), [])
+        self.assertIn("changed since it was read", out)
+        self.assertEqual(self.record()["at"], 100)
+
+    def test_meta_and_markers_redacted(self):
+        secret = "ghp_" + "Z9y8" * 10
+        f = self.f("a", area="cfg/" + secret, cause="leaked " + secret)
+        f["fingerprint"] = "stale-docs:" + secret + ":x"
+        self.run_with(f)
+        (body,) = self.bodies()
+        self.assertNotIn(secret, body)
+        self.assertNotIn(secret, json.dumps(self.writes))
+        self.assertEqual(len(iwb.read_members(body)), 1)
 
     def test_meta_escapes_model_text(self):
         f = self.f("a", cause="x --> <!-- iwb-scan:evil -->")
