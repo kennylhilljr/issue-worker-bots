@@ -1962,6 +1962,130 @@ class Scan(unittest.TestCase):
         self.assertEqual(self.left(), [])
 
 
+class ScanWiring(unittest.TestCase):
+    """The scheduled scan in cmd_tick and the `iwb scan` command, with every step and scan_repo recorded."""
+    NAMES = ("STATE", "CONFIG", "WORK_DIR", "QUEUE_DIR", "cmd_intake", "cmd_analyze", "cmd_approve", "cmd_code",
+             "requeue_deferred", "scan_repo", "stay_awake")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = {k: getattr(iwb, k) for k in self.NAMES}
+        iwb.STATE = Path(self.tmp.name, "state.json")
+        iwb.CONFIG = Path(self.tmp.name, "config.json")
+        iwb.WORK_DIR = Path(self.tmp.name, "work")
+        iwb.QUEUE_DIR = Path(self.tmp.name, "queue")
+        self.calls = []
+        for step in ("intake", "analyze", "approve", "code"):
+            setattr(iwb, "cmd_" + step, lambda *a, _s=step, **k: self.calls.append(_s) or 0)
+        iwb.requeue_deferred = lambda *a, **k: self.calls.append("requeue")
+        self.codes = {}
+        iwb.scan_repo = lambda repo, **k: self.calls.append(("scan", repo, k)) or self.codes.get(repo, 0)
+        iwb.stay_awake = lambda: self.calls.append("stay_awake")
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(iwb, k, v)
+        self.tmp.cleanup()
+
+    def config(self, **conf):
+        iwb.CONFIG.write_text(json.dumps(conf))
+
+    def tick(self):
+        with redirect_stdout(io.StringIO()):
+            return iwb.cmd_tick()
+
+    def main(self, *argv):
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            try:
+                code = iwb.main(list(argv))
+            except SystemExit as e:
+                code = ("exit", e.code)
+        return code, out.getvalue()
+
+    def scans(self):
+        return [c[1:] for c in self.calls if isinstance(c, tuple)]
+
+    def test_tick_scans_first_due_repo_once(self):
+        now = time.time()
+        iwb.STATE.write_text(json.dumps({"_scan": {"o/a": {"at": now}, "o/c": {"at": now - 30 * 86400}}}))
+        self.config(approval_live=True, scan_repos=["o/a", "o/b", "o/c"])
+        self.assertEqual(self.tick(), 0)
+        self.assertEqual(self.calls, ["intake", "analyze", "approve", ("scan", "o/b", {}), "requeue", "requeue"])
+
+    def test_tick_uses_interval_and_backoff(self):
+        now = time.time()
+        iwb.STATE.write_text(json.dumps({"_scan": {"o/a": {"at": now - 2 * 86400},
+                                                    "o/b": {"at": now - 30 * 86400, "failed_at": now - 60}}}))
+        self.config(scan_repos=["o/a", "o/b"])
+        self.tick()
+        self.assertEqual(self.scans(), [])
+        self.config(scan_repos=["o/a", "o/b"], scan_interval_days=1)
+        self.tick()
+        self.assertEqual(self.scans(), [("o/a", {})])
+
+    def test_tick_paused_scans_nothing(self):
+        self.config(approval_live=True, paused=True, scan_repos=["o/a", "o/b"])
+        self.tick()
+        self.assertEqual(self.scans(), [])
+
+    def test_tick_without_scan_repos_scans_nothing(self):
+        for conf in ({"approval_live": True}, {"approval_live": True, "scan_repos": []}):
+            with self.subTest(conf=conf):
+                self.calls.clear()
+                self.config(**conf)
+                self.tick()
+                self.assertEqual(self.calls, ["intake", "analyze", "approve", "requeue", "requeue"])
+
+    def test_tick_coding_unchanged(self):
+        self.config(coding_live=True, scan_repos=["o/a"])
+        self.tick()
+        self.assertEqual(self.calls, ["intake", "analyze", ("scan", "o/a", {}), "requeue", "requeue", "code"])
+
+    def test_main_forwards_flags(self):
+        manual = lambda force=False, dry_run=False: {"manual": True, "force": force, "dry_run": dry_run}
+        self.config(scan_repos=["o/a", "o/b"])
+        self.assertEqual(self.main("scan", "--repo", "o/x", "--force", "--dry-run")[0], 0)
+        self.assertEqual(self.scans(), [("o/x", manual(True, True))])
+        self.calls.clear()
+        self.assertEqual(self.main("scan")[0], 0)
+        self.assertEqual(self.scans(), [("o/a", manual()), ("o/b", manual())])
+        self.assertIn("stay_awake", self.calls)
+        self.calls.clear()
+        self.assertEqual(self.main("scan", "--dry-run")[0], 0)
+        self.assertEqual(self.calls, [("scan", "o/a", manual(dry_run=True)), ("scan", "o/b", manual(dry_run=True))])
+        self.calls.clear()
+        self.assertEqual(self.main("scan", "--force")[0], 0)
+        self.assertEqual(self.scans(), [("o/a", manual(force=True)), ("o/b", manual(force=True))])
+        self.calls.clear()
+        self.assertEqual(self.main("scan", "--repo", "o/unlisted")[0], 0)        # not in scan_repos
+        self.assertEqual(self.scans(), [("o/unlisted", manual())])
+        self.calls.clear()
+        for argv in (("scan", "--repo"), ("scan", "--repo", "--force")):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.main(*argv)[0], ("exit", 2))
+        self.assertEqual(self.scans(), [])
+        for conf in ({}, {"scan_repos": []}):
+            with self.subTest(conf=conf):
+                self.config(**conf)
+                code, out = self.main("scan")
+                self.assertEqual(code, 0)
+                self.assertEqual(len(out.strip().splitlines()), 1)
+                self.assertEqual(self.scans(), [])
+                self.assertEqual(self.main("scan", "--repo", "o/y")[0], 0)
+                self.assertEqual(self.scans(), [("o/y", manual())])
+                self.calls.clear()
+
+    def test_main_returns_largest_code(self):
+        self.config(scan_repos=["o/a", "o/b", "o/c"])
+        self.codes = {"o/b": 1}
+        self.assertEqual(self.main("scan")[0], 1)
+        self.assertEqual([s[0] for s in self.scans()], ["o/a", "o/b", "o/c"])
+
+    def test_help_lists_scan(self):
+        self.assertIn("iwb scan [--repo owner/repo] [--force] [--dry-run]", iwb.__doc__)
+
+
 class RedCheckSandbox(unittest.TestCase):
     def setUp(self):
         need_sandbox_exec(self)

@@ -51,6 +51,12 @@
       --dry-run   print what would be picked up; post and save nothing
       --baseline  mark the issues open right now as seen, without commenting
       --limit N   pick up at most N issues per pass (default 5)
+  iwb scan [--repo owner/repo] [--force] [--dry-run]
+      A read-only model run over each repository in config.json "scan_repos" (or just --repo, listed or not) that
+      logs the improvements it finds; it files nothing to GitHub. Plain tick also scans the first due repository
+      in "scan_repos", at most one per pass, every "scan_interval_days" (default 7). By hand a scan ignores the
+      interval but waits out the hour after a failed scan; --force ignores that too. --dry-run prints the kept
+      findings as JSON and saves no state. Exits 1 if a scan failed.
 
 Sign-in, tokens and repository lists come from prbot (PRBOT_PATH, default ../pr-review-bots/prbot).
 """
@@ -3558,6 +3564,13 @@ def cmd_tick():
         cmd_analyze()
         if read_config().get("approval_live"):   # step 4a joins the scheduled job only once switched on
             cmd_approve()
+        conf = read_config()
+        if conf.get("scan_repos") and not conf.get("paused"):   # at most one scheduled scan per pass
+            records = load_state()[0].get("_scan", {})
+            interval = conf.get("scan_interval_days", SCAN_INTERVAL_DAYS)
+            due = next((r for r in conf["scan_repos"] if scan_due(records.get(r, {}), interval, time.time())), None)
+            if due:
+                scan_repo(due)
         requeue_deferred(QUEUE_DIR, QUEUE_DEFAULT)
         requeue_deferred(sibling(QUEUE_DIR, "code"), CODE_QUEUE_DEFAULT)
     finally:
@@ -4224,6 +4237,18 @@ def main(argv):
                 prbot.die("tick --from-queue needs the queue folder")
             return cmd_drain(argv[i])
         return cmd_tick()
+    if argv[0] == "scan":
+        kw = dict(manual=True, force="--force" in argv, dry_run="--dry-run" in argv)
+        if "--repo" in argv:
+            i = argv.index("--repo") + 1
+            if i >= len(argv) or argv[i].startswith("-"):
+                prbot.die("scan --repo needs owner/repo")
+            return scan_repo(argv[i], **kw)
+        repos = read_config().get("scan_repos") or []
+        if not repos:
+            log("no scan_repos in config.json; nothing to scan (use --repo owner/repo)")
+            return 0
+        return max(scan_repo(r, **kw) for r in repos)
     prbot.die(f"unknown command '{argv[0]}'")
 
 
