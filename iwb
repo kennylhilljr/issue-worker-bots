@@ -24,7 +24,8 @@
       Right before new coding starts (here, in plain tick and in iwb code, under work.lock), the issue and its
       trusted comments are read again; if the issue changed since the approved
       plan was analyzed, the state entry is marked stale_plan (no approval or coding anywhere until a new
-      analysis), an event goes back to the issue queue, and nothing is coded.
+      analysis), an event goes back to the issue queue, and nothing is coded. If that event can't be written, the
+      hand-off is deferred and a later pass sends it again.
   iwb code [--dry-run]
       Step 4b: for each plan that step 4a approved and that has a free slot (config.json "code_concurrency",
       default 4, at most "max_parallel", default 3, per runner, one per repository), a coding run started as its own
@@ -3312,8 +3313,8 @@ def cmd_code(dry_run=False, limit=None, ecc=None, only=None, review=True, intake
             state = read_state_file()
             for key in only:
                 try:
-                    if needs_coding(state.get(key)):
-                        mark(key, "waiting")
+                    if needs_coding(state.get(key)) or stale_unnotified(state.get(key)):
+                        mark(key, "waiting")      # an unsent stale-plan event is retried by the next pass
                 except PLAN_ERRORS as e:
                     mark(key, "failed", f"could not read the plan file: {e!r}")
         return 0
@@ -3333,7 +3334,10 @@ def cmd_code(dry_run=False, limit=None, ecc=None, only=None, review=True, intake
             if entry.get("blocked") or entry.get("closed") or (entry.get("analysis") or {}).get("decision") != "plan":
                 continue
             if entry.get("stale_plan"):
-                log(f"{key}: the approved plan is out of date; not coding until a new analysis")
+                if stale_unnotified(entry):
+                    retry_stale_notice(key, entry["stale_plan"], intake_q or QUEUE_DIR, dry_run)
+                else:
+                    log(f"{key}: the approved plan is out of date; not coding until a new analysis")
                 continue
             try:
                 ap, units = approved_plan(entry)
@@ -3908,13 +3912,81 @@ def cmd_drain(queue_dir):
 
 def mark_plan_stale(key, why):
     """Record on the issue's state entry, under state.lock, that its approved plan is out of date. Approval and
-    coding refuse such an entry on every path, and analysis treats it as needing a new analysis, which clears it."""
+    coding refuse such an entry on every path, and analysis treats it as needing a new analysis, which clears it.
+    The record starts with "notified": False until its stale-plan event reaches the issue queue. Returns the
+    record it wrote (None if the issue has no entry): the token mark_stale_notified compares against."""
     state, since = load_state()
     entry = state.get(key)
     if not isinstance(entry, dict):
-        return
-    entry["stale_plan"] = {"at": time.time(), "reason": why}
+        return None
+    record = {"at": time.time(), "reason": why, "notified": False}
+    entry["stale_plan"] = record
     save_state(state, since)
+    return copy.deepcopy(record)
+
+
+def stale_unnotified(entry):
+    """True if the entry's stale_plan record says its stale-plan event has not reached the issue queue yet. Only
+    records written with "notified": False count; older records without the field were sent when written."""
+    stale = entry.get("stale_plan") if isinstance(entry, dict) else None
+    return isinstance(stale, dict) and stale.get("notified") is False
+
+
+def _stale_notified_read():
+    """Test hook: runs inside mark_stale_notified after it reads the state file and before it writes."""
+
+
+def mark_stale_notified(key, token):
+    """Set "notified": True on the issue's stale_plan record if it is still `token`, the record that was written.
+    One state.lock section reads the file, compares and replaces it, so a record a concurrent analysis cleared
+    or replaced meanwhile stays as that analysis left it; then the file is not touched. Not load_state and
+    save_state: merge_changes replaces the whole stale_plan field. True if it was set."""
+    with state_lock():
+        disk = read_state_file(locked=True)
+        _stale_notified_read()
+        entry = disk.get(key)
+        if not isinstance(entry, dict) or entry.get("stale_plan") != token:
+            return False
+        entry["stale_plan"] = dict(token, notified=True)
+        fd, tmp = tempfile.mkstemp(dir=STATE.parent, prefix=".state.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(disk, indent=1) + "\n")
+            os.replace(tmp, STATE)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+    return True
+
+
+def send_stale_notice(key, token, intake_q):
+    """Write the stale-plan event into the issue queue `intake_q`, then record that it was sent (when `token` is
+    the stale_plan record). Returns where it went; raises OSError or ValueError if it could not be written."""
+    problem = queue_dir_problem(intake_q, QUEUE_DEFAULT)
+    if problem:
+        raise OSError(problem)
+    target = write_event(intake_q, *iwb_event(*key.rsplit("#", 1), "stale-plan"), intake_q.parent / ".tmp")
+    if token is not None:
+        try:
+            if not mark_stale_notified(key, token):
+                log(f"{key}: the stale-plan record changed meanwhile; left as it is")
+        except (Exception, SystemExit) as e:
+            log(f"{key}: sent the stale-plan event but could not record that: {e!r}")
+    return target
+
+
+def retry_stale_notice(key, token, intake_q, dry_run):
+    """cmd_code's part for a stale plan whose event never reached the issue queue: send it again. A failure marks
+    the issue deferred, so its hand-off stays queued for the next try. A dry run only says so."""
+    why = token.get("reason")
+    if dry_run:
+        log(f"{key}: would send the stale-plan event ({why}) back to {intake_q} again")
+        return
+    try:
+        target = send_stale_notice(key, token, intake_q)
+        log(f"{key}: not coded: the approved plan is out of date ({why}); sent back to {target} on a retry")
+    except (OSError, ValueError) as e:
+        mark(key, "deferred", f"plan is out of date ({why}) but notification will retry: {e}")
 
 
 def plan_still_current(key, entry, intake_q):
@@ -3933,18 +4005,15 @@ def plan_still_current(key, entry, intake_q):
         log(f"{key}: not coded: the issue was closed")
         return False                      # handled: nothing to code, nothing to send back
     try:
-        mark_plan_stale(key, why)
+        token = mark_plan_stale(key, why)
     except (Exception, SystemExit) as e:
         mark(key, "failed", f"plan is out of date ({why}) but could not record that: {e!r}")
         return False
     try:
-        problem = queue_dir_problem(intake_q, QUEUE_DEFAULT)
-        if problem:
-            raise OSError(problem)
-        target = write_event(intake_q, *iwb_event(*key.rsplit("#", 1), "stale-plan"), intake_q.parent / ".tmp")
+        target = send_stale_notice(key, token, intake_q)
         log(f"{key}: not coded: the approved plan is out of date ({why}); sent back to {target}")
-    except (OSError, ValueError) as e:
-        mark(key, "failed", f"plan is out of date ({why}) but could not go back to the issue queue: {e}")
+    except (OSError, ValueError) as e:     # deferred, not failed: the hand-off stays and cmd_code sends it again
+        mark(key, "deferred", f"plan is out of date ({why}) but notification will retry: {e}")
     return False
 
 
