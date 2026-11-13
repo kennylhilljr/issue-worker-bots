@@ -3,8 +3,8 @@
 
 --mode pre blocks Write/Edit/MultiEdit calls on secret-shaped files, and Bash
 commands that would run the live pipeline (iwb), install-intake.sh or change
-launchd jobs. --mode post runs the test suite after an edit to iwb or tests/ and reports
-failures.
+launchd jobs. --mode post runs the test suite after an edit to iwb or tests/
+and reports failures.
 """
 import argparse
 import io
