@@ -228,7 +228,17 @@ class LiveCommands(unittest.TestCase):
         "arch -arm64 ./iwb tick", "ksh -c './iwb tick'",
         "launchctl asuser 501 launchctl load x", "launchctl submit -l x -- ./iwb tick",
         "launchctl remove x", "launchctl start x", "launchctl stop x",
-        "python3 -Wignore::DeprecationWarning iwb tick", "python3 -W ignore iwb tick",
+        "python3 -Wignore::DeprecationWarning iwb tick", "python3 -W ignore iwb tick",        'out="$(./iwb tick)"', 'echo "$(./iwb analyze)"', 'echo "`./iwb tick`"',
+        'echo "result: $(cd x && ./iwb tick)"', 'FOO="$(./iwb tick)" true',
+        'echo "$(bash install-intake.sh)"', 'echo "$(launchctl load x)"',
+        'echo hi > "$(./iwb tick)"',
+        "cat install-intake.sh | bash -", "bash -s < install-intake.sh",
+        "stdbuf -oL ./iwb tick", "setsid ./iwb tick", "taskpolicy -b ./iwb tick",
+        "unbuffer ./iwb tick", "script -q /dev/null ./iwb tick", "builtin exec ./iwb tick",
+        "sudo -nu kenny ./iwb tick", "sudo --user kenny ./iwb tick",
+        "/usr/bin/time -o out ./iwb tick", "env --unset X ./iwb tick", "env --chdir /tmp ./iwb tick",
+        "bash --rcfile F -c './iwb tick'", "python3 --check-hash-based-pycs always iwb tick",
+        "python3 -m cProfile iwb tick", "python3 -m pdb iwb tick", "echo 'load x' | launchctl",
     )
 
     ALLOWED = (
@@ -257,7 +267,9 @@ class LiveCommands(unittest.TestCase):
         "cat install-intake.sh", "launchctl list", "launchctl print gui/501/x", "ls launchd/",        # stricter rules leave ordinary commands alone
         "find . -name '*.py' -exec grep -l iwb {} +", "launchctl help",
         "python3 -Wignore::DeprecationWarning -m unittest discover -s tests",
-        "if true; then echo ok; fi", "env FOO=1 git status", "for f in tests/*.py; do wc -l $f; done",
+        "if true; then echo ok; fi", "env FOO=1 git status", "for f in tests/*.py; do wc -l $f; done",        '[ "$1" = approve ]', 'if [ "$m" = code ]; then echo ok; fi', '[[ $x = tick ]]',
+        'echo "$(git status --short)"', "echo $((1 + 2))",
+        "python3 - <<'EOF'\nprint(1)\nEOF",
     )
 
     def setUp(self):

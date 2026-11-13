@@ -24,15 +24,23 @@ SEPARATORS = ("&&", "||", ";;", "|&", ";", "&", "|", "(", ")", "`", "\n")
 OPERATORS = sorted(REDIRECTIONS + SEPARATORS, key=len, reverse=True)
 
 WRAPPERS = ("env", "sudo", "nohup", "time", "command", "exec", "nice", "caffeinate", "xargs",
-            "timeout", "gtimeout", "watch", "arch")
+            "timeout", "gtimeout", "watch", "arch", "setsid", "stdbuf", "taskpolicy", "unbuffer",
+            "builtin", "script")
 # Shell keywords that can start a simple command once ; and newlines have split it.
 RESERVED_WORDS = ("{", "}", "!", "if", "then", "elif", "else", "fi", "do", "done", "while", "until",
-                  "case", "esac", "coproc", "[[", "]]")
+                  "case", "esac", "coproc")
+# Programs that only compare words; a quoted "$x" or [ there never names iwb.
+TEST_PROGRAMS = ("[", "[[", "test")
 # Wrapper options that take the next word as their value (so it is not the program).
 WRAPPER_VALUE_OPTIONS = {
-    "env": ("-u", "-C", "-P"),
-    "sudo": ("-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T"),
-    "nice": ("-n",),
+    "env": ("-u", "-C", "-P", "--unset", "--chdir"),
+    "sudo": ("-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U", "-T", "--user", "--group",
+             "--host", "--prompt", "--chdir", "--close-from", "--role", "--type", "--other-user"),
+    "time": ("-o", "-f", "--output", "--format"),
+    "stdbuf": ("-i", "-o", "-e", "--input", "--output", "--error"),
+    "taskpolicy": ("-c", "-t", "-l", "-p", "-g"),
+    "script": ("-t", "-T"),
+    "nice": ("-n", "--adjustment"),
     "caffeinate": ("-t", "-w"),
     "exec": ("-a",),
     "xargs": ("-I", "-J", "-L", "-n", "-P", "-s", "-E", "-d", "-a", "-R", "-S"),
@@ -48,6 +56,8 @@ LAUNCHCTL_READ_ONLY = ("list", "print", "print-cache", "print-disabled", "blame"
                        "managerpid", "manageruid", "managername", "error", "variant", "version",
                        "help", "getenv", "hostinfo")
 IWB_SUBCOMMANDS = ("tick", "intake", "analyze", "approve", "code")
+# python -m modules whose first operand is a script they run.
+SCRIPT_RUNNING_MODULES = ("cProfile", "profile", "pdb", "trace")
 EXPANSION_CHARS = "$`{*?["
 
 IWB_MESSAGE = ("Blocked: iwb {sub} runs the live pipeline from this checkout (launchd owns it). "
@@ -168,15 +178,17 @@ def _tokens(command):
 def split_commands(command):
     """Split a shell command into simple commands.
 
-    Returns a list of (words, bodies, terminator) where terminator is the separator
-    that ended the command ('' at the end of input).
+    Returns (commands, all_bodies): commands is a list of (words, bodies, terminator)
+    where terminator is the separator that ended the command ('' at the end of input);
+    all_bodies is the source of every word, redirection targets included.
     """
-    commands = []
+    commands, all_bodies = [], []
     words, bodies = [], []
     ends = []
     pending_target = False
     for kind, value, body, start, end in _tokens(command):
         if kind == "word":
+            all_bodies.append(body)
             if pending_target:
                 pending_target = False      # a redirection target is not an argument
                 continue
@@ -197,7 +209,35 @@ def split_commands(command):
             commands.append((words, bodies, piece))
             words, bodies, ends = [], [], []
     commands.append((words, bodies, ""))
-    return [entry for entry in commands if entry[0]]
+    return [entry for entry in commands if entry[0]], all_bodies
+
+
+def _substitutions(body):
+    """Return the text of each $(...) and `...` inside a word's source (quoted ones included)."""
+    found, index = [], 0
+    while index < len(body):
+        if body.startswith("$(", index):
+            depth, stop = 0, index + 1
+            while stop < len(body):
+                if body[stop] == "(":
+                    depth += 1
+                elif body[stop] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                stop += 1
+            found.append(body[index + 2:stop])
+            index = stop + 1
+        elif body[index] == "`":
+            stop = body.find("`", index + 1)
+            stop = len(body) if stop < 0 else stop
+            found.append(body[index + 1:stop])
+            index = stop + 1
+        elif body[index] == "\\":
+            index += 2
+        else:
+            index += 1
+    return found
 
 
 def _basename(word):
@@ -216,25 +256,27 @@ def _is_python(base):
 
 
 def _shell_command_string(args):
-    """For sh/bash/zsh/dash args, return (has_c, index of the first operand)."""
-    has_c, index = False, 0
+    """For shell args, return (has_c, reads_stdin, index of the first operand)."""
+    has_c, reads_stdin, index = False, False, 0
     while index < len(args):
         arg = args[index]
-        if arg in ("-o", "+o", "-O", "+O"):
+        if arg in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
             index += 2
             continue
         if arg == "--":
-            return has_c, index + 1
+            return has_c, reads_stdin, index + 1
         if arg.startswith("--"):
             index += 1
             continue
         if arg[:1] in ("-", "+") and len(arg) > 1:
             if arg[0] == "-" and "c" in arg[1:]:
                 has_c = True
+            if arg[0] == "-" and "s" in arg[1:]:
+                reads_stdin = True
             index += 1
             continue
         break
-    return has_c, index
+    return has_c, reads_stdin, index
 
 
 def _python_operand(args):
@@ -245,13 +287,21 @@ def _python_operand(args):
         if arg == "--":
             return index + 1 if index + 1 < len(args) else None
         if arg.startswith("--"):
-            index += 1
+            index += 2 if arg == "--check-hash-based-pycs" else 1
             continue
         if arg.startswith("-") and len(arg) > 1:
             takes_value = False
             for position, flag in enumerate(arg[1:], start=1):
-                if flag in "cm":
-                    return None     # inline code or a module, not a script path
+                if flag == "m":
+                    module = arg[position + 1:] or (args[index + 1] if index + 1 < len(args) else "")
+                    if module not in SCRIPT_RUNNING_MODULES:
+                        return None     # a module, not a script path
+                    rest = index + (1 if arg[position + 1:] else 2)
+                    while rest < len(args) and args[rest].startswith("-"):
+                        rest += 2 if args[rest] in ("-o", "-s", "-c") else 1
+                    return rest if rest < len(args) else None
+                if flag == "c":
+                    return None     # inline code
                 if flag in "WX":
                     takes_value = position == len(arg) - 1
                     break
@@ -289,7 +339,7 @@ def _check_program(program_word, program_body, args, arg_bodies, via_xargs, term
                 return None
             return IWB_MESSAGE.format(sub=sub)
         return None
-    if any(ch in program_body for ch in EXPANSION_CHARS) and \
+    if program not in TEST_PROGRAMS and any(ch in program_body for ch in EXPANSION_CHARS) and \
             any(arg in IWB_SUBCOMMANDS for arg in args):
         return IWB_DYNAMIC_MESSAGE   # $cmd tick, ./i*b tick: the program may be iwb
     if program == "install-intake.sh":
@@ -298,8 +348,8 @@ def _check_program(program_word, program_body, args, arg_bodies, via_xargs, term
         subcommands = [arg for arg in args if not arg.startswith("-")]
         if subcommands and subcommands[0] not in LAUNCHCTL_READ_ONLY:
             return LAUNCHCTL_MESSAGE.format(sub=subcommands[0])
-        if via_xargs and not subcommands:
-            return LAUNCHCTL_MESSAGE.format(sub="run through xargs")
+        if not subcommands:     # commands from stdin or xargs
+            return LAUNCHCTL_MESSAGE.format(sub="without a subcommand")
     return None
 
 
@@ -321,10 +371,10 @@ def check_simple(words, bodies, terminator, depth):
             wrapper = base
             via_xargs = via_xargs or base == "xargs"
             index += 1
-            if base in ("timeout", "gtimeout"):
+            if base in ("timeout", "gtimeout", "script"):
                 while index < len(words) and words[index].startswith("-"):
                     index += 2 if words[index] in WRAPPER_VALUE_OPTIONS[base] else 1
-                index += 1  # the duration
+                index += 1  # timeout's duration, script's output file
             elif base == "watch":
                 while index < len(words) and words[index].startswith("-"):
                     index += 2 if words[index] in WRAPPER_VALUE_OPTIONS[base] else 1
@@ -337,7 +387,11 @@ def check_simple(words, bodies, terminator, depth):
                 rest = [word.split("=", 1)[1] if word.startswith("--") else word[2:]] + words[index + 1:]
             return check_command(" ".join(rest), depth + 1)
         elif word.startswith("-") and len(word) > 1:
-            index += 2 if word in WRAPPER_VALUE_OPTIONS.get(wrapper, ()) else 1
+            values = WRAPPER_VALUE_OPTIONS.get(wrapper, ())
+            # -u kenny, and a cluster ending in a value flag such as sudo -nu kenny
+            takes_value = word in values or (
+                not word.startswith("--") and len(word) > 2 and "-" + word[-1] in values)
+            index += 2 if takes_value else 1
         else:
             break
     words, bodies = words[index:], bodies[index:]
@@ -347,12 +401,12 @@ def check_simple(words, bodies, terminator, depth):
     args, arg_bodies = words[1:], bodies[1:]
 
     if program in SHELLS:
-        has_c, operand = _shell_command_string(args)
+        has_c, reads_stdin, operand = _shell_command_string(args)
         if has_c:
             if operand >= len(args):
                 return None
             return check_command(args[operand], depth + 1)
-        if operand >= len(args):
+        if reads_stdin or operand >= len(args) or args[operand] == "-":
             return SHELL_STDIN_MESSAGE
         program_word, program_body = args[operand], arg_bodies[operand]
         args, arg_bodies = args[operand + 1:], arg_bodies[operand + 1:]
@@ -379,9 +433,14 @@ def check_command(command, depth=0):
     if depth > MAX_DEPTH:
         return PARSE_MESSAGE.format(reason="shells nested too deeply")
     try:
-        commands = split_commands(command)
+        commands, all_bodies = split_commands(command)
     except Unparsable as error:
         return PARSE_MESSAGE.format(reason=error)
+    for body in all_bodies:
+        for inner in _substitutions(body):   # "$(./iwb tick)" runs even inside quotes
+            message = check_command(inner, depth + 1)
+            if message:
+                return message
     for words, bodies, terminator in commands:
         message = check_simple(words, bodies, terminator, depth)
         if message:
