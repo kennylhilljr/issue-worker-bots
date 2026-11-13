@@ -2032,8 +2032,8 @@ class ScanFilingFixture(ScanFixture):
         one = re.fullmatch(r"repos/(.+)/issues/(\d+)", path)
         if one:                                # the fresh read of a proposal right before it is edited
             i = next(x for x in self.issues[one.group(1)] if x["number"] == int(one.group(2)))
-            i = self.fresh.get(i["number"], i)
-            return json.dumps({"state": i.get("state", "open"), "labels": i.get("labels", [])}) + "\n"
+            self.assertEqual(args[args.index("--jq") + 1], iwb.FILED_JQ[len(".[] | "):])
+            return self.project([self.fresh.get(i["number"], i)])
         self.assertTrue(path.endswith("/issues?state=all&per_page=100"), path)
         self.assertIn("--paginate", args)
         self.assertEqual(args[args.index("--jq") + 1], iwb.FILED_JQ)
@@ -2378,6 +2378,23 @@ class ScanGrouping(ScanFilingFixture):
         self.assertEqual(self.edits(), [])
         self.assertIn("changed since it was read", out)
         self.assertEqual(self.record()["at"], 100)
+
+    def test_append_uses_the_fresh_body(self):
+        a, b = self.f("a"), self.f("b")
+        listed = self.proposal(1, [a])
+        self.issues[self.REPO] = [listed]
+        edited = dict(listed, body=listed["body"].replace("**Why:**", "**Why (edited by Kenny):**"))
+        self.fresh = {1: edited}
+        self.run_with(b)
+        (edit,) = self.edits()
+        self.assertIn("Why (edited by Kenny)", edit[edit.index("--body") + 1])
+        self.seed(at=100)
+        self.writes = []
+        incompatible = self.proposal(1, [self.f("x", area="iwb", category="dead-code")])
+        self.fresh = {1: dict(incompatible, labels=listed["labels"])}   # body replaced since the listing
+        code, _ = self.run_with(self.f("c"))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.edits(), [])
 
     def test_meta_and_markers_redacted(self):
         secret = "ghp_" + "Z9y8" * 10

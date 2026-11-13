@@ -2094,12 +2094,14 @@ def file_findings(repo, bot, kept, *, dry_run=False):
             continue
         try:
             if found:
-                issue, members = found
-                body = with_items(issue["body"], group, members + group)
-                now = gh_json(["api", f"repos/{repo}/issues/{issue['number']}", "--jq",
-                               "{state, labels: [.labels[].name]}"])[0]
-                if now["state"] != "open" or "bot:work" in now["labels"] or PROPOSED[0] not in now["labels"]:
+                issue = found[0]
+                # read again right before the edit: search lags, and Kenny may have edited the body or added
+                # bot:work meanwhile. The edit is built from, and checked against, this fresh copy.
+                issue = gh_json(["api", f"repos/{repo}/issues/{issue['number']}", "--jq", FILED_JQ[len(".[] | "):]])[0]
+                members = filed.target(issue, group)
+                if not members:
                     raise RuntimeError(f"#{issue['number']} changed since it was read")   # checked again next run
+                body = with_items(issue["body"], group, members + group)
                 if dry_run:
                     log(f"scan {repo}: would add {names} to #{issue['number']}")
                     print(body)
