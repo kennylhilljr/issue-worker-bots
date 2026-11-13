@@ -90,6 +90,8 @@ MAX_BRACES = 256
 LITERAL_MARKS = {"{": "\ue000", "}": "\ue001", ",": "\ue002"}
 POSIX_CLASSES = {"alpha": "a-z", "lower": "a-z", "upper": "a-z", "alnum": "a-z0-9", "digit": "0-9",
                  "xdigit": "0-9a-f"}
+# Programs that run other commands; an expanded name that may be one is checked as each.
+LAUNCHERS = SHELLS + WRAPPERS + ("eval", "source", ".", "python", "python3", "find")
 TOO_MANY_MESSAGE = ("Blocked: the program name {word!r} expands to too many names to check "
                     "(iwb, install-intake.sh, launchctl rules); spell out the program name.")
 # Values assigned in the command being checked, nested shells included: name -> list of values.
@@ -322,9 +324,9 @@ def _sequence(text):
         return None
     numbers = first.lstrip("-").isdigit()
     start, stop = (int(first), int(last)) if numbers else (ord(first), ord(last))
-    values = range(start, stop + 1, step) if start <= stop else range(start, stop - 1, -step)
-    if len(values) > MAX_BRACES:
+    if abs(stop - start) // step + 1 > MAX_BRACES:
         return ["*"]
+    values = range(start, stop + 1, step) if start <= stop else range(start, stop - 1, -step)
     return [str(value) if numbers else chr(value) for value in values]
 
 
@@ -409,15 +411,22 @@ def _source_pattern(source):
     return "".join(out)
 
 
+def _bracket_item(match):
+    """[:lower:] becomes a range, [=h=] and [.h.] the character itself."""
+    kind, text = match.group(1), match.group(2)
+    if kind == ":":
+        return POSIX_CLASSES.get(text, "\x00-\U0010ffff")
+    return text
+
+
 def _bracket_classes(pattern):
     """Rewrite bash bracket expressions for fnmatch: [^x] is [!x], [[:lower:]] a range."""
     def classes(match):
         inner = match.group(1)
         if inner.startswith("^"):
             inner = "!" + inner[1:]
-        inner = re.sub(r"\[:([a-z]+):\]", lambda m: POSIX_CLASSES.get(m.group(1), "\x00-\U0010ffff"), inner)
-        return "[" + inner + "]"
-    return re.sub(r"\[((?:\[:[a-z]+:\]|[^\]])+)\]", classes, pattern)
+        return "[" + re.sub(r"\[([:=.])(.*?)\1\]", _bracket_item, inner) + "]"
+    return re.sub(r"\[((?:\[([:=.]).*?\2\]|[^\]])+)\]", classes, pattern)
 
 
 def _program_patterns(source):
@@ -440,6 +449,8 @@ def _program_patterns(source):
 
 def _is_assignment(word):
     name, equals, _ = word.partition("=")
+    if name.endswith("+"):
+        name = name[:-1]    # NAME+=value appends
     return bool(equals) and name.isidentifier()
 
 
@@ -509,47 +520,128 @@ def _python_operand(args):
     return []
 
 
-def _resolved_words(word):
-    """Program words that word becomes with the values assigned to its variables in the command.
+def _active_dollars(body):
+    """For each '$' in a word's source, whether it expands (not quoted with '' or escaped)."""
+    flags, index, quote = [], 0, None
+    while index < len(body):
+        char = body[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            elif char == "$":
+                flags.append(False)
+        elif char == "\\" and index + 1 < len(body):
+            if body[index + 1] == "$":
+                flags.append(False)
+            index += 1
+        elif char == "$":
+            flags.append(True)
+        elif char == '"':
+            quote = None if quote == '"' else '"'
+        elif char == "'" and quote is None:
+            quote = "'"
+        index += 1
+    return flags
+
+
+def _trim(value, operator, pattern):
+    """${NAME%pattern} and friends on a known value."""
+    lengths = range(len(value) + 1)
+    if operator in ("%", "%%"):
+        cuts = [n for n in lengths if fnmatchcase(value[len(value) - n:], pattern)]
+        if not cuts:
+            return value
+        cut = min(cuts) if operator == "%" else max(cuts)
+        return value[:len(value) - cut]
+    cuts = [n for n in lengths if fnmatchcase(value[:n], pattern)]
+    if not cuts:
+        return value
+    return value[min(cuts) if operator == "#" else max(cuts):]
+
+
+def _parameter_values(name, operation):
+    """Possible results of $NAME or ${NAME<operation>}; '*' for a part that cannot be known.
+
+    None when nothing is known about NAME and the operation adds nothing.
+    """
+    values = list(dict.fromkeys(_VARIABLES.get(name, ())))
+    if not operation or re.fullmatch(r"[\^,]{1,2}.*|@.", operation):
+        return values or None       # case changes do not matter on a case-insensitive volume
+    match = re.fullmatch(r"(:?[-=?+])(.*)", operation, re.S)
+    if match:
+        if match.group(1).endswith("+"):
+            return [match.group(2), ""]
+        return values + [match.group(2)]
+    match = re.fullmatch(r"(%%|%|##|#)(.*)", operation, re.S)
+    if match:
+        return [_trim(value, match.group(1), match.group(2)) for value in values] or None
+    return ["*"]        # ${NAME/x/y}, ${NAME:1:2} and the like
+
+
+def _resolved_words(word, body=None):
+    """Program words that word may become with the values assigned in the command.
 
     Every value assigned anywhere in the command counts, whatever the order: functions and
     loops run code out of textual order, so a later assignment may be the one in effect.
-    Returns None when there are more than MAX_RESOLVED combinations.
+    Quoted ('$x') and escaped (\\$x) references stay literal. The caller word-splits each
+    result. Returns None when there are more than MAX_RESOLVED combinations.
     """
-    words = [word]
-    for match in VARIABLE_RE.finditer(word):
-        values = _VARIABLES.get(match.group(1) or match.group(2))
-        if not values:
+    flags = _active_dollars(body) if body is not None else []
+    if flags.count(True) + flags.count(False) != word.count("$"):
+        flags = [True] * word.count("$")
+    pieces, results, index, dollar = [], [""], 0, 0
+    while index < len(word):
+        if word[index] != "$":
+            results = [result + word[index] for result in results]
+            index += 1
             continue
-        words = [candidate.replace(match.group(0), value, 1)
-                 for candidate in words for value in dict.fromkeys(values)]
-        if len(words) > MAX_RESOLVED:
+        active, dollar = flags[dollar], dollar + 1
+        stop = _skip_expansion(word, index)
+        text = word[index:stop]
+        values = None
+        if active:
+            match = re.fullmatch(r"\$([A-Za-z_][A-Za-z0-9_]*)|\$\{([A-Za-z_][A-Za-z0-9_]*)(.*)\}", text, re.S)
+            if match:
+                values = _parameter_values(match.group(1) or match.group(2), match.group(3) or "")
+        if values is None:
+            values = [text]
+        results = [result + value for result in results for value in values]
+        if len(results) > MAX_RESOLVED:
             return None
-    return [candidate for candidate in words if candidate != word]
+        index = stop
+    return [result for result in dict.fromkeys(results) if result != word]
 
 
 def _record_variables(commands):
-    """Remember NAME=value words (export and local included) and for NAME in words loops."""
+    """Remember NAME=value and NAME+=value words (export and local included) and for loops."""
     for words, _bodies, _terminator in commands:
         for index, word in enumerate(words):
             if _is_assignment(word):
                 name, _, value = word.partition("=")
-                _VARIABLES.setdefault(name, []).append(value)
+                if name.endswith("+"):
+                    name = name[:-1]
+                    value_list = [old + value for old in _VARIABLES.get(name, [""])]
+                else:
+                    value_list = [value]
+                _VARIABLES.setdefault(name, []).extend(value_list)
             elif word == "for" and index + 2 < len(words) and words[index + 2] == "in":
                 _VARIABLES.setdefault(words[index + 1], []).extend(words[index + 3:])
 
 
 def _check_program(program_word, program_body, args, arg_bodies, via_xargs, terminator, depth,
-                   resolve=True):
+                   resolve=MAX_DEPTH):
     """Apply the iwb, install-intake.sh, launchctl and launcher rules to one program."""
     if resolve:
         # cmd=./install-intake.sh; "$cmd": check the program the variable was given too.
-        candidates = _resolved_words(program_word)
+        candidates = _resolved_words(program_word, program_body)
         if candidates is None:
             return TOO_MANY_MESSAGE.format(word=program_word)
         for candidate in candidates:
-            message = _check_program(candidate, candidate, args, arg_bodies, via_xargs,
-                                     terminator, depth, resolve=False)
+            fields = candidate.split()      # an unquoted $cmd is split into words
+            if not fields:
+                continue
+            message = _check_program(fields[0], fields[0], fields[1:] + args, fields[1:] + arg_bodies,
+                                     via_xargs, terminator, depth, resolve=resolve - 1)
             if message:
                 return message
     program = _basename(program_word)
@@ -625,6 +717,24 @@ def _check_program_pattern(program_source, args):
     return None
 
 
+def _check_expanded_launcher(words, bodies, terminator, depth):
+    """ba{s..s}h -c '...', su?o ./iwb tick: check the command with each launcher the name may be."""
+    source = bodies[0]
+    if not any(ch in source for ch in EXPANSION_CHARS):
+        return None
+    patterns = _program_patterns(source)
+    if patterns is None:
+        return TOO_MANY_MESSAGE.format(word=words[0])
+    if all(set(pattern) <= set("*?") for pattern in patterns):
+        return None     # $cmd: could be any program; resolved values are checked above
+    for name in LAUNCHERS:
+        if any(fnmatchcase(name, pattern) for pattern in patterns):
+            message = check_simple([name] + words[1:], [name] + bodies[1:], terminator, depth + 1)
+            if message:
+                return message
+    return None
+
+
 def check_simple(words, bodies, terminator, depth):
     """Return a block message for one simple command, or None."""
     if depth > MAX_DEPTH:
@@ -676,15 +786,20 @@ def check_simple(words, bodies, terminator, depth):
     words, bodies = words[index:], bodies[index:]
     if not words:
         return None
-    candidates = _resolved_words(words[0])
+    candidates = _resolved_words(words[0], bodies[0])
     if candidates is None:
         return TOO_MANY_MESSAGE.format(word=words[0])
     for candidate in candidates:
         # S=bash; "$S" -c '...': check the command with the assigned program too.
-        message = check_simple([candidate] + words[1:], [candidate] + bodies[1:], terminator,
-                               depth + 1)
+        fields = candidate.split()      # an unquoted $cmd is split into words
+        if not fields:
+            continue
+        message = check_simple(fields + words[1:], fields + bodies[1:], terminator, depth + 1)
         if message:
             return message
+    message = _check_expanded_launcher(words, bodies, terminator, depth)
+    if message:
+        return message
     program, program_body = _basename(words[0]), bodies[0]
     args, arg_bodies = words[1:], bodies[1:]
 
@@ -757,7 +872,10 @@ def check_pre(payload):
     if tool == "Bash":
         command = tool_input.get("command")
         if isinstance(command, str):
-            message = check_command(command)
+            try:
+                message = check_command(command)
+            except Exception as error:     # fail closed: a crash must not let the command run
+                message = PARSE_MESSAGE.format(reason=f"internal error: {type(error).__name__}")
             if message:
                 return 2, message
     return 0, ""

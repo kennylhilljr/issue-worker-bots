@@ -295,6 +295,14 @@ class LiveCommands(unittest.TestCase):
         "; ".join("v=/bin/echo%d" % n for n in range(20)) + '; v=./install-intake.sh; "$v"',
         # functions run later than their text: every value assigned in the command counts
         'f() { "$c"; }; c=./install-intake.sh; f',
+        # expanded launcher names, parameter operators, word splitting, += and bracket forms
+        "ba{s..s}h -c './iwb tick'", "e{v..v}al './iwb tick'", "su?o ./iwb tick", "ba?h install-intake.sh",
+        'cmd=; "${cmd:-./install-intake.sh}"', 'cmd=x; "${cmd:+./install-intake.sh}"',
+        'cmd=./install-intake.shx; "${cmd%x}"', 'cmd=x./install-intake.sh; "${cmd#x}"',
+        '"${unset_name:-./install-intake.sh}"', 'cmd="./install-intake.sh extra"; $cmd',
+        'cmd=./install-intake.; cmd+=sh; "$cmd"', 'a=./install-intake.sh; b=$a; "$b"',
+        "./install-intake.s[[=h=]]", "./install-intake.s[[.h.]]",
+        "./{install-intake.sh,{0..9223372036854775808}}",
     )
 
     ALLOWED = (
@@ -341,6 +349,9 @@ class LiveCommands(unittest.TestCase):
         "./install-intake.s[x]", "./install-intake.s{x..z}", '"./install-intake.s?"',
         "./install-intake.s\\?", "'./install-*'", "./install-intake.s[^h]",
         'cmd=/bin/echo; "$cmd" ok',
+        "cmd=./install-intake.sh; echo '$cmd'", "cmd=./install-intake.sh; '$cmd'",
+        "cmd=./install-intake.sh; \\$cmd", "ba?h -c 'echo ok'", '"${PY:-python3}" -m unittest',
+        'L=launchctl; "${L:-x}" list',
     )
 
     def setUp(self):
