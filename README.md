@@ -244,7 +244,7 @@ Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bo
 - **When a scan is due.** The state file keeps `state["_scan"][repo] = {at, failed_at, next_eligible_at}`. The first rule that applies wins:
   1. With `--force`, the scan always runs.
   2. After a clone or model failure, `failed_at` makes the next scan, scheduled or by hand, wait one hour.
-  3. Two unusable answers in a row set `next_eligible_at` one interval ahead. Scheduled scans wait for it; `iwb scan` by hand does not.
+  3. Two unusable answers in the same run set `next_eligible_at` one interval ahead. Scheduled scans wait for it; `iwb scan` by hand does not.
   4. Otherwise a scheduled scan waits the interval after `at`, the last usable scan.
 - **Read-only.** The worker bots take turns. Claude runs with only `Read Grep Glob` and no MCP servers (`--strict-mcp-config`). Codex runs with `-s read-only`. Both run in `iwb`'s own clone, which is removed afterwards.
 - **What is kept.** Only findings with confidence at least 80. When two findings share a fingerprint, the one with the highest confidence is kept.
