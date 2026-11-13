@@ -1730,6 +1730,227 @@ class ScanRules(unittest.TestCase):
         self.assertEqual([x["title"] for x in iwb.filter_findings([f(float("nan"), "a"), f(90, "a")])], ["a90"])
 
 
+class Scan(unittest.TestCase):
+    """scan_repo with clone and run_cli faked: the read-only boundary, the state record and no GitHub writes."""
+    REPO = "o/r"
+    GOOD = ScanRules.GOOD
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = {k: getattr(iwb, k) for k in ("STATE", "CONFIG", "clone", "run_cli", "run_gh_as", "post")}
+        self.saved_attention = iwb.prbot.openclaw_attention
+        iwb.STATE = Path(self.tmp.name, "state.json")
+        iwb.CONFIG = Path(self.tmp.name, "config.json")
+        iwb.CONFIG.write_text(json.dumps({"scan_repos": [self.REPO]}))
+        self.writes, self.clones, self.cmds, self.answers = [], [], [], []
+        iwb.run_gh_as = lambda *a, **k: self.writes.append(("run_gh_as", a))
+        iwb.post = lambda *a, **k: self.writes.append(("post", a))
+        iwb.prbot.openclaw_attention = lambda *a, **k: self.writes.append(("openclaw_attention", a))
+
+        def fake_clone(repo, bot):
+            d = tempfile.mkdtemp(dir=self.tmp.name)
+            os.mkdir(os.path.join(d, "repo"))
+            self.clones.append(d)
+            return d, "main", "abc123def456"
+        iwb.clone = fake_clone
+
+        def fake_cli(cmd, stdin, cwd=None, timeout=None):
+            self.cmds.append(cmd)
+            a = self.answers.pop(0) if self.answers else self.good()
+            if isinstance(a, BaseException):
+                raise a
+            if cmd[0] == "codex":
+                Path(cmd[cmd.index("-o") + 1]).write_text(a)
+            return 0, a, ""
+        iwb.run_cli = fake_cli
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(iwb, k, v)
+        iwb.prbot.openclaw_attention = self.saved_attention
+        self.tmp.cleanup()
+
+    def good(self, *findings):
+        return "```json\n" + json.dumps({"findings": list(findings or [self.GOOD])}) + "\n```\n"
+
+    def scan(self, **kw):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = iwb.scan_repo(self.REPO, **kw)
+        return code, out.getvalue()
+
+    def seed(self, **record):
+        iwb.STATE.write_text(json.dumps({"_scan": {self.REPO: record}}))
+
+    def record(self):
+        return json.loads(iwb.STATE.read_text())["_scan"][self.REPO]
+
+    def left(self):
+        return [d for d in self.clones if os.path.exists(d)]
+
+    def test_readonly_argv(self):
+        self.scan(force=True)
+        self.scan(force=True)
+        self.scan(force=True)
+        self.assertEqual([c[0] for c in self.cmds], ["claude", "codex", "claude"])
+        claude, codex = self.cmds[0], self.cmds[1]
+        self.assertEqual(claude[claude.index("--allowedTools") + 1], "Read Grep Glob")
+        denied = claude[claude.index("--disallowedTools") + 1].split()
+        for tool in ("Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"):
+            self.assertIn(tool, denied)
+        self.assertIn("--strict-mcp-config", claude)
+        self.assertNotIn("--mcp-config", claude)
+        self.assertIn(["-s", "read-only"], [codex[i:i + 2] for i in range(len(codex) - 1)])
+        self.assertEqual(json.loads(iwb.STATE.read_text())["_last_scan_agent"], "claude")
+
+    def test_prompt_categories(self):
+        self.scan(force=True)
+        prompt = self.cmds[0][self.cmds[0].index("-p") + 1].lower()
+        for phrase in ("stale docs and comments that no longer match the code", "behavior with no test",
+                       "tests that would pass whether or not the code works", "dead code", "unused config",
+                       "missing ci checks", "the test command not running on prs",
+                       "outdated or vulnerable dependencies the repo declares", "agent setup", "agents.md",
+                       "claude.md", "hooks", "test or lint commands an agent can't find", "every improvement",
+                       "large or small", "fingerprint", "confidence", "root_cause"):
+            self.assertIn(phrase, prompt)
+        self.assertNotIn("review findings", prompt)
+        self.assertIn(self.REPO, prompt)
+
+    def test_cli_start_failure_is_transient(self):
+        for error in (FileNotFoundError("claude"), RuntimeError("claude timed out")):
+            with self.subTest(type(error).__name__):
+                self.seed(at=100)
+                self.answers = [error]
+                code, _ = self.scan(force=True)
+                self.assertEqual(code, 1)
+                self.assertEqual(self.record()["at"], 100)
+                self.assertAlmostEqual(self.record()["failed_at"], time.time(), delta=60)
+                self.assertEqual(self.left(), [])
+
+    def test_clone_failure_is_transient(self):
+        self.seed(at=100)
+        def broken(repo, bot):
+            raise iwb.subprocess.CalledProcessError(128, ["git", "clone"])
+        iwb.clone = broken
+        code, _ = self.scan(force=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.record()["at"], 100)
+        self.assertIn("failed_at", self.record())
+        self.assertEqual(self.cmds, [])
+
+    def test_manual_waits_out_backoff(self):
+        self.seed(at=100, failed_at=time.time() - 60)
+        self.assertEqual(self.scan(manual=True)[0], 0)
+        self.assertEqual(self.cmds, [])
+        self.seed(at=100, failed_at=time.time() - iwb.RETRY_AFTER - 1)
+        self.scan(manual=True)
+        self.assertEqual(len(self.cmds), 1)
+        self.assertNotIn("failed_at", self.record())
+
+    def test_manual_bypasses_interval_and_next_eligible(self):
+        now = time.time()
+        self.seed(at=now - 60)
+        self.scan(manual=True)
+        self.seed(at=now - 60, next_eligible_at=now + 86400)
+        self.scan(manual=True)
+        self.assertEqual(len(self.cmds), 2)
+        self.assertNotIn("next_eligible_at", self.record())
+
+    def test_force_bypasses_backoff(self):
+        now = time.time()
+        self.seed(at=now - 60, failed_at=now - 60, next_eligible_at=now + 86400)
+        self.scan(force=True)
+        self.assertEqual(len(self.cmds), 1)
+        self.assertEqual(set(self.record()), {"at"})
+
+    def test_scheduled_respects_next_eligible(self):
+        now = time.time()
+        self.seed(at=now - 30 * 86400, next_eligible_at=now + 86400)
+        self.scan()
+        self.seed(at=now - 60)
+        self.scan()
+        self.assertEqual(self.cmds, [])
+        self.seed(at=now - 30 * 86400, next_eligible_at=now - 1)
+        self.scan()
+        self.assertEqual(len(self.cmds), 1)
+
+    def test_interval_from_config(self):
+        now = time.time()
+        iwb.CONFIG.write_text(json.dumps({"scan_repos": [self.REPO], "scan_interval_days": 1}))
+        self.seed(at=now - 2 * 86400)
+        self.scan()
+        self.assertEqual(len(self.cmds), 1)
+        self.answers = ["no json", "no json"]
+        self.scan(force=True)
+        self.assertAlmostEqual(self.record()["next_eligible_at"], time.time() + 86400, delta=60)
+
+    def test_unusable_twice(self):
+        self.seed(at=100, failed_at=time.time() - iwb.RETRY_AFTER - 1)
+        self.answers = ["no json", "```json\n{\"findings\": \"x\"}\n```"]
+        code, out = self.scan()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.cmds), 2)
+        self.assertEqual(out.count("unusable"), 1)
+        r = self.record()
+        self.assertNotIn("failed_at", r)
+        self.assertEqual(r["at"], 100)
+        self.assertAlmostEqual(r["next_eligible_at"], time.time() + iwb.SCAN_INTERVAL_DAYS * 86400, delta=60)
+        self.assertEqual(self.left(), [])
+
+    def test_unusable_then_good(self):
+        self.seed(at=100, next_eligible_at=time.time() + 86400)
+        self.answers = ["no json", self.good()]
+        code, out = self.scan(manual=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.cmds), 2)
+        self.assertNotIn("unusable", out)
+        self.assertAlmostEqual(self.record()["at"], time.time(), delta=60)
+        self.assertNotIn("next_eligible_at", self.record())
+
+    def test_paused_runs_no_model(self):
+        iwb.CONFIG.write_text(json.dumps({"scan_repos": [self.REPO], "paused": True}))
+        for kw in ({}, {"manual": True}, {"force": True}, {"force": True, "dry_run": True}):
+            with self.subTest(**kw):
+                code, out = self.scan(**kw)
+                self.assertEqual(code, 0)
+                self.assertIn("paused in config.json; no scan", out)
+        self.assertEqual(self.clones, [])
+        self.assertEqual(self.cmds, [])
+        self.assertFalse(iwb.STATE.exists())
+
+    def test_kept_findings_logged(self):
+        low = dict(self.GOOD, confidence=60, fingerprint="dead-code:a.py:x", title="low")
+        dup = dict(self.GOOD, confidence=85, title="dup")
+        self.answers = [self.good(low, dup, self.GOOD)]
+        _, out = self.scan(force=True)
+        lines = [l for l in out.splitlines() if "stale-docs:README.md:install" in l]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("90 stale-docs:README.md:install t", lines[0])
+        self.assertNotIn("dead-code:a.py:x", out)
+
+    def test_no_github_writes(self):
+        self.scan()
+        self.scan(manual=True)
+        self.scan(force=True)
+        before = iwb.STATE.read_text()
+        code, out = self.scan(manual=True, dry_run=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.cmds), 4)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(iwb.STATE.read_text(), before)
+        start = out.index("[")
+        self.assertEqual(json.loads(out[start:out.rindex("]") + 1]), [self.GOOD])
+
+    def test_clone_removed(self):
+        self.scan(force=True)
+        self.answers = [RuntimeError("down")]
+        self.scan(force=True)
+        self.answers = ["no json", "no json"]
+        self.scan(force=True)
+        self.assertEqual(len(self.clones), 3)
+        self.assertEqual(self.left(), [])
+
+
 class RedCheckSandbox(unittest.TestCase):
     def setUp(self):
         need_sandbox_exec(self)
