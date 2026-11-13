@@ -823,6 +823,129 @@ class Analyze(unittest.TestCase):
         self.assertEqual(len(self.comments_posted()), 1)
         self.assertNotIn("running yet", self.comments_posted()[0])
 
+    def revise_pending_thread(self):
+        """The ecc-customization#22 thread: picked up, a plan, then "Plan needs changes" from the review bot."""
+        self.plan_first()
+        p = iwb.prbot
+        p.load_config = lambda: {"claude-dev": {"owner": OWNER, "slug": "claude-dev-gh"},
+                                 "codex-dev": {"owner": OWNER, "slug": "codex-dev-gh"},
+                                 "codex": {"owner": OWNER, "slug": "codex-pr-gh"}}
+        state = json.loads(iwb.STATE.read_text())
+        e = state[self.KEY]
+        e["analysis"]["at"] -= 120                              # the plan, then the review a minute later
+        e["plan_at"] = e["analysis"]["at"]
+        e["approval"] = {"verdict": "revise", "source_digest": "d", "at": e["analysis"]["at"] + 60,
+                         "comment": "https://x/review"}   # what cmd_approve stores when it sends a plan back
+        e["review_revisions"], e["lint_revisions"], e["replan"] = 1, 1, True
+        self.plan_file = e["plan_file"]
+        iwb.STATE.write_text(json.dumps(state))
+        self.comments = [
+            {"user": "claude-dev-gh[bot]", "at": "2026-11-06T06:17:44Z",
+             "body": "<!-- iwb:picked-up -->\nPicked up by `claude-dev-gh`. Queued for analysis."},
+            {"user": "claude-dev-gh[bot]", "at": "2026-11-06T07:03:47Z",
+             "body": "<!-- iwb:analysis -->\n### Plan from `claude-dev-gh`\n\n_Analysis by `opus`._\n\nAdd hooks."},
+            {"user": "codex-pr-gh[bot]", "at": "2026-11-06T07:05:03Z",
+             "body": "<!-- iwb:approval -->\n### Plan needs changes by `codex-pr-gh`\n\nThe guard is too loose."}]
+        self.full_prompts = []
+        fake = iwb.run_model
+
+        def model(agent, prompt, stdin, cwd):
+            self.full_prompts.append(prompt)
+            return fake(agent, prompt, stdin, cwd)
+        iwb.run_model = model
+
+    def test_no_change_is_refused_while_a_plan_revision_is_pending(self):
+        # real case: ecc-customization#22 answered "No code change" to codex-pr-gh's "Plan needs changes" and
+        # dropped out of the pipeline for six days
+        self.revise_pending_thread()
+        bot_thread = "This is an automated plan/review discussion thread between bots; no action is needed."
+        self.answers = [answer({"decision": "no_change", "summary": bot_thread})]
+        self.run_pass()
+        self.assertNotIn("bot:no-code", [label for _, label, _ in self.posts])
+        self.assertEqual(len(self.prompts), 1 + 1)
+        self.assertIn("Plan needs changes by `codex-pr-gh`", self.prompts[-1])     # the review reached the planner
+        self.assertIn("no_change is not allowed here", self.full_prompts[-1])
+        self.assertIn("pipeline's own history for this same issue", self.full_prompts[-1])
+        e = self.state()
+        self.assertEqual(e["analysis"]["decision"], "plan")      # still the plan awaiting revision
+        self.assertTrue(e["replan"])                             # stays in analysis: the next pass asks again
+        self.assertNotIn("blocked", e)
+        self.assertEqual(len(self.posts), 1)                     # only the original plan was ever posted
+        self.answers = [answer({"decision": "no_change", "summary": bot_thread})]
+        self.run_pass()                                          # second refusal: hand it to Kenny
+        self.assertEqual([label for _, label, _ in self.posts], ["bot:planned", "bot:needs-kenny"])
+        self.assertIn("remove `bot:needs-kenny`", self.posts[-1][2])
+        self.assertEqual(self.events[-1][0], "needs-kenny: kennylhilljr/demo#1")
+        self.assertIs(self.state()["blocked"], True)
+        self.issue["labels"] = ["bot:needs-kenny"]
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 3)                   # skipped while Kenny has it
+        self.issue["labels"] = []
+        self.answers = [answer({"decision": "no_change", "summary": bot_thread})]
+        self.run_pass()                                          # label removed: analysis again, still guarded
+        self.assertEqual(len(self.prompts), 4)
+        self.assertNotIn("blocked", self.state())
+        self.assertNotIn("blocked_label", self.state())
+        self.assertEqual(self.state()["review_revisions"], 1)   # the reviewer's one send-back stays spent
+        self.assertEqual(self.state()["lint_revisions"], 1)
+        self.assertEqual(self.state()["plan_file"], self.plan_file)
+        self.assertIn("no_change is not allowed here", self.full_prompts[-1])
+        self.assertNotIn("bot:no-code", [label for _, label, _ in self.posts])
+        self.answers = [answer({"decision": "plan", "summary": "v2", "units": [unit()]})]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:planned")
+        self.assertFalse(iwb.revision_pending(self.state()))
+
+    def test_questions_in_between_keep_the_revision_pending(self):
+        self.revise_pending_thread()
+        self.answers = [answer({"decision": "questions", "summary": "?", "questions": ["Tier 2 for all units?"]})]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:needs-info")
+        self.assertTrue(iwb.revision_pending(self.state()))      # questions are not a revised plan
+        self.comments.append({"user": OWNER, "body": "Yes, tier 2.", "at": self.later()})
+        self.answers = [answer({"decision": "no_change", "summary": "The bots are discussing it."})]
+        self.run_pass()
+        self.assertNotIn("bot:no-code", [label for _, label, _ in self.posts])
+        self.assertIn("no_change is not allowed here", self.full_prompts[-1])
+        self.assertEqual(self.state()["analysis"]["decision"], "questions")
+
+    def test_legacy_entry_keeps_its_newer_plan_when_questions_replace_it(self):
+        self.plan_first()                                        # an entry from before plan_at: revise, then v2
+        state = json.loads(iwb.STATE.read_text())
+        e = state[self.KEY]
+        del e["plan_at"]
+        e["approval"] = {"verdict": "revise", "source_digest": "d", "at": e["analysis"]["at"] - 60}
+        iwb.STATE.write_text(json.dumps(state))
+        self.comments = [{"user": OWNER, "body": "Which uploads?", "at": self.later()}]
+        self.answers = [answer({"decision": "questions", "summary": "?", "questions": ["Which?"]})]
+        self.run_pass()
+        self.assertFalse(iwb.revision_pending(self.state()))     # the plan's time survived the questions
+        self.comments.append({"user": OWNER, "body": "None, it's done already.", "at": self.later(2)})
+        self.answers = [answer({"decision": "no_change", "summary": "Already done."})]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:no-code")
+
+    def test_entry_from_before_plan_at_still_counts_its_plan(self):
+        e = {"analysis": {"decision": "plan", "at": 100}, "approval": {"verdict": "revise", "at": 160}}
+        self.assertTrue(iwb.revision_pending(e))
+        self.assertFalse(iwb.revision_pending({**e, "approval": {"verdict": "approve", "at": 160}}))
+        self.assertFalse(iwb.revision_pending({**e, "approval": {"verdict": "revise", "at": 50}}))
+        self.assertFalse(iwb.revision_pending({"analysis": {"decision": "no_change", "at": 100}}))
+
+    def test_revised_plan_clears_the_pending_revision(self):
+        self.revise_pending_thread()
+        self.answers = [answer({"decision": "plan", "summary": "v2", "units": [unit(), unit("tier2")]})]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:planned")
+        e = self.state()
+        self.assertNotIn("replan", e)
+        self.assertFalse(iwb.revision_pending(e))
+        self.comments.append({"user": OWNER, "body": "Never mind, this is already done.", "at": self.later()})
+        self.answers = [answer({"decision": "no_change", "summary": "Already done."})]
+        self.run_pass()                                          # no revision pending: no-code is an answer again
+        self.assertEqual(self.posts[-1][1], "bot:no-code")
+        self.assertNotIn("no_change is not allowed", self.full_prompts[-1])
+
     def test_feedback_after_a_plan_revises_it(self):
         self.plan_first()
         self.comments = [{"user": OWNER, "body": "Also update the CHANGELOG.", "at": self.later()}]

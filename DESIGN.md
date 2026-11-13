@@ -82,7 +82,7 @@ A launchd job, like the review watcher, checks every 5 minutes for issues that q
 
 The strongest model reads the issue, the repository and recent history, read-only, and returns exactly one of:
 
-- **No code change.** The issue is a question, already done, or not a change to this repository. The bot says why and labels it `bot:no-code`.
+- **No code change.** The issue is a question, already done, or not a change to this repository. The bot says why and labels it `bot:no-code`. This answer is not allowed while a plan revision is pending (the latest approval comment says "Plan needs changes" and no newer plan exists): the planner and review bots' comments are this issue's own pipeline history, so the analysis must revise the plan or ask questions. A no-code answer then counts as an unusable answer; when the tries run out the issue gets `bot:needs-kenny`, and removing that label retries from analysis.
 - **Questions.** The issue is ambiguous. The questions go through agentic clarification first (step 3); whatever is left is posted, the issue is labeled `bot:needs-info`, and a reply from Kenny restarts analysis.
 - **A plan.** An orchestrator plan document: units, the files each unit may touch, acceptance commands that prove it done, declared traits (`mechanical`, `security`, `database` and so on), and dependencies between units.
 
