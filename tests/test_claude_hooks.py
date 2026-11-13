@@ -244,6 +244,8 @@ class LiveCommands(unittest.TestCase):
         "python3 -m trace --ignore-dir /usr iwb tick",
         "python3 -m trace --trace iwb tick", "python3 -m trace --count iwb tick",
         "python3 -m cProfile -- iwb tick",
+        "python3 -m trace -c iwb tick", "python3 -m trace -s iwb tick",
+        "python3 -m trace --ignore-d /usr iwb tick", "python3 -m cProfile --out x iwb tick",
     )
 
     ALLOWED = (

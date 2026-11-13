@@ -58,8 +58,7 @@ LAUNCHCTL_READ_ONLY = ("list", "print", "print-cache", "print-disabled", "blame"
 IWB_SUBCOMMANDS = ("tick", "intake", "analyze", "approve", "code")
 # python -m modules whose first operand is a script they run.
 SCRIPT_RUNNING_MODULES = ("cProfile", "profile", "pdb", "trace")
-MODULE_VALUE_OPTIONS = ("-o", "-s", "-c", "-f", "-C", "--outfile", "--sort", "--command", "--file",
-                        "--coverdir", "--ignore-module", "--ignore-dir")
+GUARDED_PROGRAMS = ("iwb", "install-intake.sh", "launchctl")
 EXPANSION_CHARS = "$`{*?["
 
 IWB_MESSAGE = ("Blocked: iwb {sub} runs the live pipeline from this checkout (launchd owns it). "
@@ -299,13 +298,13 @@ def _python_operand(args):
                     module = arg[position + 1:] or (args[index + 1] if index + 1 < len(args) else "")
                     if module not in SCRIPT_RUNNING_MODULES:
                         return None     # a module, not a script path
+                    # Their own options vary (and argparse accepts abbreviations), so the
+                    # script is taken to be the first later word that names a guarded program.
                     rest = index + (1 if arg[position + 1:] else 2)
-                    while rest < len(args) and args[rest].startswith("-"):
-                        if args[rest] == "--":
-                            rest += 1
-                            break
-                        rest += 2 if args[rest] in MODULE_VALUE_OPTIONS else 1
-                    return rest if rest < len(args) else None
+                    for candidate in range(rest, len(args)):
+                        if _basename(args[candidate]) in GUARDED_PROGRAMS:
+                            return candidate
+                    return None
                 if flag == "c":
                     return None     # inline code
                 if flag in "WX":
