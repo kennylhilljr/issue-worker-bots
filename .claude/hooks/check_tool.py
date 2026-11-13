@@ -721,12 +721,14 @@ def _may_name_iwb(source):
     './scripts/*.py' cannot name iwb, './i*b' and './iw?' can. Anything harder to follow
     counts as may: a $ or ` expansion (its value may hold a slash or be split into words), a
     zsh = prefix, a tilde, bash extglob or zsh alternation, zsh extendedglob (^x, x~y, x#),
-    or too many brace names.
+    zsh braceccl ({wx} as [wx]), or too many brace names.
     """
     if source[:1] == "=" or any(ch in source for ch in "()|^~#") or _has_active_expansion(source):
         return True
     patterns = _program_patterns(source)
-    return patterns is None or any(fnmatchcase("iwb", pattern) for pattern in patterns)
+    return patterns is None or any(
+        fnmatchcase("iwb", candidate) for pattern in patterns
+        for candidate in (pattern, pattern.replace("{", "[").replace("}", "]")))
 
 
 def _check_program_pattern(program_source, args):
