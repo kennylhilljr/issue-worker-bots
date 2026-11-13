@@ -239,6 +239,9 @@ class LiveCommands(unittest.TestCase):
         "/usr/bin/time -o out ./iwb tick", "env --unset X ./iwb tick", "env --chdir /tmp ./iwb tick",
         "bash --rcfile F -c './iwb tick'", "python3 --check-hash-based-pycs always iwb tick",
         "python3 -m cProfile iwb tick", "python3 -m pdb iwb tick", "echo 'load x' | launchctl",
+        "bash -euo pipefail -c './iwb tick'", "bash -eo pipefail -c './iwb tick'",
+        "bash -euo pipefail install-intake.sh", "env - ./iwb tick", "env -iS './iwb tick'",
+        "python3 -m trace --ignore-dir /usr iwb tick",
     )
 
     ALLOWED = (
@@ -269,7 +272,7 @@ class LiveCommands(unittest.TestCase):
         "python3 -Wignore::DeprecationWarning -m unittest discover -s tests",
         "if true; then echo ok; fi", "env FOO=1 git status", "for f in tests/*.py; do wc -l $f; done",        '[ "$1" = approve ]', 'if [ "$m" = code ]; then echo ok; fi', '[[ $x = tick ]]',
         'echo "$(git status --short)"', "echo $((1 + 2))",
-        "python3 - <<'EOF'\nprint(1)\nEOF",
+        "python3 - <<'EOF'\nprint(1)\nEOF",        "bash -euo pipefail -c 'echo ok'",
     )
 
     def setUp(self):

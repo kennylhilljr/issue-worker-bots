@@ -273,7 +273,8 @@ def _shell_command_string(args):
                 has_c = True
             if arg[0] == "-" and "s" in arg[1:]:
                 reads_stdin = True
-            index += 1
+            # -euo pipefail: a cluster ending in o/O takes the next word as its value
+            index += 2 if arg[-1] in "oO" else 1
             continue
         break
     return has_c, reads_stdin, index
@@ -298,7 +299,9 @@ def _python_operand(args):
                         return None     # a module, not a script path
                     rest = index + (1 if arg[position + 1:] else 2)
                     while rest < len(args) and args[rest].startswith("-"):
-                        rest += 2 if args[rest] in ("-o", "-s", "-c") else 1
+                        takes_value = args[rest] in ("-o", "-s", "-c") or (
+                            args[rest].startswith("--") and "=" not in args[rest])
+                        rest += 2 if takes_value else 1
                     return rest if rest < len(args) else None
                 if flag == "c":
                     return None     # inline code
@@ -379,6 +382,13 @@ def check_simple(words, bodies, terminator, depth):
                 while index < len(words) and words[index].startswith("-"):
                     index += 2 if words[index] in WRAPPER_VALUE_OPTIONS[base] else 1
                 return check_command(" ".join(words[index:]), depth + 1)  # watch runs sh -c
+        elif wrapper == "env" and word == "-":
+            index += 1      # env - is the old spelling of env -i
+        elif wrapper == "env" and not word.startswith("--") and word.startswith("-") and "S" in word:
+            # env -iS '...': the S flag's value is the rest of the word or the next word
+            value = word[word.index("S") + 1:]
+            rest = ([value] if value else []) + words[index + 1:]
+            return check_command(" ".join(rest), depth + 1)
         elif wrapper == "env" and (word.startswith("-S") or word.startswith("--split-string")):
             # env -S runs its value as a command line, followed by the remaining words.
             if word in ("-S", "--split-string"):
