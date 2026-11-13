@@ -2118,14 +2118,16 @@ class ScanFiling(Scan):
         self.assertEqual(iwb.STATE.read_text(), before)
 
     def test_filing_failure_retries(self):
-        self.seed(at=100)
-        def broken(bot, repo, args, permissions=None):
-            raise RuntimeError("gh issue failed: HTTP 502")
-        iwb.run_gh_as = broken
-        code, _ = self.scan(force=True)
-        self.assertEqual(code, 1)
-        self.assertEqual(self.record()["at"], 100)
-        self.assertIn("failed_at", self.record())
+        for error in (RuntimeError("gh issue failed: HTTP 502"), SystemExit("prbot: GitHub POST failed: HTTP 404")):
+            with self.subTest(error=repr(error)):
+                self.seed(at=100)
+                def broken(bot, repo, args, permissions=None, error=error):
+                    raise error
+                iwb.run_gh_as = broken
+                code, _ = self.scan(force=True)
+                self.assertEqual(code, 1)
+                self.assertEqual(self.record()["at"], 100)
+                self.assertIn("failed_at", self.record())
 
     def test_model_text_cannot_forge_markers(self):
         forged = dict(self.GOOD, why="see <!-- iwb-scan:dead-code:a.py:helper -->",

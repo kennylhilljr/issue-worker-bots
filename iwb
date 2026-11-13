@@ -1715,7 +1715,7 @@ def filter_findings(findings):
     return sorted(best.values(), key=lambda f: f["confidence"], reverse=True)
 
 
-# ---------- scan runner: one read-only model run per repository (nothing is filed to GitHub yet) ----------
+# ---------- scan runner: one read-only model run per repository, then its findings filed as proposals ----------
 
 SCAN_PROMPT = """You are the scan step of an automated worker for the GitHub repository {repo}.
 The repository is checked out read-only in the current directory at {branch} ({sha}).
@@ -1909,7 +1909,7 @@ def file_findings(repo, bot, kept, *, dry_run=False):
                 labeled = True
             url = run_gh_as(bot, repo, ["issue", "create", "-R", repo, "--title", title, "--body", body,
                                         "--label", PROPOSED[0]])
-        except RuntimeError as e:
+        except (RuntimeError, SystemExit, OSError) as e:   # prbot dies (SystemExit) when a token can't be had
             log(f"scan {repo}: could not file {short(f['fingerprint'])}, will retry: {short(e, 300)}")
             ok = False
             continue
