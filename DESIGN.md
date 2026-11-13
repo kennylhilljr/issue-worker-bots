@@ -230,6 +230,7 @@ Two cautions:
 - `state.json` is written atomically (a temporary file in the same folder, then a rename), under a lock (`state.lock` next to it) that every pass holds from reading the file to the rename. Each pass re-reads it just before saving and writes back only the fields it changed in each issue's entry, so a long coding run never overwrites what another pass recorded meanwhile, even on the same issue. A state file that isn't a JSON object, read again while holding `state.lock` so a good file another pass just wrote is never mistaken for it, is moved aside to `state.json.corrupt-<UTC time>` and the pass starts empty; the hidden pick-up markers keep intake from repeating work. Saved plans are written the same atomic way.
 - The push after a run happens from a new repository `iwb` makes, never from the clone the agents worked in (see "Check and commit" above).
 - The guard hook and the `cross-review` skill already stop agents from posting or pushing as Kenny.
+- In this checkout, a Claude Code hook (`.claude/hooks/check_tool.py`) refuses secret-file edits and commands that run the live pipeline, `install-intake.sh` or launchctl changes, and runs the suite after edits to `iwb` or `tests/`. File and program names compare case-insensitively, like the APFS volume the checkout is on, and program names built by globs, braces or variables are refused when they can name a guarded program. It catches mistakes; it is not a sandbox.
 
 ## Bridge to OpenClaw
 

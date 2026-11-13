@@ -107,6 +107,9 @@ class SecretPaths(unittest.TestCase):
         "keys/id.key",
         "secrets/token.txt",
         "a/secrets/b/c.json",
+        # the checkout's volume is case-insensitive: these are the same files
+        ".ENV", ".Env.local", "server.PEM", "id.KEY", "keys/Id.Key", "Secrets/token.txt",
+        "a/SECRETS/b/c.json",
     )
     ALLOWED = (
         "docs/env.md",
@@ -116,6 +119,7 @@ class SecretPaths(unittest.TestCase):
         "my_secrets/x.txt",
         "notes/pem.txt",
         "iwb",
+        "Secrets.md", "My_Secrets/x.txt", "docs/ENV.md",
     )
     EDIT_TOOLS = ("Write", "Edit", "MultiEdit")
 
@@ -261,6 +265,50 @@ class LiveCommands(unittest.TestCase):
         "python3 -m cProfile ./i*b code --dry-run x/iwb",
     )
 
+    # The checkout's volume is case-insensitive, so ./IWB runs iwb (issue #91).
+    BLOCKED_CASE = (
+        "./IWB tick", "IWB tick", "./Iwb code", "/Users/x/issue-worker-bots/IWB intake",
+        "python3 IWB tick", "Python3 iwb tick", "python3 -m cProfile IWB tick",
+        "LAUNCHCTL load x.plist", "/bin/LaunchCtl bootout gui/501/x", "Launchctl kickstart -k x",
+        "./Install-Intake.sh", "bash INSTALL-INTAKE.SH", ". ./Install-Intake.sh",
+        "BASH -c './iwb tick'", "Bash -c './IWB tick'", "ENV ./IWB tick", "SUDO ./iwb tick",
+        "EVAL ./iwb tick", "XARGS ./iwb < x", "FIND . -exec ./IWB tick \\;",
+    )
+
+    # Program names built by globs, braces or variables (issue #91).
+    BLOCKED_PATTERN = (
+        "./install-intake.s?", "./install-intake.*", "./install-*", "./Install-Intake.S?",
+        "./install-intake.{sh,x}", "./install-intake.$EXT", "./inst*.sh", "bash ./install-intake.s?",
+        "/bin/launchct? load x.plist", "/bin/launch* bootout gui/501/x", "/bin/launchc{tl,x} load x",
+        'cmd=launchctl; "$cmd" load x.plist', "$L bootout gui/501/x", "${L} kickstart -k x",
+        '"$(which launchctl)" load x', "./IW{B,X} tick", "./iwb{,} tick",
+        "./install-intake.s{h..h}", "./install-intake.s[[:lower:]]", "./install-intake.[a-z]h",
+        "/bin/launchct{l..l} load x.plist", "/bin/launchct[!x] load x.plist",
+        # variables assigned in the same command
+        'cmd=./install-intake.sh; "$cmd"', 'cmd=./iwb; sub=tick; "$cmd" "$sub"',
+        'export C=./IWB; $C tick', 'L=/bin/launchctl; "$L" bootshell continue',
+        "L=launchctl; $L stop x", 'S=bash; "$S" -c "./iwb tick"', 'W=sudo; $W ./iwb tick',
+        'c=./install-intake.sh; bash "$c"', 'c=./install-intake.sh; bash -c "$c"',
+        "for c in ./install-intake.sh; do $c; done", 'P=install-intake; ./$P.sh',
+        "./{install-intake.sh,x}{,a}{,b}{,c}{,d}{,e}{,f}{,g}{,h}", "./install-intake.s{g..i}",
+        'cmd=./install-intake.sh; "${cmd:-./fallback}"', 'L=launchctl; ${L%x} load x',
+        "; ".join("v=/bin/echo%d" % n for n in range(20)) + '; v=./install-intake.sh; "$v"',
+        # functions run later than their text: every value assigned in the command counts
+        'f() { "$c"; }; c=./install-intake.sh; f',
+        # expanded launcher names, parameter operators, word splitting, += and bracket forms
+        "ba{s..s}h -c './iwb tick'", "e{v..v}al './iwb tick'", "su?o ./iwb tick", "ba?h install-intake.sh",
+        'cmd=; "${cmd:-./install-intake.sh}"', 'cmd=x; "${cmd:+./install-intake.sh}"',
+        'cmd=./install-intake.shx; "${cmd%x}"', 'cmd=x./install-intake.sh; "${cmd#x}"',
+        '"${unset_name:-./install-intake.sh}"', 'cmd="./install-intake.sh extra"; $cmd',
+        'cmd=./install-intake.; cmd+=sh; "$cmd"', 'a=./install-intake.sh; b=$a; "$b"',
+        "./install-intake.s[[=h=]]", "./install-intake.s[[.h.]]",
+        "./{install-intake.sh,{0..9223372036854775808}}",
+        'cmd=./install-intake.sh; "${cmd/x/y}"', 'cmd=./install-intake.sh; "${cmd:0}"',
+        'cmd=bash; "${cmd%"?"}" -c \'./iwb tick\'', 'cmd=./install-intake.sh; "${cmd%"?"}"',
+        'cmd=./install-intake.sh; $""$cmd', "cmd=./install-intake.sh; $''$cmd",
+        'cmd=./install-intake.sh; $"$cmd"',
+    )
+
     ALLOWED = (
         # help
         "./iwb --help", "./iwb -h", "./iwb",
@@ -291,6 +339,23 @@ class LiveCommands(unittest.TestCase):
         'echo "$(git status --short)"', "echo $((1 + 2))",
         "python3 - <<'EOF'\nprint(1)\nEOF",        "bash -euo pipefail -c 'echo ok'",
         "python3 -m cProfile -o out.prof app.py", "python3 -m pdb tests/test_iwb.py",
+        # case-insensitive names keep their safe forms
+        "./IWB --help", "./IWB analyze --dry-run", "LAUNCHCTL list", "Launchctl print gui/501/x",
+        # expanded program names that cannot be a guarded program, or a read-only call
+        "/bin/launchct? list", '"$PYTHON" -m unittest discover -s tests', "$EDITOR README.md",
+        '"$(git rev-parse --show-toplevel)/scripts/check.py"', "$cmd status", "./*.py",
+        "./scripts/{check,x}.py", "./i?b --help",
+        # ordinary variable programs whose first word is not a launchctl write
+        'GIT=git; "$GIT" config --get user.name', '"$NPM" start', "$X stop", "$X kill 1",
+        "PY=python3; $PY -m unittest discover -s tests", "L=launchctl; $L list",
+        "for f in a b; do echo $f; done", "./tests/test_[a-z]*.py",
+        # quoted, escaped or impossible patterns cannot name a guarded program
+        "./install-intake.s[x]", "./install-intake.s{x..z}", '"./install-intake.s?"',
+        "./install-intake.s\\?", "'./install-*'", "./install-intake.s[^h]",
+        'cmd=/bin/echo; "$cmd" ok',
+        "cmd=./install-intake.sh; echo '$cmd'", "cmd=./install-intake.sh; '$cmd'",
+        "cmd=./install-intake.sh; \\$cmd", "ba?h -c 'echo ok'", '"${PY:-python3}" -m unittest',
+        'L=launchctl; "${L:-x}" list',
     )
 
     def setUp(self):
@@ -312,7 +377,7 @@ class LiveCommands(unittest.TestCase):
         return self.call("Bash", {"command": command})
 
     def test_live_commands_blocked(self):
-        for command in self.BLOCKED + self.BLOCKED_EXTRA:
+        for command in self.BLOCKED + self.BLOCKED_EXTRA + self.BLOCKED_CASE + self.BLOCKED_PATTERN:
             with self.subTest(command=command):
                 result = self.bash(command)
                 self.assertEqual(result.returncode, 2, result.stderr)
@@ -334,6 +399,12 @@ class LiveCommands(unittest.TestCase):
             ("./install-intake.sh", "install-intake.sh"),
             ("launchctl load x.plist", "launchctl"),
             ("launchctl kickstart -k gui/501/x", "launchctl"),
+            ("./IWB tick", "iwb"),
+            ("LAUNCHCTL load x.plist", "launchctl"),
+            ("./Install-Intake.sh", "install-intake.sh"),
+            ("./install-intake.s?", "install-intake.sh"),
+            ("/bin/launchct? load x.plist", "launchctl"),
+            ('cmd=launchctl; "$cmd" load x.plist', "launchctl"),
             ('echo "unbalanced', "could not be parsed"),
         )
         for command, rule in cases:
@@ -380,8 +451,12 @@ def load_hook_module():
 class PostEdit(unittest.TestCase):
     """A fake python3 on PATH stands in for the suite; the real suite never runs here."""
 
-    RUN_PATHS = ("iwb", "tests/test_iwb.py", os.path.join(ROOT, "tests", "x.py"))
-    QUIET_PATHS = ("README.md", "docs/x.md", ".claude/settings.json", "/elsewhere/tests/x.py")
+    RUN_PATHS = ("iwb", "tests/test_iwb.py", os.path.join(ROOT, "tests", "x.py"),
+                 # the checkout's volume is case-insensitive (issue #91)
+                 "IWB", "Iwb", "Tests/test_iwb.py", "TESTS/x.py", os.path.join(ROOT, "Tests", "x.py"),
+                 os.path.join(ROOT.swapcase(), "IWB"))
+    QUIET_PATHS = ("README.md", "docs/x.md", ".claude/settings.json", "/elsewhere/tests/x.py",
+                   "IWB.md", "Tests", "/elsewhere/Tests/x.py", "docs/IWB")
     EDIT_TOOLS = ("Write", "Edit", "MultiEdit")
 
     def setUp(self):
@@ -449,7 +524,7 @@ class PostEdit(unittest.TestCase):
                 result = self.run_hook("Edit", {"file_path": path}, env=self.env(FAKE_RC="1"))
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("Tests failed", result.stderr)
-                self.assertIn(os.path.basename(path), result.stderr)
+                self.assertIn(os.path.basename(path).casefold(), result.stderr.casefold())
                 self.assertIn("FAKE-STDOUT", result.stderr)
                 self.assertIn("FAKE-STDERR", result.stderr)
                 self.assert_one_run()
@@ -475,6 +550,23 @@ class PostEdit(unittest.TestCase):
         result = self.run_hook("Edit", {"file_path": "iwb"}, env=self.env(path=empty))
         self.assertEqual(result.returncode, 2)
         self.assertIn("could not run", result.stderr)
+
+    def test_edited_test_target_ignores_case(self):
+        module = load_hook_module()
+        parent = os.path.basename(ROOT).swapcase()
+        cwd = os.getcwd()
+        os.chdir(ROOT)
+        self.addCleanup(os.chdir, cwd)
+        for path in (os.path.join("..", parent, "IWB"), os.path.join("..", parent, "Tests", "x.py")):
+            with self.subTest(path=path):
+                self.assertIsNotNone(module.edited_test_target(path))
+        self.assertIsNone(module.edited_test_target(os.path.join("..", parent + "-other", "IWB")))
+        cases = {"IWB": "IWB", "Tests/test_iwb.py": "Tests/test_iwb.py", "iwb": "iwb",
+                 "IWB.md": None, "Tests": None, "docs/IWB": None, "../IWB": None}
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(module.edited_test_target(path), expected)
+        self.assertEqual(module.edited_test_target(os.path.join(ROOT.swapcase(), "IWB")).casefold(), "iwb")
 
     def test_timeout_is_reported_and_cleaned_up(self):
         module = load_hook_module()
