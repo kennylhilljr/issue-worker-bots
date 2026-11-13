@@ -2137,6 +2137,18 @@ class ScanFiling(Scan):
         self.assertEqual(body.count("<!--"), 1)
         self.assertEqual(body.count("-->"), 1)
 
+    def test_intake_pass_leaves_proposals_alone(self):
+        bot = "claude-dev-gh[bot]"
+        iwb.CONFIG.write_text(json.dumps({"trusted_openers": [bot]}))
+        intake = Intake("run_pass")          # its fake GitHub and recorders, restored after this test
+        intake.setUp()
+        self.addCleanup(intake.tearDown)
+        intake.issues = [issue(1, user=bot, labels=["bot:proposed"]), issue(2, user=bot),
+                         issue(3, user=bot, labels=["bot:proposed", "bot:work"]), issue(4)]
+        intake.events = {3: [("bot:work", OWNER)]}
+        intake.run_pass()
+        self.assertEqual(sorted(n for n, _ in intake.picked), [3, 4])
+
     def test_intake_waits_for_bot_work(self):
         owner, bot = OWNER, "claude-dev-gh[bot]"
         iwb.CONFIG.write_text(json.dumps({"trusted_openers": [bot]}))   # even a trusted bot's proposals wait
