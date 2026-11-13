@@ -2086,6 +2086,31 @@ class ScanWiring(unittest.TestCase):
         self.assertIn("iwb scan [--repo owner/repo] [--force] [--dry-run]", iwb.__doc__)
 
 
+class ScanDocs(unittest.TestCase):
+    """README.md and DESIGN.md each document iwb scan on their own; neither may leave a part of it out."""
+    PHRASES = ("iwb scan", "scan_repos", "off by default", "scan_interval_days", "default 7", "failed_at",
+               "one hour", "next_eligible_at", "iwb tick", "at most one", "--repo", "--force", "--dry-run",
+               "JSON", "read-only", "Read Grep Glob", "MCP", "-s read-only", "at least 80", "fingerprint",
+               "highest confidence", "nothing to GitHub")
+
+    def check(self, name):
+        text = (ROOT / name).read_text()
+        self.assertEqual([p for p in self.PHRASES if p not in text], [], f"{name} misses iwb scan phrases")
+
+    def test_readme(self):
+        self.check("README.md")
+        text = (ROOT / "README.md").read_text()
+        self.assertLess(text.index("## CLI reference"), text.index("### iwb scan"))
+        self.assertLess(text.index("### iwb scan"), text.index("## Repository layout"))
+
+    def test_design(self):
+        self.check("DESIGN.md")
+        text = (ROOT / "DESIGN.md").read_text()
+        self.assertIn("## iwb scan", text)
+        self.assertIn('state["_scan"][repo] = {at, failed_at, next_eligible_at}', text)
+        self.assertLess(text.index("failed_at` waits one hour"), text.index("`next_eligible_at`, when"))
+
+
 class RedCheckSandbox(unittest.TestCase):
     def setUp(self):
         need_sandbox_exec(self)
