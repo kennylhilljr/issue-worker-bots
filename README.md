@@ -229,25 +229,28 @@ Plans ready, questions posted and blocked issues appear in OpenClaw as `attentio
 | `iwb code [--dry-run]` | Starts a coding run for each approved plan that has a free slot (each run opens its PR), then (with `auto_merge`) runs step 5 on open worker PRs. `--dry-run` prints what it would do. |
 | `iwb intake [--dry-run] [--baseline] [--limit N]` | One pass over open issues; picks up at most N (default 5). `--dry-run` prints and saves nothing; `--baseline` marks the open issues as seen without commenting. |
 | `iwb analyze [--dry-run] [--limit N]` | Analyzes up to N picked-up issues at the same time (default `analysis_concurrency`, 3) and posts a no-code answer, questions or a plan. |
-| `iwb scan [--repo owner/repo] [--force] [--dry-run]` | A read-only scan of the `scan_repos` repositories (or `--repo`) that logs the improvements it finds and files nothing; see [iwb scan](#iwb-scan). |
+| `iwb scan [--repo owner/repo] [--force] [--dry-run]` | A read-only scan of the `scan_repos` repositories (or `--repo`) that files each improvement it finds as a `bot:proposed` issue, unless one already has its marker; see [iwb scan](#iwb-scan). |
 
-Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bot:approved`, `bot:in-progress`, `bot:pr-open`, `bot:needs-kenny`, `bot:done` and `bot:blocked`; `bot:stale` is not built yet. `bot:stop` is set by Kenny.
+Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bot:approved`, `bot:in-progress`, `bot:pr-open`, `bot:needs-kenny`, `bot:done` and `bot:blocked`; `bot:stale` is not built yet. `bot:stop` is set by Kenny. `bot:proposed` marks an issue `iwb scan` filed.
 
 ### iwb scan
 
-`iwb scan [--repo owner/repo] [--force] [--dry-run]` runs a read-only model pass over a repository and logs every improvement it finds: stale docs and comments, behavior with no test, dead code and unused config, missing CI checks, outdated or vulnerable dependencies, and missing or stale agent setup. This part files nothing to GitHub: it only logs the findings, and posts no issues, comments or labels.
+`iwb scan [--repo owner/repo] [--force] [--dry-run]` runs a read-only model pass over a repository and files every improvement it finds as an issue: stale docs and comments, behavior with no test, dead code and unused config, missing CI checks, outdated or vulnerable dependencies, and missing or stale agent setup. It never changes code or opens PRs. The scan itself writes nothing to GitHub; only the filing step opens issues.
 
 - **Which repositories.** Only those listed in the `scan_repos` key of `config.json`. Scanning is off by default: without `scan_repos` nothing is scanned on a schedule.
 - **How often.** Each repository at most once every `scan_interval_days` (default 7).
 - **Scheduled.** `iwb tick` scans the first repository in `scan_repos` order that is due, at most one per pass, after approval. Nothing is scanned while `config.json` has `paused`.
-- **By hand.** `iwb scan` scans every repository in `scan_repos`, ignoring the interval. `--repo owner/repo` scans just that one, even if it isn't listed. `--force` also ignores the backoff after a failure. `--dry-run` prints the kept findings as JSON and saves no state. Exits 1 if a scan failed.
+- **By hand.** `iwb scan` scans every repository in `scan_repos`, ignoring the interval. `--repo owner/repo` scans just that one, even if it isn't listed. `--force` also ignores the backoff after a failure. `--dry-run` prints the kept findings as JSON and the issues it would file, posts nothing and saves no state. Exits 1 if a scan failed or a finding was skipped.
 - **When a scan is due.** The state file keeps `state["_scan"][repo] = {at, failed_at, next_eligible_at}`. The first rule that applies wins:
   1. With `--force`, the scan always runs.
-  2. After a clone or model failure, `failed_at` makes the next scan, scheduled or by hand, wait one hour.
+  2. After a clone, model, issue-read or filing failure, `failed_at` makes the next scan, scheduled or by hand, wait one hour.
   3. Two unusable answers in the same run set `next_eligible_at` one interval ahead. Scheduled scans wait for it; `iwb scan` by hand does not.
-  4. Otherwise a scheduled scan waits the interval after `at`, the last usable scan.
+  4. Otherwise a scheduled scan waits the interval after `at`, the last usable scan whose findings were all filed.
 - **Read-only.** The worker bots take turns. Claude runs with only `Read Grep Glob` and no MCP servers (`--strict-mcp-config`). Codex runs with `-s read-only`. Both run in `iwb`'s own clone, which is removed afterwards.
 - **What is kept.** Only findings with confidence at least 80. When two findings share a fingerprint, the one with the highest confidence is kept.
+- **Filing.** The worker bot that ran the scan opens one issue per kept finding, highest confidence first, with no cap. Each issue is labeled `bot:proposed`, and its body holds the finding, evidence, why, the suggested change and acceptance, then the hidden marker `<!-- iwb-scan:<fingerprint> -->`. Model text is redacted, and any HTML comment in it is escaped, so it cannot fake a marker.
+- **Dedup by marker.** A finding is not filed again while any issue in that repository carries its marker, open or closed. Closing a proposal means "don't do it". Pull requests never count. Markers are checked against GitHub, not the state file, so an empty state file files nothing twice. Fingerprints are per repository. `iwb` first searches the issues for the marker and checks each hit's body for the exact marker. When the search fails or finds no exact match, it lists every issue in the repository once per scan and checks those. When that listing fails too, the finding is skipped this run: the scan logs it, sets `failed_at` and leaves `at` unchanged. A finding is never filed blind.
+- **`bot:proposed` and intake.** Intake leaves `bot:proposed` issues, and any issue a worker bot opened, alone until Kenny adds `bot:work`. That holds even if the bot is listed in `trusted_openers`. `bot:proposed` is not a status label, so later status changes keep it.
 
 ## Repository layout
 

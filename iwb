@@ -53,10 +53,11 @@
       --limit N   pick up at most N issues per pass (default 5)
   iwb scan [--repo owner/repo] [--force] [--dry-run]
       A read-only model run over each repository in config.json "scan_repos" (or just --repo, listed or not) that
-      logs the improvements it finds; it files nothing to GitHub. Plain tick also scans the first due repository
-      in "scan_repos", at most one per pass, every "scan_interval_days" (default 7). By hand a scan ignores the
+      files each improvement it finds as a bot:proposed issue unless an issue, open or closed, already carries its
+      <!-- iwb-scan:<fingerprint> --> marker; intake leaves those until Kenny adds bot:work. Plain tick also
+      scans the first due repository in "scan_repos", at most one per pass, every "scan_interval_days" (default 7). By hand a scan ignores the
       interval but waits out the hour after a failed scan; --force ignores that too. --dry-run prints the kept
-      findings as JSON and saves no state. Exits 1 if a scan failed.
+      findings as JSON and the issues it would file, posts nothing and saves no state. Exits 1 if a scan failed.
 
 Sign-in, tokens and repository lists come from prbot (PRBOT_PATH, default ../pr-review-bots/prbot).
 """
@@ -262,15 +263,20 @@ def trusted_openers(owner):
     return {owner, *extra}
 
 
-def qualifies(repo, issue, owner):
-    """(True, reason) if the bots may work on this issue, else (False, reason). Only the owner can add bot:work."""
+def qualifies(repo, issue, owner, bot_logins=()):
+    """(True, reason) if the bots may work on this issue, else (False, reason). Only the owner can add bot:work.
+    An issue a worker bot opened (one `iwb scan` filed, labeled bot:proposed) waits for the owner's bot:work, even
+    when its opener is listed in trusted_openers."""
     labels = {l["name"] for l in issue.get("labels", [])}
     if "bot:skip" in labels or "bot:stop" in labels:
         return False, "labeled bot:skip or bot:stop"
     if any(a.get("type") == "User" for a in issue.get("assignees", [])):
         return False, "assigned to a person"
     opener = issue["user"]["login"]
-    if opener in trusted_openers(owner):
+    proposed = PROPOSED[0] in labels or opener in bot_logins
+    if proposed and "bot:work" not in labels:
+        return False, f"proposed by {opener}; waits for {owner} to add bot:work"
+    if opener in trusted_openers(owner) and not proposed:
         return True, f"opened by {opener}"
     if "bot:work" in labels:
         who = label_added_by(repo, issue["number"], "bot:work")
@@ -364,7 +370,7 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None, repo_filte
                 log(f"{key}: marked as seen; it will not be picked up")
                 continue
             try:
-                ok, reason = qualifies(repo, issue, owner)
+                ok, reason = qualifies(repo, issue, owner, bot_logins)
                 if not ok:
                     continue
                 if already_commented(repo, issue["number"], bot_logins):
@@ -1746,10 +1752,11 @@ Use {{"findings": []}} when there is nothing to improve.
 
 
 def scan_repo(repo, *, manual=False, force=False, dry_run=False):
-    """One read-only scan of `repo` when it is due (see scan_due). Logs the findings filter_findings keeps and files
-    nothing. Records state["_scan"][repo]: at (last usable scan), failed_at (a clone or model failure: retried after
-    RETRY_AFTER), next_eligible_at (two unusable answers: the next scheduled scan waits a full interval).
-    Returns 1 after a failure, else 0."""
+    """One read-only scan of `repo` when it is due (see scan_due). Files each finding filter_findings keeps as a
+    bot:proposed issue unless one already carries its marker (file_findings). Records state["_scan"][repo]: at (last
+    scan whose findings were all filed or found filed), failed_at (a clone, model, issue read or filing failure:
+    retried after RETRY_AFTER), next_eligible_at (two unusable answers: the next scheduled scan waits a full
+    interval). Returns 1 after a failure, else 0."""
     conf = read_config()
     if conf.get("paused"):
         log(f"scan {repo}: paused in config.json; no scan")
@@ -1790,17 +1797,125 @@ def scan_repo(repo, *, manual=False, force=False, dry_run=False):
         log(f"scan {repo}: two unusable answers ({short(problem, 300)}); next scheduled scan in {interval} days")
     else:
         kept = filter_findings(found)
-        record["at"] = now
-        record.pop("failed_at", None)
         record.pop("next_eligible_at", None)
         log(f"scan {repo}: {len(kept)} of {len(found)} findings kept")
         for f in kept:
             log(f"scan {repo}: {f['confidence']} {short(f['fingerprint'])} {short(f['title'], 300)}")
         if dry_run:   # model text can quote a committed secret: token-shaped strings never reach the output
             print(TOKENISH.sub("[redacted]", json.dumps(kept, indent=1)))
+        if file_findings(repo, WORKERS[agent], kept, dry_run=dry_run):
+            record["at"] = now
+            record.pop("failed_at", None)
+        else:                                  # some findings were skipped: retried after RETRY_AFTER, at unchanged
+            record["failed_at"] = now
+            if not dry_run:
+                save_state(state, since)
+            return 1
     if not dry_run:
         save_state(state, since)
     return 0
+
+
+PROPOSED = ("bot:proposed", "C5DEF5", "Proposed by iwb scan; add bot:work to have a worker build it")
+FILED_JQ = ".[] | {number, body, pr: (.pull_request != null)}"
+
+
+def scan_marker(fingerprint):
+    """The hidden marker a filed finding carries. Characters that could end the HTML comment are replaced."""
+    return f"<!-- iwb-scan:{re.sub(r'[^A-Za-z0-9._:/-]', '-', fingerprint)} -->"
+
+
+def scan_text(text):
+    """Model text for an issue body: token-shaped strings redacted, and no HTML comments, so a finding can never
+    carry another finding's marker."""
+    return TOKENISH.sub("[redacted]", str(text)).replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+
+
+def finding_body(f):
+    """The issue body for one finding: what, evidence, why, the suggested change and acceptance, then the marker."""
+    cause = f"\n\n**Root cause:** {scan_text(f['root_cause'])}" if f.get("root_cause") else ""
+    return (f"Proposed by `iwb scan` (confidence {f['confidence']}). Add `bot:work` to have a worker bot build "
+            f"it, or close the issue to keep it from being proposed again.\n\n"
+            f"**Finding:** {scan_text(f['title'])}\n\n**Category:** `{scan_text(f['category'])}` in "
+            f"`{scan_text(f['area'])}`{cause}\n\n**Evidence:** {scan_text(f['evidence'])}\n\n"
+            f"**Why:** {scan_text(f['why'])}\n\n**Suggested change:** {scan_text(f['change'])}\n\n"
+            f"**Acceptance:** {scan_text(f['acceptance'])}\n\n{scan_marker(f['fingerprint'])}\n")
+
+
+class FiledIssues:
+    """Which markers already appear in a repository's issues, open or closed (pull requests never count). Each
+    marker is searched for first; when search fails or finds no exact match, every issue is listed once per run
+    and checked. Neither working raises RuntimeError: a finding is never filed blind."""
+
+    def __init__(self, repo):
+        self.repo, self.listed = repo, None
+
+    def search(self, marker):
+        key = marker[len("<!-- iwb-scan:"):-len(" -->")]
+        hits = gh_json(["api", "-X", "GET", "search/issues", "-f",
+                        f'q=repo:{self.repo} is:issue in:body "iwb-scan:{key}"', "-f", "per_page=100",
+                        "--jq", ".items" + FILED_JQ[1:]])
+        return any(not h["pr"] and marker in (h["body"] or "") for h in hits)
+
+    def listing(self):
+        if self.listed is None:
+            issues = gh_json(["api", f"repos/{self.repo}/issues?state=all&per_page=100", "--paginate",
+                              "--jq", FILED_JQ])
+            self.listed = [i["body"] or "" for i in issues if not i["pr"]]
+        return self.listed
+
+    def has(self, marker):
+        try:
+            if self.search(marker):
+                return True
+        except (SystemExit, ValueError, KeyError, TypeError) as e:
+            log(f"scan {self.repo}: issue search failed ({short(e, 200)}); listing the issues instead")
+        try:
+            return any(marker in body for body in self.listing())
+        except (SystemExit, ValueError, KeyError, TypeError) as e:
+            raise RuntimeError(f"could not list the issues of {self.repo}: {short(e, 200)}")
+
+    def add(self, body):
+        if self.listed is not None:
+            self.listed.append(body)
+
+
+def file_findings(repo, bot, kept, *, dry_run=False):
+    """File each kept finding (highest confidence first, no cap) as an issue labeled bot:proposed, opened by `bot`,
+    unless an issue in `repo` already carries its marker. Returns False when a finding was skipped because the
+    marker could not be checked or the issue could not be opened; the others are still filed."""
+    filed, ok, labeled = FiledIssues(repo), True, False
+    for f in kept:
+        marker = scan_marker(f["fingerprint"])
+        try:
+            if filed.has(marker):
+                log(f"scan {repo}: already filed {short(f['fingerprint'])}")
+                continue
+        except RuntimeError as e:
+            log(f"scan {repo}: skipped {short(f['fingerprint'])} this run, will retry: {e}")
+            ok = False
+            continue
+        title, body = short(scan_text(f["title"]), 200), finding_body(f)
+        if dry_run:
+            log(f"scan {repo}: would file '{title}' with {PROPOSED[0]}")
+            print(body)
+            filed.add(body)
+            continue
+        try:
+            if not labeled:   # its own label, not in LABELS, so post() never strips it from an issue
+                name, color, desc = PROPOSED
+                run_gh_as(bot, repo, ["label", "create", name, "-R", repo, "--color", color, "--description", desc,
+                                      "--force"])
+                labeled = True
+            url = run_gh_as(bot, repo, ["issue", "create", "-R", repo, "--title", title, "--body", body,
+                                        "--label", PROPOSED[0]])
+        except RuntimeError as e:
+            log(f"scan {repo}: could not file {short(f['fingerprint'])}, will retry: {short(e, 300)}")
+            ok = False
+            continue
+        filed.add(body)
+        log(f"scan {repo}: filed {short(f['fingerprint'])} {url}")
+    return ok
 
 
 # ---------- step 4b: coding the approved plan and opening the PR ----------

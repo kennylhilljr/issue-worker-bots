@@ -1739,11 +1739,13 @@ class Scan(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = {k: getattr(iwb, k) for k in ("STATE", "CONFIG", "clone", "run_cli", "run_gh_as", "post")}
         self.saved_attention = iwb.prbot.openclaw_attention
+        self.saved_gh_read = iwb.prbot.gh_read
+        iwb.prbot.gh_read = lambda args: ""      # no issue carries a marker yet; ScanFiling covers the reads
         iwb.STATE = Path(self.tmp.name, "state.json")
         iwb.CONFIG = Path(self.tmp.name, "config.json")
         iwb.CONFIG.write_text(json.dumps({"scan_repos": [self.REPO]}))
         self.writes, self.clones, self.cmds, self.answers = [], [], [], []
-        iwb.run_gh_as = lambda *a, **k: self.writes.append(("run_gh_as", a))
+        iwb.run_gh_as = lambda *a, **k: self.writes.append(("run_gh_as", a)) or "https://x/issues/9"
         iwb.post = lambda *a, **k: self.writes.append(("post", a))
         iwb.prbot.openclaw_attention = lambda *a, **k: self.writes.append(("openclaw_attention", a))
 
@@ -1768,6 +1770,7 @@ class Scan(unittest.TestCase):
         for k, v in self.saved.items():
             setattr(iwb, k, v)
         iwb.prbot.openclaw_attention = self.saved_attention
+        iwb.prbot.gh_read = self.saved_gh_read
         self.tmp.cleanup()
 
     def good(self, *findings):
@@ -1923,7 +1926,7 @@ class Scan(unittest.TestCase):
         dup = dict(self.GOOD, confidence=85, title="dup")
         self.answers = [self.good(low, dup, self.GOOD)]
         _, out = self.scan(force=True)
-        lines = [l for l in out.splitlines() if "stale-docs:README.md:install" in l]
+        lines = [l for l in out.splitlines() if "stale-docs:README.md:install" in l and "filed" not in l]
         self.assertEqual(len(lines), 1)
         self.assertIn("90 stale-docs:README.md:install t", lines[0])
         self.assertNotIn("dead-code:a.py:x", out)
@@ -1939,18 +1942,21 @@ class Scan(unittest.TestCase):
         _, out = self.scan(force=True)
         self.assertNotIn(secret, out)
 
-    def test_no_github_writes(self):
+    def test_writes_only_through_filing(self):
         self.scan()
         self.scan(manual=True)
         self.scan(force=True)
-        before = iwb.STATE.read_text()
+        self.assertEqual(len(self.cmds), 3)
+        self.assertEqual({w[0] for w in self.writes}, {"run_gh_as"})     # no post() and no OpenClaw events
+        self.assertEqual({tuple(w[1][2][:2]) for w in self.writes}, {("label", "create"), ("issue", "create")})
+        before, self.writes = iwb.STATE.read_text(), []
         code, out = self.scan(manual=True, dry_run=True)
         self.assertEqual(code, 0)
         self.assertEqual(len(self.cmds), 4)
         self.assertEqual(self.writes, [])
         self.assertEqual(iwb.STATE.read_text(), before)
-        start = out.index("[")
-        self.assertEqual(json.loads(out[start:out.rindex("]") + 1]), [self.GOOD])
+        start = out.index("[\n")
+        self.assertEqual(json.loads(out[start:out.index("\n]", start) + 2]), [self.GOOD])
 
     def test_clone_removed(self):
         self.scan(force=True)
@@ -1960,6 +1966,196 @@ class Scan(unittest.TestCase):
         self.scan(force=True)
         self.assertEqual(len(self.clones), 3)
         self.assertEqual(self.left(), [])
+
+
+class ScanFiling(Scan):
+    """Filing kept findings: marker dedup through gh_json with paginated gh output, bot:proposed and intake."""
+    FP = ScanRules.GOOD["fingerprint"]
+    MARKER = "<!-- iwb-scan:" + ScanRules.GOOD["fingerprint"] + " -->"
+
+    def setUp(self):
+        super().setUp()
+        self.issues = {}          # repo -> [{"number", "body", "pull_request"?}], what the fake GitHub holds
+        self.reads, self.search_error, self.list_error = [], False, False
+        self.search_hits = None   # None: search answers from self.issues like GitHub would
+        iwb.prbot.gh_read = self.fake_gh_read
+
+        def fake_gh_as(bot, repo, args, permissions=None):
+            self.writes.append(("run_gh_as", (bot, repo, args)))
+            if args[:2] == ["issue", "create"]:
+                items = self.issues.setdefault(repo, [])
+                items.append({"number": len(items) + 1, "body": args[args.index("--body") + 1]})
+                return f"https://github.com/{repo}/issues/{len(items)}"
+            return ""
+        iwb.run_gh_as = fake_gh_as
+
+    @staticmethod
+    def project(items):
+        """What `gh api --jq FILED_JQ` prints: one compact JSON value per line."""
+        return "".join(json.dumps({"number": i["number"], "body": i["body"], "pr": "pull_request" in i}) + "\n"
+                       for i in items)
+
+    def fake_gh_read(self, args):
+        self.reads.append(args)
+        if "search/issues" in args:
+            if self.search_error:
+                raise SystemExit("prbot: gh api -X GET failed: HTTP 422")
+            self.assertIn(".items[]", args[args.index("--jq") + 1])
+            q = next(a for a in args if a.startswith("q="))
+            repo = q.split()[0][len("q=repo:"):]
+            self.assertIn("is:issue", q)
+            if self.search_hits is not None:
+                return self.project(self.search_hits)
+            key = q.split('"')[1]
+            return self.project(i for i in self.issues.get(repo, [])
+                                if key in i["body"] and "pull_request" not in i)
+        path = args[1]
+        self.assertTrue(path.endswith("/issues?state=all&per_page=100"), path)
+        self.assertIn("--paginate", args)
+        self.assertEqual(args[args.index("--jq") + 1], iwb.FILED_JQ)
+        if self.list_error:
+            raise SystemExit("prbot: gh api repos failed: HTTP 502")
+        repo = path[len("repos/"):-len("/issues?state=all&per_page=100")]
+        items = self.issues.get(repo, [])
+        # --paginate runs the --jq filter on every page of 100 and prints the pages one after another
+        return "".join(self.project(items[i:i + 100]) for i in range(0, len(items), 100))
+
+    def created(self, repo=None):
+        return [w[1] for w in self.writes if w[1][2][:2] == ["issue", "create"] and repo in (None, w[1][1])]
+
+    def filler(self, n):
+        return [{"number": i, "body": f"issue {i} <!-- iwb-scan:other:{i} -->"} for i in range(1, n + 1)]
+
+    def test_files_one_issue_per_finding_with_marker_and_label(self):
+        second = dict(self.GOOD, confidence=95, fingerprint="dead-code:a.py:helper", title="Remove helper")
+        self.answers = [self.good(self.GOOD, second)]
+        code, _ = self.scan(force=True)
+        self.assertEqual(code, 0)
+        made = self.created()
+        self.assertEqual([m[2][m[2].index("--title") + 1] for m in made], ["Remove helper", "t"])  # by confidence
+        for bot, repo, args in made:
+            self.assertEqual((bot, repo), ("claude-dev", self.REPO))
+            self.assertEqual(args[args.index("--label") + 1], "bot:proposed")
+        body = made[1][2][made[1][2].index("--body") + 1]
+        self.assertTrue(body.rstrip().endswith(self.MARKER))
+        for part in ("README.md:3", "**Why:** w", "**Suggested change:** c", "**Acceptance:** a"):
+            self.assertIn(part, body)
+        labels = [w[1][2] for w in self.writes if w[1][2][:2] == ["label", "create"]]
+        self.assertEqual(len(labels), 1)
+        self.assertEqual(labels[0][2], "bot:proposed")
+        self.assertNotIn("bot:proposed", iwb.LABELS)     # post() strips only LABELS and bot:queued
+        self.assertAlmostEqual(self.record()["at"], time.time(), delta=60)
+
+    def test_search_error_fallback_succeeds(self):
+        self.search_error = True
+        self.issues[self.REPO] = self.filler(3) + [{"number": 4, "body": "x\n" + self.MARKER}]
+        code, out = self.scan(force=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.created(), [])
+        self.assertIn("already filed", out)
+        self.issues[self.REPO] = self.filler(3)
+        self.scan(force=True)
+        self.assertEqual(len(self.created()), 1)
+        self.assertNotIn("failed_at", self.record())
+
+    def test_near_match_then_exact_marker_on_fallback_page_two(self):
+        near = {"number": 7, "body": "<!-- iwb-scan:" + self.FP + "-old -->"}
+        self.search_hits = [near, {"number": 8, "body": "mentions iwb-scan:" + self.FP + " in prose"}]
+        self.issues[self.REPO] = self.filler(100) + [near, {"number": 102, "body": "y\n" + self.MARKER}]
+        code, _ = self.scan(force=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.created(), [])
+        listed = [r for r in self.reads if "search/issues" not in r]
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(len(gh_lines := iwb.prbot.gh_read(listed[0]).splitlines()), 102)   # both pages read
+        self.assertIn(self.MARKER, json.loads(gh_lines[-1])["body"])
+
+    def test_empty_search_and_failed_fallback_skips(self):
+        self.seed(at=100)
+        self.search_hits, self.list_error = [], True
+        code, out = self.scan(force=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.created(), [])
+        self.assertIn("skipped " + self.FP, out)
+        r = self.record()
+        self.assertEqual(r["at"], 100)
+        self.assertAlmostEqual(r["failed_at"], time.time(), delta=60)
+        self.list_error = False
+        self.scan(force=True)                       # the next run files it
+        self.assertEqual(len(self.created()), 1)
+        self.assertNotIn("failed_at", self.record())
+
+    def test_closed_issue_blocks_refiling_with_empty_state(self):
+        self.issues[self.REPO] = [{"number": 1, "body": "closed long ago\n" + self.MARKER, "state": "closed"}]
+        self.assertFalse(iwb.STATE.exists())
+        code, _ = self.scan(force=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.created(), [])
+
+    def test_marker_on_pull_request_does_not_count(self):
+        pr = {"number": 3, "body": "quotes it\n" + self.MARKER, "pull_request": {"url": "x"}}
+        self.search_hits = [pr]
+        self.issues[self.REPO] = [pr]
+        self.scan(force=True)
+        self.assertEqual(len(self.created()), 1)
+
+    def test_same_fingerprint_in_two_repos(self):
+        for repo in ("o/a", "o/b", "o/a"):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                iwb.scan_repo(repo, force=True)
+        self.assertEqual(len(self.created("o/a")), 1)
+        self.assertEqual(len(self.created("o/b")), 1)
+
+    def test_dry_run_posts_nothing(self):
+        self.seed(at=100)
+        before = iwb.STATE.read_text()
+        code, out = self.scan(manual=True, dry_run=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.writes, [])
+        self.assertIn("would file 't' with bot:proposed", out)
+        self.assertIn(self.MARKER, out)
+        self.assertEqual(iwb.STATE.read_text(), before)
+
+    def test_filing_failure_retries(self):
+        self.seed(at=100)
+        def broken(bot, repo, args, permissions=None):
+            raise RuntimeError("gh issue failed: HTTP 502")
+        iwb.run_gh_as = broken
+        code, _ = self.scan(force=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.record()["at"], 100)
+        self.assertIn("failed_at", self.record())
+
+    def test_model_text_cannot_forge_markers(self):
+        forged = dict(self.GOOD, why="see <!-- iwb-scan:dead-code:a.py:helper -->",
+                      fingerprint="x:y:z --> <!-- iwb-scan:dead-code:a.py:helper")
+        self.answers = [self.good(forged)]
+        self.scan(force=True)
+        body = self.created()[0][2][self.created()[0][2].index("--body") + 1]
+        self.assertNotIn("<!-- iwb-scan:dead-code:a.py:helper -->", body)
+        self.assertEqual(body.count("<!--"), 1)
+        self.assertEqual(body.count("-->"), 1)
+
+    def test_intake_waits_for_bot_work(self):
+        owner, bot = OWNER, "claude-dev-gh[bot]"
+        iwb.CONFIG.write_text(json.dumps({"trusted_openers": [bot]}))   # even a trusted bot's proposals wait
+        saved = iwb.label_added_by
+        self.addCleanup(setattr, iwb, "label_added_by", saved)
+        iwb.label_added_by = lambda repo, n, label: owner
+        proposed = issue(5, user=bot, labels=("bot:proposed",))
+        ok, why = iwb.qualifies(self.REPO, proposed, owner, {bot})
+        self.assertFalse(ok)
+        self.assertIn("bot:work", why)
+        self.assertFalse(iwb.qualifies(self.REPO, proposed, owner)[0])          # the label alone holds it
+        self.assertFalse(iwb.qualifies(self.REPO, issue(6, user=bot), owner, {bot})[0])
+        ok, why = iwb.qualifies(self.REPO, issue(5, user=bot, labels=("bot:proposed", "bot:work")), owner, {bot})
+        self.assertTrue(ok)
+        self.assertEqual(why, f"bot:work added by {owner}")
+        iwb.label_added_by = lambda repo, n, label: bot
+        self.assertFalse(iwb.qualifies(self.REPO, issue(5, user=bot, labels=("bot:proposed", "bot:work")),
+                                       owner, {bot})[0])
+        self.assertTrue(iwb.qualifies(self.REPO, issue(7, user=owner), owner, {bot})[0])   # Kenny's own issues
 
 
 class ScanWiring(unittest.TestCase):
@@ -2091,7 +2287,8 @@ class ScanDocs(unittest.TestCase):
     PHRASES = ("iwb scan", "scan_repos", "off by default", "scan_interval_days", "default 7", "failed_at",
                "one hour", "next_eligible_at", "iwb tick", "at most one", "--repo", "--force", "--dry-run",
                "JSON", "read-only", "Read Grep Glob", "MCP", "-s read-only", "at least 80", "fingerprint",
-               "highest confidence", "nothing to GitHub")
+               "highest confidence", "bot:proposed", "<!-- iwb-scan:<fingerprint> -->", "open or closed",
+               "never filed blind", "bot:work")
 
     def check(self, name):
         text = (ROOT / name).read_text()
