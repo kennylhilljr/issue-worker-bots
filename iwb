@@ -3874,7 +3874,7 @@ def hand_off_ready(q, keys, handed):
             continue
         if key in queued:
             handed.add(key)
-            log(f"{key}: ready to code; hand-off already pending in the code queue")
+            log(f"{key}: ready to code; hand-off already pending in the code queue or its deferred folder")
             continue
         try:
             target = hand_off_to_coding(sibling(q, "code"), name, ev)
