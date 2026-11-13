@@ -311,6 +311,9 @@ class LiveCommands(unittest.TestCase):
         "./i[a-z]b tick", "./I[W]B code", "./{i,x}wb tick", "./i*b code --dry-run",
         './sc"$x"b tick', "./scripts/$x.py code", '"a$"$x.py tick', './x"$@"y tick',
         "'./i'*b tick", "~/i[w]b tick", "=i[w]b tick", "./i[w]b/ tick",
+        # zsh extendedglob: ^x, x~y and x# can match iwb
+        "setopt extendedglob; ./iw^x* tick", "./iw^x* tick", "./i*~x tick", "./[i]w~x* tick",
+        "./x#iwb tick", "./i[w]#b tick", "./i[w]b~x tick",
         # with nullglob a glob that matches nothing disappears and the next word runs
         "shopt -s nullglob; ./zz*.py ./iwb tick", "./scripts/*.py ./IWB tick",
         "./scripts/*.py ./i?b tick", "./scripts/*.py $X tick",
