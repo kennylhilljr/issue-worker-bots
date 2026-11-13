@@ -302,9 +302,12 @@ def _python_operand(args):
                     # script is taken to be the first later word that names a guarded program
                     # or may expand to one.
                     rest = index + (1 if arg[position + 1:] else 2)
-                    for candidate in range(rest, len(args)):
-                        if _basename(args[candidate]) in GUARDED_PROGRAMS or \
-                                any(ch in args[candidate] for ch in EXPANSION_CHARS):
+                    later = range(rest, len(args))
+                    for candidate in later:
+                        if _basename(args[candidate]) in GUARDED_PROGRAMS:
+                            return candidate
+                    for candidate in later:
+                        if any(ch in args[candidate] for ch in EXPANSION_CHARS):
                             return candidate
                     return None
                 if flag == "c":
