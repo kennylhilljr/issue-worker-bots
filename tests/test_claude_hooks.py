@@ -303,6 +303,10 @@ class LiveCommands(unittest.TestCase):
         'cmd=./install-intake.; cmd+=sh; "$cmd"', 'a=./install-intake.sh; b=$a; "$b"',
         "./install-intake.s[[=h=]]", "./install-intake.s[[.h.]]",
         "./{install-intake.sh,{0..9223372036854775808}}",
+        'cmd=./install-intake.sh; "${cmd/x/y}"', 'cmd=./install-intake.sh; "${cmd:0}"',
+        'cmd=bash; "${cmd%"?"}" -c \'./iwb tick\'', 'cmd=./install-intake.sh; "${cmd%"?"}"',
+        'cmd=./install-intake.sh; $""$cmd', "cmd=./install-intake.sh; $''$cmd",
+        'cmd=./install-intake.sh; $"$cmd"',
     )
 
     ALLOWED = (

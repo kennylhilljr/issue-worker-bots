@@ -574,8 +574,10 @@ def _parameter_values(name, operation):
         return values + [match.group(2)]
     match = re.fullmatch(r"(%%|%|##|#)(.*)", operation, re.S)
     if match:
-        return [_trim(value, match.group(1), match.group(2)) for value in values] or None
-    return ["*"]        # ${NAME/x/y}, ${NAME:1:2} and the like
+        # The untrimmed value too: quoting inside the pattern ("${cmd%"?"}") is lost by now.
+        trimmed = [_trim(value, match.group(1), match.group(2)) for value in values]
+        return list(dict.fromkeys(values + trimmed)) or None
+    return values + ["*"]       # ${NAME/x/y}, ${NAME:1:2} and the like: the value or anything
 
 
 def _resolved_words(word, body=None):
@@ -596,6 +598,9 @@ def _resolved_words(word, body=None):
             index += 1
             continue
         active, dollar = flags[dollar], dollar + 1
+        if word.startswith("$$", index):
+            index += 1      # $""$cmd and $''$cmd reach here as $$cmd: the first $ adds nothing
+            continue
         stop = _skip_expansion(word, index)
         text = word[index:stop]
         values = None
