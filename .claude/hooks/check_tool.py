@@ -82,8 +82,16 @@ LAUNCHCTL_WRITE = ("load", "unload", "bootstrap", "bootout", "bootshell", "kicks
                    "remove", "enable", "disable", "setenv", "unsetenv", "asuser", "bsexec",
                    "reboot", "uncache")
 # $NAME and ${NAME}: a variable whose value an assignment in the same command may show.
-VARIABLE_RE = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})")
-MAX_RESOLVED = 16
+# ${NAME:-x}, ${NAME%.sh} and the like resolve to NAME's value too (an overmatch at worst).
+VARIABLE_RE = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\})")
+MAX_RESOLVED = 256
+MAX_BRACES = 256
+# Quoted or escaped {, } and , are literal: markers keep brace expansion away from them.
+LITERAL_MARKS = {"{": "\ue000", "}": "\ue001", ",": "\ue002"}
+POSIX_CLASSES = {"alpha": "a-z", "lower": "a-z", "upper": "a-z", "alnum": "a-z0-9", "digit": "0-9",
+                 "xdigit": "0-9a-f"}
+TOO_MANY_MESSAGE = ("Blocked: the program name {word!r} expands to too many names to check "
+                    "(iwb, install-intake.sh, launchctl rules); spell out the program name.")
 # Values assigned in the command being checked, nested shells included: name -> list of values.
 _VARIABLES = {}
 
@@ -304,12 +312,31 @@ def _skip_expansion(word, index):
     return stop
 
 
-def _brace_expand(pattern, limit=64):
-    """Expand {a,b} alternatives, nested ones included; past limit, braces become '*'."""
+def _sequence(text):
+    """Expand the inside of a {1..3} or {a..c} brace sequence; None when it is not one."""
+    match = re.fullmatch(r"(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(?:\.\.(-?\d+))?", text)
+    if not match:
+        return None
+    first, last, step = match.group(1), match.group(2), abs(int(match.group(3) or 1)) or 1
+    if first.lstrip("-").isdigit() != last.lstrip("-").isdigit():
+        return None
+    numbers = first.lstrip("-").isdigit()
+    start, stop = (int(first), int(last)) if numbers else (ord(first), ord(last))
+    values = range(start, stop + 1, step) if start <= stop else range(start, stop - 1, -step)
+    if len(values) > MAX_BRACES:
+        return ["*"]
+    return [str(value) if numbers else chr(value) for value in values]
+
+
+def _brace_expand(pattern):
+    """Expand {a,b} alternatives and {1..3} sequences, nested ones included.
+
+    Returns None past MAX_BRACES names; the caller refuses the word.
+    """
     results, pending = [], [pattern]
     while pending:
-        if len(results) + len(pending) > limit:
-            return [pattern.replace("{", "*").replace("}", "*").replace(",", "*")]
+        if len(results) + len(pending) > MAX_BRACES:
+            return None
         item = pending.pop()
         start = item.find("{")
         while start >= 0:
@@ -329,42 +356,86 @@ def _brace_expand(pattern, limit=64):
                 for left, right in zip(bounds, bounds[1:]):
                     pending.append(item[:start] + item[left + 1:right] + item[stop + 1:])
                 break
+            sequence = _sequence(item[start + 1:stop]) if stop < len(item) else None
+            if sequence is not None:
+                pending.extend(item[:start] + value + item[stop + 1:] for value in sequence)
+                break
             start = item.find("{", start + 1)
         else:
             results.append(item)
     return results
 
 
-def _program_patterns(word):
-    """Glob patterns for the file name a program word may expand to.
+def _literal(char):
+    """A pattern piece that matches char itself."""
+    if char in "*?[":
+        return "[" + char + "]"
+    return LITERAL_MARKS.get(char, char)
 
-    Every $NAME, ${...}, $(...) and `...` becomes '*'; braces are expanded.
+
+def _source_pattern(source):
+    """Turn a word's shell source into a glob pattern for the name it may expand to.
+
+    Quoted and escaped characters are literal; every $NAME, ${...}, $(...) and `...`
+    becomes '*', inside double quotes too.
     """
-    out, index = [], 0
-    while index < len(word):
-        if word[index] in "$`":
-            out.append("*")
-            index = _skip_expansion(word, index)
-        else:
-            out.append(word[index])
+    out, index, quote = [], 0, None
+    while index < len(source):
+        char = source[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            else:
+                out.append(_literal(char))
             index += 1
-    pattern = "".join(out)
-    # {a..z} sequences and [[:lower:]]-style classes: fnmatch knows neither, so overmatch.
-    pattern = re.sub(r"\{[^{},]*\.\.[^{},]*\}", "*", pattern)
-    pattern = re.sub(r"\[!?\]?(?:\[:[a-z]+:\]|[^\]])*\]", "?", pattern)
-    return [fold(os.path.basename(item.rstrip("/"))) for item in _brace_expand(pattern)]
+        elif char == "\\" and index + 1 < len(source):
+            out.append(_literal(source[index + 1]))
+            index += 2
+        elif char in "$`":
+            out.append("*")
+            index = _skip_expansion(source, index)
+        elif quote == '"':
+            if char == '"':
+                quote = None
+            else:
+                out.append(_literal(char))
+            index += 1
+        elif char in "'\"":
+            quote = char
+            index += 1
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
 
 
-def _may_name(word, program):
-    """True when the program word uses shell expansion that can produce program's file name."""
-    if not any(ch in word for ch in EXPANSION_CHARS):
-        return False
-    return any(fnmatchcase(program, pattern) for pattern in _program_patterns(word))
+def _bracket_classes(pattern):
+    """Rewrite bash bracket expressions for fnmatch: [^x] is [!x], [[:lower:]] a range."""
+    def classes(match):
+        inner = match.group(1)
+        if inner.startswith("^"):
+            inner = "!" + inner[1:]
+        inner = re.sub(r"\[:([a-z]+):\]", lambda m: POSIX_CLASSES.get(m.group(1), "\x00-\U0010ffff"), inner)
+        return "[" + inner + "]"
+    return re.sub(r"\[((?:\[:[a-z]+:\]|[^\]])+)\]", classes, pattern)
 
 
-def _only_expansion(word):
-    """True when the program's file name is nothing but expansions and wildcards ($cmd, ./*)."""
-    return all(set(pattern) <= set("*?") for pattern in _program_patterns(word))
+def _program_patterns(source):
+    """Case-folded glob patterns for the file name a program word's source may expand to.
+
+    None when the braces expand to too many names to check.
+    """
+    expanded = _brace_expand(_source_pattern(source))
+    if expanded is None:
+        return None
+    patterns = []
+    for item in expanded:
+        for mark, char in ((v, k) for k, v in LITERAL_MARKS.items()):
+            item = item.replace(mark, char)
+        patterns.append(fold(os.path.basename(_bracket_classes(item).rstrip("/"))))
+    return patterns
+
+
 
 
 def _is_assignment(word):
@@ -439,15 +510,21 @@ def _python_operand(args):
 
 
 def _resolved_words(word):
-    """Program words that word becomes with the values assigned to its variables in the command."""
+    """Program words that word becomes with the values assigned to its variables in the command.
+
+    Every value assigned anywhere in the command counts, whatever the order: functions and
+    loops run code out of textual order, so a later assignment may be the one in effect.
+    Returns None when there are more than MAX_RESOLVED combinations.
+    """
     words = [word]
     for match in VARIABLE_RE.finditer(word):
-        name = match.group(1) or match.group(2)
-        values = _VARIABLES.get(name)
+        values = _VARIABLES.get(match.group(1) or match.group(2))
         if not values:
             continue
         words = [candidate.replace(match.group(0), value, 1)
-                 for candidate in words for value in values][:MAX_RESOLVED]
+                 for candidate in words for value in dict.fromkeys(values)]
+        if len(words) > MAX_RESOLVED:
+            return None
     return [candidate for candidate in words if candidate != word]
 
 
@@ -467,8 +544,11 @@ def _check_program(program_word, program_body, args, arg_bodies, via_xargs, term
     """Apply the iwb, install-intake.sh, launchctl and launcher rules to one program."""
     if resolve:
         # cmd=./install-intake.sh; "$cmd": check the program the variable was given too.
-        for candidate in _resolved_words(program_word):
-            message = _check_program(candidate, program_body, args, arg_bodies, via_xargs,
+        candidates = _resolved_words(program_word)
+        if candidates is None:
+            return TOO_MANY_MESSAGE.format(word=program_word)
+        for candidate in candidates:
+            message = _check_program(candidate, candidate, args, arg_bodies, via_xargs,
                                      terminator, depth, resolve=False)
             if message:
                 return message
@@ -502,7 +582,7 @@ def _check_program(program_word, program_body, args, arg_bodies, via_xargs, term
             any(arg in IWB_SUBCOMMANDS for arg in args):
         return IWB_DYNAMIC_MESSAGE   # $cmd tick, ./i*b tick: the program may be iwb
     if program not in TEST_PROGRAMS and program not in GUARDED_PROGRAMS:
-        message = _check_program_pattern(program_word, args)
+        message = _check_program_pattern(program_body, args)
         if message:
             return message
     if program == "install-intake.sh":
@@ -516,26 +596,32 @@ def _check_program(program_word, program_body, args, arg_bodies, via_xargs, term
     return None
 
 
-def _check_program_pattern(program_word, args):
-    """Refuse a program word whose expansion may name install-intake.sh, or launchctl with a write.
+def _check_program_pattern(program_source, args):
+    """Refuse a program word (its shell source) whose expansion may name install-intake.sh, or launchctl with a write.
 
     ./install-intake.s?, /bin/launchct? load x and ./IWB{,} are refused. A word that is only
     an expansion ("$cmd") could be any program, so it is refused only when a launchctl
     write subcommand follows; iwb subcommands are handled before this.
     """
+    if not any(ch in program_source for ch in EXPANSION_CHARS):
+        return None
+    patterns = _program_patterns(program_source)
+    if patterns is None:
+        return TOO_MANY_MESSAGE.format(word=program_source)
     subcommands = [arg for arg in args if not arg.startswith("-")]
-    if _only_expansion(program_word):
+    # Nothing but expansions and wildcards ($cmd, ./*): it could be any program.
+    if all(set(pattern) <= set("*?") for pattern in patterns):
         if subcommands and subcommands[0] in LAUNCHCTL_WRITE:
-            return PROGRAM_PATTERN_MESSAGE.format(word=program_word, name="launchctl")
+            return PROGRAM_PATTERN_MESSAGE.format(word=program_source, name="launchctl")
         return None
     for name in GUARDED_PROGRAMS:
-        if not _may_name(program_word, name):
+        if not any(fnmatchcase(name, pattern) for pattern in patterns):
             continue
         if name == "launchctl" and subcommands and subcommands[0] in LAUNCHCTL_READ_ONLY:
             continue
         if name == "iwb" and _check_program("iwb", "iwb", args, args, False, "", MAX_DEPTH) is None:
             continue
-        return PROGRAM_PATTERN_MESSAGE.format(word=program_word, name=name)
+        return PROGRAM_PATTERN_MESSAGE.format(word=program_source, name=name)
     return None
 
 
@@ -590,9 +676,13 @@ def check_simple(words, bodies, terminator, depth):
     words, bodies = words[index:], bodies[index:]
     if not words:
         return None
-    for candidate in _resolved_words(words[0]):
+    candidates = _resolved_words(words[0])
+    if candidates is None:
+        return TOO_MANY_MESSAGE.format(word=words[0])
+    for candidate in candidates:
         # S=bash; "$S" -c '...': check the command with the assigned program too.
-        message = check_simple([candidate] + words[1:], bodies, terminator, depth + 1)
+        message = check_simple([candidate] + words[1:], [candidate] + bodies[1:], terminator,
+                               depth + 1)
         if message:
             return message
     program, program_body = _basename(words[0]), bodies[0]

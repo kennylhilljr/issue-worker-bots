@@ -290,6 +290,11 @@ class LiveCommands(unittest.TestCase):
         "L=launchctl; $L stop x", 'S=bash; "$S" -c "./iwb tick"', 'W=sudo; $W ./iwb tick',
         'c=./install-intake.sh; bash "$c"', 'c=./install-intake.sh; bash -c "$c"',
         "for c in ./install-intake.sh; do $c; done", 'P=install-intake; ./$P.sh',
+        "./{install-intake.sh,x}{,a}{,b}{,c}{,d}{,e}{,f}{,g}{,h}", "./install-intake.s{g..i}",
+        'cmd=./install-intake.sh; "${cmd:-./fallback}"', 'L=launchctl; ${L%x} load x',
+        "; ".join("v=/bin/echo%d" % n for n in range(20)) + '; v=./install-intake.sh; "$v"',
+        # functions run later than their text: every value assigned in the command counts
+        'f() { "$c"; }; c=./install-intake.sh; f',
     )
 
     ALLOWED = (
@@ -332,6 +337,10 @@ class LiveCommands(unittest.TestCase):
         'GIT=git; "$GIT" config --get user.name', '"$NPM" start', "$X stop", "$X kill 1",
         "PY=python3; $PY -m unittest discover -s tests", "L=launchctl; $L list",
         "for f in a b; do echo $f; done", "./tests/test_[a-z]*.py",
+        # quoted, escaped or impossible patterns cannot name a guarded program
+        "./install-intake.s[x]", "./install-intake.s{x..z}", '"./install-intake.s?"',
+        "./install-intake.s\\?", "'./install-*'", "./install-intake.s[^h]",
+        'cmd=/bin/echo; "$cmd" ok',
     )
 
     def setUp(self):
