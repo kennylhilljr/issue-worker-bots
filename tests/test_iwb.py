@@ -2029,6 +2029,8 @@ class ScanFilingFixture(ScanFixture):
             return self.project(i for i in self.issues.get(repo, [])
                                 if key in i["body"] and "pull_request" not in i)
         path = args[1]
+        if "/pulls" in path:                   # recent reviews: ScanReviews covers them
+            return ""
         one = re.fullmatch(r"repos/(.+)/issues/(\d+)", path)
         if one:                                # the fresh read of a proposal right before it is edited
             i = next(x for x in self.issues[one.group(1)] if x["number"] == int(one.group(2)))
@@ -2094,7 +2096,7 @@ class ScanFiling(ScanFilingFixture):
         code, _ = self.scan(force=True)
         self.assertEqual(code, 0)
         self.assertEqual(self.created(), [])
-        listed = [r for r in self.reads if "search/issues" not in r]
+        listed = [r for r in self.reads if "search/issues" not in r and "/pulls" not in r[1]]
         self.assertEqual(len(listed), 1)
         self.assertEqual(len(gh_lines := iwb.prbot.gh_read(listed[0]).splitlines()), 102)   # both pages read
         self.assertIn(self.MARKER, json.loads(gh_lines[-1])["body"])
@@ -2413,6 +2415,151 @@ class ScanGrouping(ScanFilingFixture):
         self.assertEqual(iwb.read_members(body)[0]["root_cause"], f["root_cause"])
 
 
+class ScanReviews(ScanFixture):
+    """Recent bot-review findings in the scan prompt, read through gh_json with paginated gh output."""
+    DAY = 86400
+
+    def setUp(self):
+        super().setUp()
+        self.prs = {}             # number -> {"updated": epoch, "reviews": [...], "comments": [...]}
+        self.fail, self.reads = False, []
+        iwb.prbot.gh_read = self.fake_gh_read
+
+    @staticmethod
+    def iso(t):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+    def fake_gh_read(self, args):
+        self.reads.append(args)
+        path = args[1]
+        if "/pulls" not in path:
+            return ""                          # issue reads for filing: nothing filed yet
+        self.assertIn("--paginate", args)
+        jq = args[args.index("--jq") + 1]
+        if self.fail:
+            raise SystemExit("prbot: gh api repos/o/r/pulls failed: HTTP 502")
+        if path.startswith(f"repos/{self.REPO}/pulls?"):
+            self.assertEqual(jq, ".[] | {number, updated: .updated_at}")
+            return "".join(json.dumps({"number": n, "updated": self.iso(p["updated"])}) + "\n"
+                           for n, p in sorted(self.prs.items()))
+        n, kind = re.fullmatch(rf"repos/{self.REPO}/pulls/(\d+)/(reviews|comments)\?per_page=100", path).groups()
+        self.assertIn("at: .submitted_at" if kind == "reviews" else "at: .created_at", jq)
+        return "".join(json.dumps(dict(c, at=self.iso(c["at"]) if c["at"] else None)) + "\n"
+                       for c in self.prs[int(n)][kind])
+
+    def comment(self, n, i, at, text, user="codex-pr-gh[bot]"):
+        return {"user": user, "body": f"### Codex review\n\n{text}\n\n<sub>posted by {user}</sub>\n",
+                "url": f"https://github.com/{self.REPO}/pull/{n}#pullrequestreview-{i}", "at": at}
+
+    def pr(self, n, updated, reviews=(), comments=()):
+        self.prs[n] = {"updated": updated, "reviews": list(reviews), "comments": list(comments)}
+
+    def prompt(self):
+        cmd = self.cmds[-1]
+        return cmd[-1] if cmd[0] == "codex" else cmd[cmd.index("-p") + 1]
+
+    def test_window_on_created_at(self):
+        now = time.time()
+        self.pr(1, now - self.DAY, comments=[
+            self.comment(1, 1, now - 89 * self.DAY, "- **P1 — `a.py:1`: inside the window.**"),
+            self.comment(1, 2, now - 91 * self.DAY, "- **P1 — `a.py:2`: outside the window.**")],
+            reviews=[self.comment(1, 3, now - 2 * self.DAY, "- **P2 — `a.py:3`: a recent review.**"),
+                     self.comment(1, 4, None, "- **P2 — `a.py:4`: a pending review.**")])
+        self.pr(2, now - 95 * self.DAY, reviews=[self.comment(2, 5, now - 96 * self.DAY, "- **P1 — old PR.**")])
+        self.scan(force=True)
+        p = self.prompt()
+        self.assertIn("inside the window", p)
+        self.assertIn("a recent review", p)
+        self.assertNotIn("outside the window", p)
+        self.assertNotIn("pending review", p)
+        self.assertNotIn("old PR", p)
+        self.assertFalse(any("/pulls/2/" in r[1] for r in self.reads))       # a PR not updated since: not read
+        self.assertLess(p.index("a recent review"), p.index("inside the window"))   # newest first
+        self.assertIn(f"- PR #1 https://github.com/{self.REPO}/pull/1#pullrequestreview-3 P2: `a.py:3`: a recent "
+                      f"review.", p)
+
+    def test_only_p1_and_p2(self):
+        now = time.time()
+        self.pr(1, now, reviews=[self.comment(1, 1, now - 60, "- **P0 — zero.**\n- **P1 — one.**\n- **P2 — two.**"
+                                                               "\n- **P3 — three.**")])
+        self.scan(force=True)
+        p = self.prompt()
+        self.assertIn("P1: one.", p)
+        self.assertIn("P2: two.", p)
+        self.assertNotIn("zero.", p)
+        self.assertNotIn("three.", p)
+
+    def test_configured_authors_and_defaults(self):
+        now = time.time()
+        self.pr(1, now, reviews=[self.comment(1, 1, now - 60, "- **P1 — by claude.**", user="claude-pr-gh[bot]"),
+                                 self.comment(1, 2, now - 60, "- **P1 — by codex.**", user="codex-pr-gh[bot]"),
+                                 self.comment(1, 3, now - 60, "- **P1 — by a person.**", user=OWNER),
+                                 self.comment(1, 4, now - 60, "- **P1 — by another bot.**", user="my-bot[bot]")])
+        self.scan(force=True)
+        p = self.prompt()
+        self.assertIn("by claude", p)
+        self.assertIn("by codex", p)
+        self.assertNotIn("by a person", p)
+        self.assertNotIn("by another bot", p)
+        self.assertEqual(iwb.review_bot_logins({}), ["claude-pr-gh[bot]", "codex-pr-gh[bot]"])
+        iwb.CONFIG.write_text(json.dumps({"scan_repos": [self.REPO], "scan": {"review_bot_logins": ["my-bot[bot]"]}}))
+        self.scan(force=True)
+        p = self.prompt()
+        self.assertIn("by another bot", p)
+        self.assertNotIn("by claude", p)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(iwb.review_bot_logins({"scan": {"review_bot_logins": "x"}}), iwb.REVIEW_BOTS)
+
+    def test_truncation(self):
+        now = time.time()
+        many = [self.comment(1, i, now - i * 60, f"- **P2 — finding number {i:03d} " + "x" * 120 + "**")
+                for i in range(200)]
+        self.pr(1, now, reviews=many)
+        self.scan(force=True)
+        p = self.prompt()
+        start = p.index("- PR #1")
+        listed = [l for l in p[start:].splitlines() if l.startswith("- PR #")]
+        self.assertLessEqual(len("\n".join(listed)), iwb.REVIEW_CHARS)
+        self.assertGreater(len(listed), 5)
+        self.assertLess(len(listed), 200)
+        self.assertEqual([l.split("finding number ")[1][:3] for l in listed],
+                         [f"{i:03d}" for i in range(len(listed))])            # the newest are the ones kept
+        self.assertTrue(all(len(l) < 300 for l in listed))                      # one short line each
+
+    def test_read_failure_is_logged_and_scan_continues(self):
+        self.fail = True
+        code, out = self.scan(force=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.cmds), 1)
+        self.assertEqual(sum("could not read recent review findings" in l for l in out.splitlines()), 1)
+        self.assertNotIn("repeat-review", self.prompt())
+        self.assertAlmostEqual(self.record()["at"], time.time(), delta=60)
+
+    def test_prompt_asks_for_repeat_review(self):
+        now = time.time()
+        self.pr(1, now, reviews=[self.comment(1, 1, now - 60, "- **P1 — missing timeout.**")])
+        self.scan(force=True)
+        p = self.prompt()
+        self.assertIn("repeat-review", p)
+        self.assertIn("more than once", p)
+        self.assertIn("review links as\nits evidence", p)
+        self.scan(force=True)                     # codex gets the same list
+        codex = self.cmds[-1]
+        self.assertEqual(codex[0], "codex")
+        self.assertIn("missing timeout", codex[-1])
+
+    def test_no_reviews_no_section(self):
+        self.scan(force=True)
+        self.assertNotIn("repeat-review", self.prompt())
+        self.assertNotIn("review findings", self.prompt().lower())
+
+    def test_review_text_redacted(self):
+        now, secret = time.time(), "ghp_" + "Q1w2" * 10
+        self.pr(1, now, reviews=[self.comment(1, 1, now - 60, f"- **P1 — leaked {secret} in config.**")])
+        self.scan(force=True)
+        self.assertNotIn(secret, self.prompt())
+
+
 class ScanWiring(unittest.TestCase):
     """The scheduled scan in cmd_tick and the `iwb scan` command, with every step and scan_repo recorded."""
     NAMES = ("STATE", "CONFIG", "WORK_DIR", "QUEUE_DIR", "cmd_intake", "cmd_analyze", "cmd_approve", "cmd_code",
@@ -2555,6 +2702,9 @@ class ScanDocs(unittest.TestCase):
         text = (ROOT / "README.md").read_text()
         self.assertLess(text.index("## CLI reference"), text.index("### iwb scan"))
         self.assertLess(text.index("### iwb scan"), text.index("## Repository layout"))
+        for phrase in ("scan.review_bot_logins", '["claude-pr-gh[bot]", "codex-pr-gh[bot]"]', "90 days",
+                       "`created_at`", "repeat-review", "newest first", "P1 and P2", "runs without them"):
+            self.assertIn(phrase, text)
 
     def test_design(self):
         self.check("DESIGN.md")

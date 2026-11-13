@@ -297,7 +297,7 @@ The runtime's validation is unchanged either way: binding fields, plan hash and 
 
 ## iwb scan
 
-The pipeline only works on the issues Kenny writes. `iwb scan` is a read-only pass that looks over a repository for improvements, so the bots can propose work too. It files each finding as a `bot:proposed` issue, and Kenny decides which ones get built by adding `bot:work`. The model run itself is read-only and writes nothing to GitHub; only the filing step opens issues. Feeding in recent review findings comes later.
+The pipeline only works on the issues Kenny writes. `iwb scan` is a read-only pass that looks over a repository for improvements, so the bots can propose work too. It files each finding as a `bot:proposed` issue, and Kenny decides which ones get built by adding `bot:work`. The model run itself is read-only and writes nothing to GitHub; only the filing step opens issues. The model also gets the P1 and P2 findings from the repository's bot reviews in the last 90 days (`scan.review_bot_logins`), so it can propose a `repeat-review` lint rule, hook or test for a kind of bug that keeps coming back. A failed read of the reviews is logged and the scan runs without them. README.md has the details.
 
 **Which repositories, and how often.** Only repositories listed in `scan_repos` in `config.json`, so scanning is off by default. Each one is scanned at most once every `scan_interval_days` (default 7). `iwb tick` checks the list after approval and scans the first due repository, at most one per pass, so no extra launchd job is needed. A paused config scans nothing, not even by hand. `iwb scan` runs it by hand over the whole list, or `--repo` over one repository, listed or not.
 
