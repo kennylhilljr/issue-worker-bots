@@ -229,8 +229,25 @@ Plans ready, questions posted and blocked issues appear in OpenClaw as `attentio
 | `iwb code [--dry-run]` | Starts a coding run for each approved plan that has a free slot (each run opens its PR), then (with `auto_merge`) runs step 5 on open worker PRs. `--dry-run` prints what it would do. |
 | `iwb intake [--dry-run] [--baseline] [--limit N]` | One pass over open issues; picks up at most N (default 5). `--dry-run` prints and saves nothing; `--baseline` marks the open issues as seen without commenting. |
 | `iwb analyze [--dry-run] [--limit N]` | Analyzes up to N picked-up issues at the same time (default `analysis_concurrency`, 3) and posts a no-code answer, questions or a plan. |
+| `iwb scan [--repo owner/repo] [--force] [--dry-run]` | A read-only scan of the `scan_repos` repositories (or `--repo`) that logs the improvements it finds and files nothing; see [iwb scan](#iwb-scan). |
 
 Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bot:approved`, `bot:in-progress`, `bot:pr-open`, `bot:needs-kenny`, `bot:done` and `bot:blocked`; `bot:stale` is not built yet. `bot:stop` is set by Kenny.
+
+### iwb scan
+
+`iwb scan [--repo owner/repo] [--force] [--dry-run]` runs a read-only model pass over a repository and logs every improvement it finds: stale docs and comments, behavior with no test, dead code and unused config, missing CI checks, outdated or vulnerable dependencies, and missing or stale agent setup. This part files nothing to GitHub: it only logs the findings, and posts no issues, comments or labels.
+
+- **Which repositories.** Only those listed in the `scan_repos` key of `config.json`. Scanning is off by default: without `scan_repos` nothing is scanned on a schedule.
+- **How often.** Each repository at most once every `scan_interval_days` (default 7).
+- **Scheduled.** `iwb tick` scans the first repository in `scan_repos` order that is due, at most one per pass, after approval. Nothing is scanned while `config.json` has `paused`.
+- **By hand.** `iwb scan` scans every repository in `scan_repos`, ignoring the interval. `--repo owner/repo` scans just that one, even if it isn't listed. `--force` also ignores the backoff after a failure. `--dry-run` prints the kept findings as JSON and saves no state. Exits 1 if a scan failed.
+- **When a scan is due.** The state file keeps `state["_scan"][repo] = {at, failed_at, next_eligible_at}`. The first rule that applies wins:
+  1. With `--force`, the scan always runs.
+  2. After a clone or model failure, `failed_at` makes the next scan, scheduled or by hand, wait one hour.
+  3. Two unusable answers in the same run set `next_eligible_at` one interval ahead. Scheduled scans wait for it; `iwb scan` by hand does not.
+  4. Otherwise a scheduled scan waits the interval after `at`, the last usable scan.
+- **Read-only.** The worker bots take turns. Claude runs with only `Read Grep Glob` and no MCP servers (`--strict-mcp-config`). Codex runs with `-s read-only`. Both run in `iwb`'s own clone, which is removed afterwards.
+- **What is kept.** Only findings with confidence at least 80. When two findings share a fingerprint, the one with the highest confidence is kept.
 
 ## Repository layout
 

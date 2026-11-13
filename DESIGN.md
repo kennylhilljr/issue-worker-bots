@@ -295,6 +295,34 @@ The runtime's validation is unchanged either way: binding fields, plan hash and 
 3. Phase C once step 4 creates real runs.
 4. Phase B only if the 5-minute delay turns out to matter.
 
+## iwb scan
+
+The pipeline only works on the issues Kenny writes. `iwb scan` is a read-only pass that looks over a repository for improvements, so the bots can propose work too. This first version files nothing to GitHub: it logs what it finds. Filing findings as issues, grouping similar ones, and feeding in recent review findings come later.
+
+**Which repositories, and how often.** Only repositories listed in `scan_repos` in `config.json`, so scanning is off by default. Each one is scanned at most once every `scan_interval_days` (default 7). `iwb tick` checks the list after approval and scans the first due repository, at most one per pass, so no extra launchd job is needed. A paused config scans nothing, not even by hand. `iwb scan` runs it by hand over the whole list, or `--repo` over one repository, listed or not.
+
+**The record.** Each repository has `state["_scan"][repo] = {at, failed_at, next_eligible_at}`:
+- `at` is when the last usable scan finished.
+- `failed_at` is set when the clone or the model CLI fails, including a CLI that will not start. That is a transient failure, so `at` stays where it was.
+- `next_eligible_at` is set when the model gives two unusable answers in the same run. It is one interval ahead, so a model that cannot follow the format does not run every tick.
+
+**Precedence.** The first rule that applies decides whether a scan runs:
+1. `--force` always runs, ignoring the backoff.
+2. `failed_at` waits one hour, for scheduled and manual scans alike. A usage limit or outage is not retried every five minutes.
+3. A manual scan runs.
+4. `next_eligible_at`, when it is set, decides a scheduled scan.
+5. Otherwise a scheduled scan waits the interval after `at`.
+
+A usable answer sets `at` and clears the other two fields. `--dry-run` prints the kept findings as JSON and saves no state.
+
+**Read-only.** One model run per repository, in `iwb`'s own shallow clone, removed afterwards. The worker bots take turns. The run has the same restrictions as analysis:
+- Claude gets only `Read Grep Glob`, with Bash, Edit, Write and the web tools disallowed and no MCP servers (`--strict-mcp-config` with no config).
+- Codex runs with `-s read-only`.
+
+The prompt asks for every improvement, large or small, in fixed categories: stale docs and comments, missing or hollow tests, dead code and unused config, missing CI checks, outdated or vulnerable dependencies, and agent setup. The answer is one JSON block of findings. Each finding has a title, category, area, root cause, evidence, why, suggested change, acceptance, confidence and fingerprint (`category:path:slug`). An unreadable answer is asked for once more.
+
+**What is kept.** Findings with confidence at least 80. When findings share a fingerprint, only the one with the highest confidence is kept, and the kept findings are sorted by confidence. Model text is passed through the same token redaction as comments before it is logged or printed.
+
 ## Repository checks
 
 `scripts/check.py` is the one check for this repository, locally and in CI. It byte-compiles `iwb` and every Python file under `tests/` and stops there on a syntax error, then runs unittest discovery with a fresh `TMPDIR` under `/tmp` and `PRBOT_PATH` set to the bundled `tests/prbot_stub.py`, so no sibling pr-review-bots checkout or credentials are needed. The GitHub Actions workflow that runs it is documented in [docs/ci.md](docs/ci.md); Kenny installs it by hand because `.github/workflows/**` is always blocked for bots.
