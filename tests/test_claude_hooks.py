@@ -307,6 +307,13 @@ class LiveCommands(unittest.TestCase):
         'cmd=bash; "${cmd%"?"}" -c \'./iwb tick\'', 'cmd=./install-intake.sh; "${cmd%"?"}"',
         'cmd=./install-intake.sh; $""$cmd', "cmd=./install-intake.sh; $''$cmd",
         'cmd=./install-intake.sh; $"$cmd"',
+        # before an iwb subcommand, a word that may name iwb stays refused (issue #95)
+        "./i[a-z]b tick", "./I[W]B code", "./{i,x}wb tick", "./i*b code --dry-run",
+        './sc"$x"b tick', "./scripts/$x.py code", '"a$"$x.py tick', './x"$@"y tick',
+        "'./i'*b tick", "~/i[w]b tick", "=i[w]b tick", "./i[w]b/ tick",
+        # with nullglob a glob that matches nothing disappears and the next word runs
+        "shopt -s nullglob; ./zz*.py ./iwb tick", "./scripts/*.py ./IWB tick",
+        "./scripts/*.py ./i?b tick", "./scripts/*.py $X tick",
     )
 
     ALLOWED = (
@@ -356,6 +363,9 @@ class LiveCommands(unittest.TestCase):
         "cmd=./install-intake.sh; echo '$cmd'", "cmd=./install-intake.sh; '$cmd'",
         "cmd=./install-intake.sh; \\$cmd", "ba?h -c 'echo ok'", '"${PY:-python3}" -m unittest',
         'L=launchctl; "${L:-x}" list',
+        # globs before an iwb subcommand that cannot match iwb (issue #95)
+        "./i[ac]b tick", "'./i*b' tick", "./scripts/*.py code", "./i\\*b tick",
+        '"./iw?" tick', "./scripts/{check,x}.py code --dry-run", "./i[!w]b analyze",
     )
 
     def setUp(self):

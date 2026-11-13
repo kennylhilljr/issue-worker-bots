@@ -676,7 +676,8 @@ def _check_program(program_word, program_body, args, arg_bodies, via_xargs, term
             return IWB_MESSAGE.format(sub=sub)
         return None
     if program not in TEST_PROGRAMS and any(ch in program_body for ch in EXPANSION_CHARS) and \
-            any(arg in IWB_SUBCOMMANDS for arg in args):
+            any(arg in IWB_SUBCOMMANDS for arg in args) and \
+            any(_may_name_iwb(body) for body in [program_body] + list(arg_bodies)):
         return IWB_DYNAMIC_MESSAGE   # $cmd tick, ./i*b tick: the program may be iwb
     if program not in TEST_PROGRAMS and program not in GUARDED_PROGRAMS:
         message = _check_program_pattern(program_body, args)
@@ -691,6 +692,40 @@ def _check_program(program_word, program_body, args, arg_bodies, via_xargs, term
         if not subcommands:     # commands from stdin or xargs
             return LAUNCHCTL_MESSAGE.format(sub="without a subcommand")
     return None
+
+
+def _has_active_expansion(source):
+    """Whether a word's source has a $ or ` that is not single-quoted or escaped."""
+    index, quote = 0, None
+    while index < len(source):
+        char = source[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+        elif char == "\\":
+            index += 1
+        elif char in "$`":
+            return True
+        elif char == '"':
+            quote = None if quote == '"' else '"'
+        elif char == "'":
+            quote = "'"
+        index += 1
+    return False
+
+
+def _may_name_iwb(source):
+    """Whether a word (its shell source) may become a program named iwb.
+
+    Globs and braces are expanded to file name patterns: './i[ac]b', "'./i*b'" and
+    './scripts/*.py' cannot name iwb, './i*b' and './iw?' can. Anything harder to follow
+    counts as may: a $ or ` expansion (its value may hold a slash or be split into words), a
+    tilde or zsh = prefix, extglob or zsh alternation, or too many brace names.
+    """
+    if source[:1] in "~=" or any(ch in source for ch in "()|") or _has_active_expansion(source):
+        return True
+    patterns = _program_patterns(source)
+    return patterns is None or any(fnmatchcase("iwb", pattern) for pattern in patterns)
 
 
 def _check_program_pattern(program_source, args):
