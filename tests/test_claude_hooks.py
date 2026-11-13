@@ -318,6 +318,12 @@ class LiveCommands(unittest.TestCase):
         "setopt braceccl; ./i{w}b tick", "./i{v-x}b* tick", "./i{w}? tick",
         "./iw{[:lower:]} tick", "./i{[[:lower:]]}b tick", "./i{]w}b tick",
         './i{"}"w}b tick', "./i{{w}}b tick", "./i{ac}b tick",
+        # brackets fnmatch reads differently, negations, ranges and classes
+        "./i[w[:]]b tick", "./i[!]b tick", "./i[!x]b tick", "./i[v-x]b tick",
+        "./i[[:lower:]]b tick", "./i[[=w=]]b tick", "./i[]w]b tick", "./i[a\\w]b tick",
+        # without a slash an alias, function, hash entry or PATH may make the word iwb
+        "shopt -s expand_aliases\nalias 'x*'=./iwb\nx* tick", "x* tick", "i[ac]b tick",
+        "hash -p ./iwb 'k?'; k? tick",
         # zsh = expansion looks iwb up in PATH, quoted empty prefixes included
         "''=iw{b..b} tick", '""=i[w]b tick', "=i?b tick",
         # with nullglob a glob that matches nothing disappears and the next word runs
@@ -374,7 +380,8 @@ class LiveCommands(unittest.TestCase):
         'L=launchctl; "${L:-x}" list',
         # globs before an iwb subcommand that cannot match iwb (issue #95)
         "./i[ac]b tick", "'./i*b' tick", "./scripts/*.py code", "./i\\*b tick",
-        '"./iw?" tick', "./scripts/{check,x}.py code --dry-run", "./i[!w]b analyze",
+        '"./iw?" tick', "./scripts/{check,x}.py code --dry-run", "./i[ac][ac]b analyze",
+        "./I[AC]B tick", "/x/i[ac]b approve",
     )
 
     def setUp(self):

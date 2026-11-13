@@ -677,8 +677,11 @@ def _check_program(program_word, program_body, args, arg_bodies, via_xargs, term
         return None
     if program not in TEST_PROGRAMS and any(ch in program_body for ch in EXPANSION_CHARS) and \
             any(arg in IWB_SUBCOMMANDS for arg in args) and \
-            any(_may_name_iwb(body) for body in [program_body] + list(arg_bodies)):
-        return IWB_DYNAMIC_MESSAGE   # $cmd tick, ./i*b tick: the program may be iwb
+            ("/" not in program_word
+             or any(_may_name_iwb(body) for body in [program_body] + list(arg_bodies))):
+        # $cmd tick, ./i*b tick: the program may be iwb. Only a word with a slash can be
+        # ruled out: without one, an alias, function, hash entry or PATH may make it iwb.
+        return IWB_DYNAMIC_MESSAGE
     if program not in TEST_PROGRAMS and program not in GUARDED_PROGRAMS:
         message = _check_program_pattern(program_body, args)
         if message:
@@ -734,11 +737,61 @@ def _may_name_iwb(source):
         single = replaced
     if "{" in single or "}" in single:
         return True
-    patterns = _program_patterns(source)
-    characters = _program_patterns(single)
+    patterns = _iwb_patterns(source)
+    characters = _iwb_patterns(single)
     if patterns is None or characters is None:
         return True
     return any(fnmatchcase("iwb", pattern) for pattern in patterns + characters)
+
+
+def _plain_brackets(pattern):
+    """Rewrite bracket expressions so fnmatch matches at least what the shell does.
+
+    A plain set ([ac]) stays; a negated set, a range or a class ([!w], [a-z], [[:lower:]])
+    becomes '?'. None for a bracket fnmatch and the shells may read differently
+    ([w[:]], an unclosed [!]b): the caller refuses the word.
+    """
+    out, index = [], 0
+    while index < len(pattern):
+        if pattern[index] != "[":
+            out.append(pattern[index])
+            index += 1
+            continue
+        start = index + 1
+        negated = start < len(pattern) and pattern[start] in "!^"
+        if negated:
+            start += 1
+        stop = start + 1 if start < len(pattern) and pattern[start] == "]" else start
+        stop = pattern.find("]", stop)
+        if stop < 0:
+            return None
+        content = pattern[start:stop]
+        if content == "[" and not negated:
+            out.append("[[]")       # a quoted or escaped [
+        elif "[" in content:
+            return None
+        elif negated or any(ch in content for ch in "-:=.\\"):
+            out.append("?")
+        else:
+            out.append("[" + content + "]")
+        index = stop + 1
+    return "".join(out)
+
+
+def _iwb_patterns(source):
+    """Like _program_patterns, with brackets read by _plain_brackets; None to refuse."""
+    expanded = _brace_expand(_source_pattern(source))
+    if expanded is None:
+        return None
+    patterns = []
+    for item in expanded:
+        for mark, char in ((v, k) for k, v in LITERAL_MARKS.items()):
+            item = item.replace(mark, char)
+        item = _plain_brackets(item)
+        if item is None:
+            return None
+        patterns.append(fold(os.path.basename(item.rstrip("/"))))
+    return patterns
 
 
 def _check_program_pattern(program_source, args):
