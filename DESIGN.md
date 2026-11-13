@@ -217,7 +217,7 @@ Two cautions:
 
 ## Status labels
 
-`bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bot:approved`, `bot:in-progress`, `bot:pr-open`, `bot:needs-kenny`, `bot:done`, `bot:blocked`, `bot:stale`, and `bot:stop` (set by Kenny). Each change also posts a one-line comment from the worker bot, so the issue timeline tells the story.
+`bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bot:approved`, `bot:in-progress`, `bot:pr-open`, `bot:needs-kenny`, `bot:done`, `bot:blocked`, `bot:stale`, and `bot:stop` (set by Kenny). `bot:proposed` is not a status: it marks an issue `iwb scan` filed, and stays. Each change also posts a one-line comment from the worker bot, so the issue timeline tells the story.
 
 ## Safety
 
@@ -297,13 +297,13 @@ The runtime's validation is unchanged either way: binding fields, plan hash and 
 
 ## iwb scan
 
-The pipeline only works on the issues Kenny writes. `iwb scan` is a read-only pass that looks over a repository for improvements, so the bots can propose work too. This first version files nothing to GitHub: it logs what it finds. Filing findings as issues, grouping similar ones, and feeding in recent review findings come later.
+The pipeline only works on the issues Kenny writes. `iwb scan` is a read-only pass that looks over a repository for improvements, so the bots can propose work too. It files each finding as a `bot:proposed` issue, and Kenny decides which ones get built by adding `bot:work`. The model run itself is read-only and writes nothing to GitHub; only the filing step opens issues. Grouping similar findings and feeding in recent review findings come later.
 
 **Which repositories, and how often.** Only repositories listed in `scan_repos` in `config.json`, so scanning is off by default. Each one is scanned at most once every `scan_interval_days` (default 7). `iwb tick` checks the list after approval and scans the first due repository, at most one per pass, so no extra launchd job is needed. A paused config scans nothing, not even by hand. `iwb scan` runs it by hand over the whole list, or `--repo` over one repository, listed or not.
 
 **The record.** Each repository has `state["_scan"][repo] = {at, failed_at, next_eligible_at}`:
-- `at` is when the last usable scan finished.
-- `failed_at` is set when the clone or the model CLI fails, including a CLI that will not start. That is a transient failure, so `at` stays where it was.
+- `at` is when the last usable scan finished with every kept finding filed or found already filed.
+- `failed_at` is set when the clone or the model CLI fails, including a CLI that will not start. It is also set when a finding could not be checked or filed. All of these are transient failures, so `at` stays where it was.
 - `next_eligible_at` is set when the model gives two unusable answers in the same run. It is one interval ahead, so a model that cannot follow the format does not run every tick.
 
 **Precedence.** The first rule that applies decides whether a scan runs:
@@ -313,7 +313,7 @@ The pipeline only works on the issues Kenny writes. `iwb scan` is a read-only pa
 4. `next_eligible_at`, when it is set, decides a scheduled scan.
 5. Otherwise a scheduled scan waits the interval after `at`.
 
-A usable answer sets `at` and clears the other two fields. `--dry-run` prints the kept findings as JSON and saves no state.
+A usable answer whose findings were all filed sets `at` and clears the other two fields. `--dry-run` prints the kept findings as JSON and the issues it would file, posts nothing and saves no state.
 
 **Read-only.** One model run per repository, in `iwb`'s own shallow clone, removed afterwards. The worker bots take turns. The run has the same restrictions as analysis:
 - Claude gets only `Read Grep Glob`, with Bash, Edit, Write and the web tools disallowed and no MCP servers (`--strict-mcp-config` with no config).
@@ -321,7 +321,17 @@ A usable answer sets `at` and clears the other two fields. `--dry-run` prints th
 
 The prompt asks for every improvement, large or small, in fixed categories: stale docs and comments, missing or hollow tests, dead code and unused config, missing CI checks, outdated or vulnerable dependencies, and agent setup. The answer is one JSON block of findings. Each finding has a title, category, area, root cause, evidence, why, suggested change, acceptance, confidence and fingerprint (`category:path:slug`). An unreadable answer is asked for once more.
 
-**What is kept.** Findings with confidence at least 80. When findings share a fingerprint, only the one with the highest confidence is kept, and the kept findings are sorted by confidence. Model text is passed through the same token redaction as comments before it is logged or printed.
+**What is kept.** Findings with confidence at least 80. When findings share a fingerprint, only the one with the highest confidence is kept, and the kept findings are sorted by confidence. Model text is passed through the same token redaction as comments before it is logged, printed or filed.
+
+**Filing.** Every kept finding is filed as its own issue, highest confidence first, with no cap. The worker bot that ran the scan opens it with the label `bot:proposed`. The label is created by the scanner and is not one of the status labels, so `post()` never strips it. The body has the finding, its evidence, why, the suggested change and acceptance criteria, then the hidden marker `<!-- iwb-scan:<fingerprint> -->`. HTML comments in model text are escaped, so a finding cannot carry another finding's marker.
+
+**Dedup by marker.** GitHub, not the state file, is the memory. A finding is not filed while an issue in the same repository carries its exact marker, open or closed: closing a proposal means "don't do it". A marker on a pull request does not count. The same fingerprint in two repositories is two findings. The check runs in two steps:
+1. An issue search (`is:issue`, with an explicit `--jq` projection) whose hits are checked for the exact marker in their bodies.
+2. When the search errors or has no exact match, the authoritative fallback: every issue in the repository (`state=all`, paginated, pull requests skipped), listed once per scan.
+
+When the fallback errors too, the finding is skipped and logged. The scan sets `failed_at` and leaves `at`, so it runs again after an hour. A finding is never filed blind.
+
+**Intake.** Intake leaves an issue labeled `bot:proposed`, or opened by a worker bot, alone until Kenny adds `bot:work`. That holds even if the bot is listed in `trusted_openers`, and only Kenny's `bot:work` counts, as for any other opener.
 
 ## Repository checks
 
