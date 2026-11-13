@@ -563,11 +563,16 @@ Answer with a revised plan that addresses the review, or with questions. no_chan
 
 
 def revision_pending(entry):
-    """Whether the issue's latest plan was sent back ("Plan needs changes") and no newer analysis has been posted.
+    """Whether the issue's latest plan was sent back ("Plan needs changes") and no newer plan has been posted.
     In that state the next analysis must revise the plan or ask questions: a no_change answer would drop the
-    issue out of the pipeline with the reviewer's changes never made."""
+    issue out of the pipeline with the reviewer's changes never made. Questions answered in between, a retry
+    after bot:needs-kenny or bot:blocked is removed, or a hand-over all keep it pending: only a new plan ends it.
+    "plan_at" is when the last plan was posted; an entry from before it existed falls back to its plan analysis."""
     a, ap = entry.get("analysis") or {}, entry.get("approval") or {}
-    return a.get("decision") == "plan" and ap.get("verdict") == "revise" and ap.get("at", 0) >= a.get("at", 0)
+    if ap.get("verdict") != "revise":
+        return False
+    plan_at = entry.get("plan_at", a.get("at", 0) if a.get("decision") == "plan" else 0)
+    return ap.get("at", 0) >= plan_at
 
 
 def is_plan_comment(body):
@@ -1104,6 +1109,7 @@ def finish_analysis(job, answer, err, dry_run):
         plan_file = PLANS_DIR / f"{repo.replace('/', '__')}__{number}.json"
         write_atomic(plan_file, json.dumps({"units": answer["units"]}, indent=1) + "\n")
         entry["plan_file"] = str(plan_file)
+        entry["plan_at"] = time.time()   # ends a pending revision (revision_pending)
     entry.pop("stale_plan", None)        # a fresh analysis replaces the out-of-date plan
     entry.pop("reason", None)            # consumed only now: a held or failed analysis keeps them
     entry.pop("replan", None)

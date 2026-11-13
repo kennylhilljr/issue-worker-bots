@@ -833,6 +833,7 @@ class Analyze(unittest.TestCase):
         state = json.loads(iwb.STATE.read_text())
         e = state[self.KEY]
         e["analysis"]["at"] -= 120                              # the plan, then the review a minute later
+        e["plan_at"] = e["analysis"]["at"]
         e["approval"] = {"verdict": "revise", "source_digest": "d", "at": e["analysis"]["at"] + 60,
                          "comment": "https://x/review"}   # what cmd_approve stores when it sends a plan back
         e["review_revisions"], e["replan"] = 1, True
@@ -879,11 +880,37 @@ class Analyze(unittest.TestCase):
         self.run_pass()
         self.assertEqual(len(self.prompts), 3)                   # skipped while Kenny has it
         self.issue["labels"] = []
-        self.answers = [answer({"decision": "plan", "summary": "v2", "units": [unit()]})]
-        self.run_pass()                                          # label removed: analysis again
+        self.answers = [answer({"decision": "no_change", "summary": bot_thread})]
+        self.run_pass()                                          # label removed: analysis again, still guarded
         self.assertEqual(len(self.prompts), 4)
         self.assertNotIn("blocked", self.state())
         self.assertNotIn("blocked_label", self.state())
+        self.assertIn("no_change is not allowed here", self.full_prompts[-1])
+        self.assertNotIn("bot:no-code", [label for _, label, _ in self.posts])
+        self.answers = [answer({"decision": "plan", "summary": "v2", "units": [unit()]})]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:planned")
+        self.assertFalse(iwb.revision_pending(self.state()))
+
+    def test_questions_in_between_keep_the_revision_pending(self):
+        self.revise_pending_thread()
+        self.answers = [answer({"decision": "questions", "summary": "?", "questions": ["Tier 2 for all units?"]})]
+        self.run_pass()
+        self.assertEqual(self.posts[-1][1], "bot:needs-info")
+        self.assertTrue(iwb.revision_pending(self.state()))      # questions are not a revised plan
+        self.comments.append({"user": OWNER, "body": "Yes, tier 2.", "at": self.later()})
+        self.answers = [answer({"decision": "no_change", "summary": "The bots are discussing it."})]
+        self.run_pass()
+        self.assertNotIn("bot:no-code", [label for _, label, _ in self.posts])
+        self.assertIn("no_change is not allowed here", self.full_prompts[-1])
+        self.assertEqual(self.state()["analysis"]["decision"], "questions")
+
+    def test_entry_from_before_plan_at_still_counts_its_plan(self):
+        e = {"analysis": {"decision": "plan", "at": 100}, "approval": {"verdict": "revise", "at": 160}}
+        self.assertTrue(iwb.revision_pending(e))
+        self.assertFalse(iwb.revision_pending({**e, "approval": {"verdict": "approve", "at": 160}}))
+        self.assertFalse(iwb.revision_pending({**e, "approval": {"verdict": "revise", "at": 50}}))
+        self.assertFalse(iwb.revision_pending({"analysis": {"decision": "no_change", "at": 100}}))
 
     def test_revised_plan_clears_the_pending_revision(self):
         self.revise_pending_thread()
