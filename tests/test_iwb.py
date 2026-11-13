@@ -4311,6 +4311,116 @@ class QueueRealSteps(Queue):
         self.assertEqual(len(self.left(self.q)), 1)
         self.assertEqual(self.left(wrong), [])
 
+    def test_a_failed_stale_plan_notification_is_retried(self):
+        # regression (Codex review of #12): the stale-plan event could not be written, the hand-off was deferred,
+        # and its retry saw stale_plan set, skipped the issue and deleted the hand-off: the event was never sent
+        self.real_coding()
+        self.save({5: self.approved(5)})
+        self.code_event(5)
+        self.comments[5] = [{"user": OWNER, "body": "Wait, the API changed.", "at": "2026-11-03T14:00:00Z"}]
+        real = iwb.write_event
+        with mock.patch.object(iwb, "write_event", lambda dest, *a, **kw: (_ for _ in ()).throw(OSError("disk full"))
+                               if dest == self.q else real(dest, *a, **kw)):
+            code, out = self.code_drain()
+        self.assertEqual(code, 0)
+        self.assertIn("notification will retry: disk full", out)
+        self.assertEqual(len(self.left(self.cq) + self.left(self.cdeferred)), 1)   # the hand-off is kept
+        self.assertFalse(json.loads(iwb.STATE.read_text())[self.KEY]["stale_plan"]["notified"])
+        with redirect_stdout(io.StringIO()):
+            iwb.requeue_deferred(self.cq, iwb.CODE_QUEUE_DEFAULT)
+        code, out = self.code_drain()
+        self.assertEqual(code, 0)
+        (back,) = self.q.iterdir()
+        self.assertEqual(json.loads(back.read_text())["event"], "stale-plan")
+        self.assertEqual((self.left(self.cq), self.left(self.cdeferred), self.coded), ([], [], []))
+        stale = json.loads(iwb.STATE.read_text())[self.KEY]["stale_plan"]
+        self.assertEqual((stale["reason"], stale["notified"]), ("reply after plan", True))
+        self.code_event(5)                                            # sent: a later hand-off sends nothing more
+        self.code_drain()
+        self.assertEqual((len(self.left(self.q)), self.left(self.cq), self.coded), (1, [], []))
+
+    def test_a_failed_stale_plan_retry_keeps_the_hand_off(self):
+        self.real_coding()
+        self.save({5: self.approved(5, stale_plan={"at": 1, "reason": "reply after plan", "notified": False})})
+        self.code_event(5)
+        moved = Path(self.tmp.name, "moved")
+        self.q.rename(moved)
+        self.q.symlink_to(moved)                                      # the issue queue is now unsafe: the retry fails
+        code, out = self.code_drain()
+        self.assertEqual(code, 0)
+        self.assertIn("notification will retry", out)
+        self.assertEqual((self.left(self.cq), len(self.left(self.cdeferred)), self.coded), ([], 1, []))
+        self.assertIs(json.loads(iwb.STATE.read_text())[self.KEY]["stale_plan"]["notified"], False)
+
+    def test_a_busy_coding_lock_keeps_an_unsent_stale_plan_hand_off_waiting(self):
+        self.real_coding()
+        held = iwb.work_lock()                                        # another `iwb code` is running
+        self.addCleanup(held.close)
+        self.save({5: self.approved(5, stale_plan={"at": 1, "reason": "reply after plan", "notified": False})})
+        self.code_event(5)
+        code, out = self.code_drain()
+        self.assertEqual((code, self.left(self.cq), self.attempts(self.cdeferred)), (0, [], [None]))
+        self.assertIn(f"waiting: {self.KEY}", out)
+        for f in self.cdeferred.iterdir():
+            f.unlink()
+        self.save({5: self.approved(5, stale_plan={"at": 1, "reason": "reply after plan", "notified": True})})
+        self.code_event(5)                                            # already sent: nothing left to do
+        self.assertEqual((self.code_drain()[0], self.left(self.cq), self.left(self.cdeferred)), (0, [], []))
+        self.assertEqual(self.left(self.q), [])
+
+    def test_a_dry_run_does_not_retry_a_stale_plan_notification(self):
+        self.real_coding()
+        self.save({5: self.approved(5, stale_plan={"at": 1, "reason": "reply after plan", "notified": False})})
+        before = iwb.STATE.read_bytes()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(iwb.cmd_code(dry_run=True, intake_q=self.q), 0)
+        self.assertIn("would send the stale-plan event", out.getvalue())
+        self.assertEqual((self.left(self.q), iwb.STATE.read_bytes(), self.coded), ([], before, []))
+
+    def concurrent_change(self, change):
+        """mark_stale_notified, with another pass's save_state (of `change` to the entry) started right after the
+        helper read the state file and before it wrote. Returns (whether that save was still waiting for
+        state.lock when the helper went on, what the helper returned, the entry afterwards)."""
+        import threading
+        token = {"at": 1, "reason": "reply after plan", "notified": False}
+        self.save({5: self.approved(5, stale_plan=token)})
+        state, since = iwb.load_state()                               # the other pass, an analysis, read earlier
+        change(state[self.KEY])
+        other = threading.Thread(target=iwb.save_state, args=(state, since))
+        waited = []
+
+        def between_read_and_write():
+            other.start()
+            other.join(0.5)
+            waited.append(other.is_alive())
+
+        with mock.patch.object(iwb, "_stale_notified_read", between_read_and_write):
+            done = iwb.mark_stale_notified(self.KEY, dict(token))
+        other.join(10)
+        self.assertFalse(other.is_alive())
+        return waited, done, json.loads(iwb.STATE.read_text())[self.KEY]
+
+    def test_a_stale_plan_cleared_while_it_is_marked_notified_stays_cleared(self):
+        waited, done, entry = self.concurrent_change(lambda e: e.pop("stale_plan"))
+        self.assertEqual((waited, done), ([True], True))              # the read-to-write section held state.lock
+        self.assertNotIn("stale_plan", entry)
+
+    def test_a_stale_plan_replaced_while_it_is_marked_notified_keeps_the_newer_record(self):
+        newer = {"at": 2, "reason": "issue edited", "notified": False}
+        waited, done, entry = self.concurrent_change(lambda e: e.update(stale_plan=dict(newer)))
+        self.assertEqual(waited, [True])
+        self.assertEqual(entry["stale_plan"], newer)
+
+    def test_a_changed_stale_plan_record_is_left_as_it_is(self):
+        self.save({5: self.approved(5, stale_plan={"at": 2, "reason": "issue edited", "notified": False})})
+        before = iwb.STATE.read_bytes()
+        self.assertFalse(iwb.mark_stale_notified(self.KEY, {"at": 1, "reason": "reply after plan", "notified": False}))
+        self.save({})
+        self.assertFalse(iwb.mark_stale_notified(self.KEY, {"at": 1, "reason": "reply after plan", "notified": False}))
+        self.save({5: self.approved(5, stale_plan={"at": 2, "reason": "issue edited", "notified": False})})
+        self.assertEqual(iwb.STATE.read_bytes(), before)
+
     def test_a_current_plan_is_coded_and_an_edited_issue_is_not(self):
         self.real_coding()
         self.save({5: self.approved(5)})
