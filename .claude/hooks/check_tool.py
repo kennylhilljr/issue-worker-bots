@@ -729,6 +729,8 @@ def _may_name_iwb(source):
     """
     if any(ch in source for ch in "=()|^~#") or _has_active_expansion(source):
         return True
+    if "[" in source and any(ch in source for ch in "\\'\""):
+        return True     # a quoted or escaped ] does not close the set: i[w\]]b is iwb
     single = source
     while True:
         replaced = re.sub(r"\{[^{}]*\}", "?", single)

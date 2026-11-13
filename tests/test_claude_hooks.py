@@ -324,6 +324,9 @@ class LiveCommands(unittest.TestCase):
         # without a slash an alias, function, hash entry or PATH may make the word iwb
         "shopt -s expand_aliases\nalias 'x*'=./iwb\nx* tick", "x* tick", "i[ac]b tick",
         "hash -p ./iwb 'k?'; k? tick",
+        # a quoted or escaped ] stays in the set
+        "./bin/i[w\\]]b tick", "./bin/i[w']']b tick", './bin/i[w"]"]b tick', "./bin/i[w\\]-]b intake",
+        "./*[w\\]]b tick",
         # zsh = expansion looks iwb up in PATH, quoted empty prefixes included
         "''=iw{b..b} tick", '""=i[w]b tick', "=i?b tick",
         # with nullglob a glob that matches nothing disappears and the next word runs
