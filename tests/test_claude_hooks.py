@@ -307,6 +307,31 @@ class LiveCommands(unittest.TestCase):
         'cmd=bash; "${cmd%"?"}" -c \'./iwb tick\'', 'cmd=./install-intake.sh; "${cmd%"?"}"',
         'cmd=./install-intake.sh; $""$cmd', "cmd=./install-intake.sh; $''$cmd",
         'cmd=./install-intake.sh; $"$cmd"',
+        # before an iwb subcommand, a word that may name iwb stays refused (issue #95)
+        "./i[a-z]b tick", "./I[W]B code", "./{i,x}wb tick", "./i*b code --dry-run",
+        './sc"$x"b tick', "./scripts/$x.py code", '"a$"$x.py tick', './x"$@"y tick',
+        "'./i'*b tick", "~/i[w]b tick", "=i[w]b tick", "./i[w]b/ tick",
+        # zsh extendedglob: ^x, x~y and x# can match iwb
+        "setopt extendedglob; ./iw^x* tick", "./iw^x* tick", "./i*~x tick", "./[i]w~x* tick",
+        "./x#iwb tick", "./i[w]#b tick", "./i[w]b~x tick",
+        # zsh braceccl: {w} and {v-x} are character classes
+        "setopt braceccl; ./i{w}b tick", "./i{v-x}b* tick", "./i{w}? tick",
+        "./iw{[:lower:]} tick", "./i{[[:lower:]]}b tick", "./i{]w}b tick",
+        './i{"}"w}b tick', "./i{{w}}b tick", "./i{ac}b tick",
+        # brackets fnmatch reads differently, negations, ranges and classes
+        "./i[w[:]]b tick", "./i[!]b tick", "./i[!x]b tick", "./i[v-x]b tick",
+        "./i[[:lower:]]b tick", "./i[[=w=]]b tick", "./i[]w]b tick", "./i[a\\w]b tick",
+        # without a slash an alias, function, hash entry or PATH may make the word iwb
+        "shopt -s expand_aliases\nalias 'x*'=./iwb\nx* tick", "x* tick", "i[ac]b tick",
+        "hash -p ./iwb 'k?'; k? tick",
+        # a quoted or escaped ] stays in the set
+        "./bin/i[w\\]]b tick", "./bin/i[w']']b tick", './bin/i[w"]"]b tick', "./bin/i[w\\]-]b intake",
+        "./*[w\\]]b tick",
+        # zsh = expansion looks iwb up in PATH, quoted empty prefixes included
+        "''=iw{b..b} tick", '""=i[w]b tick', "=i?b tick",
+        # with nullglob a glob that matches nothing disappears and the next word runs
+        "shopt -s nullglob; ./zz*.py ./iwb tick", "./scripts/*.py ./IWB tick",
+        "./scripts/*.py ./i?b tick", "./scripts/*.py $X tick",
     )
 
     ALLOWED = (
@@ -356,6 +381,10 @@ class LiveCommands(unittest.TestCase):
         "cmd=./install-intake.sh; echo '$cmd'", "cmd=./install-intake.sh; '$cmd'",
         "cmd=./install-intake.sh; \\$cmd", "ba?h -c 'echo ok'", '"${PY:-python3}" -m unittest',
         'L=launchctl; "${L:-x}" list',
+        # globs before an iwb subcommand that cannot match iwb (issue #95)
+        "./i[ac]b tick", "'./i*b' tick", "./scripts/*.py code", "./i\\*b tick",
+        '"./iw?" tick', "./scripts/{check,x}.py code --dry-run", "./i[ac][ac]b analyze",
+        "./I[AC]B tick", "/x/i[ac]b approve",
     )
 
     def setUp(self):
