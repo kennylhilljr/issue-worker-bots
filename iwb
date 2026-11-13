@@ -3730,11 +3730,14 @@ def requeue_deferred(queue, default):
 
 def read_event(f):
     """The event as a dict, or None if it can never be handled (bad JSON, no valid repo or issue number). A sweep
-    ({"kind": "sweep", "repo": "owner/name" or null}) has no number."""
+    ({"kind": "sweep", "repo": "owner/name" or null}) has no number. Its "repo" key must be there: an explicit
+    null sweeps every repository, but a sweep without the key is rejected, not taken as one for all of them."""
     try:
         ev = json.loads(f.read_text())
         if isinstance(ev, dict) and ev.get("kind") == "sweep":
-            repo = ev.get("repo")
+            if "repo" not in ev:
+                return None
+            repo = ev["repo"]
             return ev if repo is None or isinstance(repo, str) and REPO_NAME.fullmatch(repo) else None
         repo, number = ev["repo"], ev["number"]
     except (ValueError, KeyError, TypeError, IndexError):

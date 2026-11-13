@@ -4294,6 +4294,16 @@ class Queue(unittest.TestCase):
         self.assertEqual(self.passes, [("intake", None), ("analyze", None)])
         self.assertEqual(self.left(), [])
 
+    def test_a_sweep_without_a_repo_key_is_rejected(self):
+        # regression (Codex review of #12): a sweep with no "repo" key read as "repo": null and swept every repository
+        f = self.q / "sweep-no-key.json"
+        f.write_text(json.dumps({"kind": "sweep", "received_at": "2026-11-03T14:15:02.123Z",
+                                 "source": "github-event-router", "version": 1}))
+        self.assertEqual(self.drain()[0], 0)
+        self.assertEqual(self.left(), [])
+        self.assertEqual(self.left(self.rejected), [f.name])
+        self.assertEqual(self.passes, [])
+
     def test_a_sweep_runs_after_the_queued_issues(self):
         self.event(1)
         self.sweep(self.REPO)
