@@ -441,6 +441,47 @@ def answer(obj):
     return "Here is my analysis.\n```json\n" + json.dumps(obj) + "\n```\n"
 
 
+class AttentionTag(unittest.TestCase):
+    """Every attention event names the worker bot it is about: all bots share one Slack identity."""
+
+    def setUp(self):
+        self.saved = (iwb.prbot.openclaw_attention, iwb.prbot.bot_config)
+        self.events = []
+        iwb.prbot.openclaw_attention = lambda reason, detail: self.events.append((reason, detail)) or True
+        self.config = {"claude-dev": {"slug": "claude-dev-gh"}, "codex-dev": {"slug": "codex-dev-gh"}}
+        iwb.prbot.bot_config = lambda bot: self.config.get(bot) or iwb.prbot.die(f"bot '{bot}' is not registered")
+
+    def tearDown(self):
+        iwb.prbot.openclaw_attention, iwb.prbot.bot_config = self.saved
+
+    def test_registered_slug_wins_and_bad_or_missing_slugs_fall_back(self):
+        self.config = {"claude-dev": {"slug": "my-claude-app"}, "codex-dev": {"slug": "Bad Slug]"}}
+        with redirect_stderr(io.StringIO()):
+            iwb.attention("claude-dev", "blocked: o/r#1", {})
+            iwb.attention("codex-dev", "blocked: o/r#2", {})
+            self.config = {}
+            iwb.attention("claude-dev", "blocked: o/r#3", {})
+        self.assertEqual([r for r, _ in self.events], ["[my-claude-app] blocked: o/r#1",
+                                                       "[codex-dev-gh] blocked: o/r#2", "[claude-dev-gh] blocked: o/r#3"])
+
+    def test_reason_starts_with_the_worker_bot_login(self):
+        self.assertTrue(iwb.attention("claude-dev", "blocked: o/r#1", {"url": "u"}))
+        iwb.attention("codex-dev", "needs-kenny: o/r#2", {})
+        iwb.attention("someone-else", "blocked: o/r#3", {})
+        self.assertEqual([r for r, _ in self.events], ["[claude-dev-gh] blocked: o/r#1",
+                                                       "[codex-dev-gh] needs-kenny: o/r#2", "[iwb] blocked: o/r#3"])
+        self.assertEqual(self.events[0][1], {"url": "u"})
+
+    def test_logins_match_the_registered_apps(self):
+        for bot, login in iwb.BOT_LOGINS.items():
+            self.assertEqual(json.loads(Path(iwb.ROOT, "bots", f"{bot}.json").read_text())["name"], login)
+        self.assertEqual(set(iwb.BOT_LOGINS), set(iwb.WORKERS.values()))
+
+    def test_every_call_goes_through_the_tag(self):
+        src = Path(iwb.ROOT, "iwb").read_text()
+        self.assertEqual(src.count("prbot.openclaw_attention("), 1)   # only inside attention()
+
+
 class Analyze(unittest.TestCase):
     KEY = "kennylhilljr/demo#1"
 
@@ -736,7 +777,7 @@ class Analyze(unittest.TestCase):
     def test_openclaw_hears_what_needs_kenny_once(self):
         self.answers = [answer({"decision": "questions", "summary": "?", "questions": ["a", "b"]})]
         self.run_pass()
-        self.assertEqual([r for r, _ in self.events], ["questions: kennylhilljr/demo#1"])
+        self.assertEqual([r for r, _ in self.events], ["[claude-dev-gh] questions: kennylhilljr/demo#1"])
         self.assertEqual(self.events[0][1]["questions"], 2)
         self.run_pass()
         self.assertEqual(len(self.events), 1)   # no new event without a new moment
@@ -746,7 +787,7 @@ class Analyze(unittest.TestCase):
                                 "units": [unit("a"), unit("b", routing={**unit()["routing"], "initial_tier": 2})]})]
         self.run_pass()
         reason, detail = self.events[1]
-        self.assertEqual(reason, "plan ready: kennylhilljr/demo#1")
+        self.assertEqual(reason, "[claude-dev-gh] plan ready: kennylhilljr/demo#1")
         self.assertEqual((detail["units"], detail["highest_tier"], detail["worker"]), (2, 2, "claude-dev-gh"))
 
     def test_no_change_and_dry_run_stay_quiet_blocked_does_not(self):
@@ -760,7 +801,7 @@ class Analyze(unittest.TestCase):
         self.answers = ["junk", "more junk"]
         self.run_pass()
         self.run_pass()
-        self.assertEqual([r for r, _ in self.events], ["blocked: kennylhilljr/demo#1"])
+        self.assertEqual([r for r, _ in self.events], ["[claude-dev-gh] blocked: kennylhilljr/demo#1"])
 
     def later(self, minutes=1):
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60 * minutes))
@@ -875,7 +916,7 @@ class Analyze(unittest.TestCase):
         self.run_pass()                                          # second refusal: hand it to Kenny
         self.assertEqual([label for _, label, _ in self.posts], ["bot:planned", "bot:needs-kenny"])
         self.assertIn("remove `bot:needs-kenny`", self.posts[-1][2])
-        self.assertEqual(self.events[-1][0], "needs-kenny: kennylhilljr/demo#1")
+        self.assertEqual(self.events[-1][0], "[claude-dev-gh] needs-kenny: kennylhilljr/demo#1")
         self.assertIs(self.state()["blocked"], True)
         self.issue["labels"] = ["bot:needs-kenny"]
         self.run_pass()
@@ -1680,7 +1721,7 @@ class Approve(unittest.TestCase):
         self.verdicts = [{"verdict": "reject", "summary": "wrong approach"}]
         self.run_pass()
         self.assertEqual(self.posts[-1][1], "bot:blocked")
-        self.assertEqual(self.events, ["blocked: kennylhilljr/demo#1"])
+        self.assertEqual(self.events, ["[claude-dev-gh] blocked: kennylhilljr/demo#1"])
 
     def test_lint_send_back_leaves_the_reviewer_its_own_revision(self):
         # regression: issue-worker-bots#15, a lint send-back used up the only revision, so the reviewer's
@@ -1701,7 +1742,7 @@ class Approve(unittest.TestCase):
         self.verdicts = [{"verdict": "revise", "summary": "x", "changes": ["still missing"]}]
         self.run_pass()
         self.assertEqual(self.posts[-1][1], "bot:blocked")                 # a second reviewer revise still blocks
-        self.assertEqual(self.events, ["blocked: kennylhilljr/demo#1"])
+        self.assertEqual(self.events, ["[claude-dev-gh] blocked: kennylhilljr/demo#1"])
 
     def test_second_lint_send_back_blocks(self):
         self.plan(code_unit())
@@ -3175,7 +3216,7 @@ class Code(unittest.TestCase):
         e = self.state()
         self.assertTrue(e["blocked"])
         self.assertEqual(e["approval"]["plan_digest"], iwb.plan_digest(units))
-        self.assertEqual(self.events, ["blocked: kennylhilljr/demo#1"])
+        self.assertEqual(self.events, ["[claude-dev-gh] blocked: kennylhilljr/demo#1"])
         self.run_pass()
         self.assertEqual(len(self.posts), 1)                            # quiet until Kenny removes bot:blocked
 
@@ -3273,7 +3314,7 @@ class Code(unittest.TestCase):
         self.run_pass()
         self.assertEqual(self.labels(), ["bot:in-progress", "bot:blocked"])
         self.assertIn("stopped: needs_owner", self.posts[-1][2])
-        self.assertEqual(self.events, ["blocked: kennylhilljr/demo#1"])
+        self.assertEqual(self.events, ["[claude-dev-gh] blocked: kennylhilljr/demo#1"])
         self.assertEqual(self.pushed, [])
         self.approve_plan([coding_unit()], key="kennylhilljr/demo#4")
         self.ecc_results.pop("drive")
@@ -6156,7 +6197,7 @@ class AutoMerge(unittest.TestCase):
         self.assertEqual(self.labels(), ["bot:needs-kenny"])
         self.assertIn(why, self.posts[0][2])
         self.assertEqual(self.work()["status"], "needs-kenny")
-        self.assertEqual(self.events, [f"needs-kenny: {self.KEY}"])
+        self.assertEqual(self.events, [f"[claude-dev-gh] needs-kenny: {self.KEY}"])
 
     def test_clean_review_merges(self):
         self.run_pass()

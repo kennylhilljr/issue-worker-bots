@@ -251,16 +251,16 @@ One detail drives the event choice below: the plugin creates a run entry for eve
 
 The bots already look at GitHub every 5 minutes. They also emit what they did into the event log.
 
-- **Writer.** `iwb` and `prbot` import `JsonlEventSink` from the installed runtime (`~/.local/share/openclaw-ecc-orchestrator/runtime/src`) and call `emit(type, run_id, unit_id, data)`. Locking, ordering, redaction and truncation come with it. If the runtime can't be imported or the file is locked for too long, the bot logs it once and carries on; GitHub work never waits on OpenClaw.
+- **Writer.** `iwb` and `prbot` import `JsonlEventSink` from the installed runtime (`~/.local/share/openclaw-ecc-orchestrator/runtime/src`) and call `emit(type, run_id, unit_id, data)`. The `reason` starts with a tag naming the bot it is about (`[claude-dev-gh]`, `[codex-dev-gh]`, `[claude-pr-gh]`, `[codex-pr-gh]`, or `[iwb]`/`[prbot]` when no single bot applies), because Slack shows every bot under one identity. Locking, ordering, redaction and truncation come with it. If the runtime can't be imported or the file is locked for too long, the bot logs it once and carries on; GitHub work never waits on OpenClaw.
 - **One pseudo-run.** All GitHub activity uses a single `run_id`, `github`, so OpenClaw shows one entry for it instead of one per issue.
 - **Only what needs Kenny, as `attention.required`.** This type renders today with no plugin change:
 
-| Bot moment | `reason` (100 characters max) | `detail` |
+| Bot moment | `reason` (100 characters max after the tag) | `detail` |
 | --- | --- | --- |
-| Questions posted | `questions: <repo>#<n>` | issue title, URL, worker bot, model |
-| Plan posted | `plan ready: <repo>#<n>` | title, URL, number of units, highest tier |
-| Issue blocked | `blocked: <repo>#<n>` | the reason, URL |
-| Review with P1 or P2 findings | `review findings: <repo>#<pr>` | reviewer bot, number of findings, URL |
+| Questions posted | `[<worker login>] questions: <repo>#<n>` | issue title, URL, worker bot, model |
+| Plan posted | `[<worker login>] plan ready: <repo>#<n>` | title, URL, number of units, highest tier |
+| Issue blocked | `[<worker login>] blocked: <repo>#<n>`, `[<worker login>] needs-kenny: <repo>#<n>` | the reason, URL |
+| Review with P1 or P2 findings | `[<reviewer login>] review findings: <repo>#<pr>` | reviewer bot, number of findings, URL |
 
 - **Everything else, as `github.activity`, later.** Picked up, no-code answers, PRs opened, reviews without findings, pushes. The runtime's `make_event` rejects types it doesn't know, so this needs two small changes first: `github.activity` added to `EVENT_TYPES` in the orchestrator runtime (required field `kind`, no unit), and a plugin case that keeps a bounded list (like `merges`) and never creates a run. Until then, only the four moments above are emitted.
 - **Once per moment.** Each emitted event is recorded in the bot's state file (for example `events: ["plan ready"]` on the issue entry), so a pass never emits the same moment twice.
