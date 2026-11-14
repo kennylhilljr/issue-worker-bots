@@ -445,12 +445,24 @@ class AttentionTag(unittest.TestCase):
     """Every attention event names the worker bot it is about: all bots share one Slack identity."""
 
     def setUp(self):
-        self.saved = iwb.prbot.openclaw_attention
+        self.saved = (iwb.prbot.openclaw_attention, iwb.prbot.bot_config)
         self.events = []
         iwb.prbot.openclaw_attention = lambda reason, detail: self.events.append((reason, detail)) or True
+        self.config = {"claude-dev": {"slug": "claude-dev-gh"}, "codex-dev": {"slug": "codex-dev-gh"}}
+        iwb.prbot.bot_config = lambda bot: self.config.get(bot) or iwb.prbot.die(f"bot '{bot}' is not registered")
 
     def tearDown(self):
-        iwb.prbot.openclaw_attention = self.saved
+        iwb.prbot.openclaw_attention, iwb.prbot.bot_config = self.saved
+
+    def test_registered_slug_wins_and_bad_or_missing_slugs_fall_back(self):
+        self.config = {"claude-dev": {"slug": "my-claude-app"}, "codex-dev": {"slug": "Bad Slug]"}}
+        with redirect_stderr(io.StringIO()):
+            iwb.attention("claude-dev", "blocked: o/r#1", {})
+            iwb.attention("codex-dev", "blocked: o/r#2", {})
+            self.config = {}
+            iwb.attention("claude-dev", "blocked: o/r#3", {})
+        self.assertEqual([r for r, _ in self.events], ["[my-claude-app] blocked: o/r#1",
+                                                       "[codex-dev-gh] blocked: o/r#2", "[claude-dev-gh] blocked: o/r#3"])
 
     def test_reason_starts_with_the_worker_bot_login(self):
         self.assertTrue(iwb.attention("claude-dev", "blocked: o/r#1", {"url": "u"}))

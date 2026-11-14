@@ -1133,13 +1133,25 @@ def finish_analysis(job, answer, err, dry_run):
     log(f"{key}: posted {answer['decision']} ({label}) {url}")
 
 
-BOT_LOGINS = {"claude-dev": "claude-dev-gh", "codex-dev": "codex-dev-gh"}   # prbot name -> GitHub App login (bots/*.json)
+BOT_LOGINS = {"claude-dev": "claude-dev-gh", "codex-dev": "codex-dev-gh"}   # prbot name -> default App login (bots/*.json)
+LOGIN_TAG = re.compile(r"[a-z0-9][a-z0-9-]{0,38}")
+
+
+def bot_login(bot):
+    """The worker bot's GitHub App login: its registered App slug, else the default name, else "iwb"."""
+    try:
+        slug = prbot.bot_config(bot).get("slug")
+    except (Exception, SystemExit):   # not registered (prbot dies) or no readable config: a tag is still owed
+        slug = None
+    if isinstance(slug, str) and LOGIN_TAG.fullmatch(slug):
+        return slug
+    return BOT_LOGINS.get(bot, "iwb")
 
 
 def attention(bot, reason, detail):
     """Tell OpenClaw something needs Kenny. All bots share one Slack identity, so the reason starts with the
     worker bot's GitHub App login, e.g. "[claude-dev-gh] blocked: owner/repo#12", or [iwb] for an unknown bot."""
-    return prbot.openclaw_attention(f"[{BOT_LOGINS.get(bot, 'iwb')}] {reason}", detail)
+    return prbot.openclaw_attention(f"[{bot_login(bot)}] {reason}", detail)
 
 
 def tell_openclaw(bot, repo, number, title, slug, model, answer, url):
