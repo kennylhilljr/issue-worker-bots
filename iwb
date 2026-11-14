@@ -1098,8 +1098,8 @@ def finish_analysis(job, answer, err, dry_run):
             entry["blocked"] = True
             if stuck != "bot:blocked":
                 entry["blocked_label"] = stuck
-            prbot.openclaw_attention(f"{'blocked' if stuck == 'bot:blocked' else 'needs-kenny'}: {repo}#{number}",
-                                     {"url": url, "title": issue["title"], "worker": slug, "problem": str(e)})
+            attention(bot, f"{'blocked' if stuck == 'bot:blocked' else 'needs-kenny'}: {repo}#{number}",
+                      {"url": url, "title": issue["title"], "worker": slug, "problem": str(e)})
         else:
             mark(key, "deferred")         # the next pass asks the model again
         return
@@ -1129,20 +1129,29 @@ def finish_analysis(job, answer, err, dry_run):
         entry["handled_at"] = replan_at
     entry["analysis"] = {"decision": answer["decision"], "at": time.time(), "model": model, "comment": url,
                          "digest": digest}
-    tell_openclaw(repo, number, issue["title"], slug, model, answer, url)
+    tell_openclaw(bot, repo, number, issue["title"], slug, model, answer, url)
     log(f"{key}: posted {answer['decision']} ({label}) {url}")
 
 
-def tell_openclaw(repo, number, title, slug, model, answer, url):
+BOT_LOGINS = {"claude-dev": "claude-dev-gh", "codex-dev": "codex-dev-gh"}   # prbot name -> GitHub App login (bots/*.json)
+
+
+def attention(bot, reason, detail):
+    """Tell OpenClaw something needs Kenny. All bots share one Slack identity, so the reason starts with the
+    worker bot's GitHub App login, e.g. "[claude-dev-gh] blocked: owner/repo#12", or [iwb] for an unknown bot."""
+    return prbot.openclaw_attention(f"[{BOT_LOGINS.get(bot, 'iwb')}] {reason}", detail)
+
+
+def tell_openclaw(bot, repo, number, title, slug, model, answer, url):
     """Plans and questions need Kenny, so they go to OpenClaw. A no-code answer does not."""
     detail = {"url": url, "title": title, "worker": slug, "model": model}
     if answer["decision"] == "plan":
         detail.update(units=len(answer["units"]),
                       highest_tier=max(u["routing"]["initial_tier"] for u in answer["units"]))
-        prbot.openclaw_attention(f"plan ready: {repo}#{number}", detail)
+        attention(bot, f"plan ready: {repo}#{number}", detail)
     elif answer["decision"] == "questions":
         detail.update(questions=len(answer["questions"]))
-        prbot.openclaw_attention(f"questions: {repo}#{number}", detail)
+        attention(bot, f"questions: {repo}#{number}", detail)
 
 
 # ---------- step 4a: gates, red check, and plan approval by the other agent ----------
@@ -1547,8 +1556,8 @@ def send_back(entry, key, repo, number, worker, issue, digest, problems):
         entry["blocked"] = True
         entry["approval"] = {"verdict": "reject", "level": "rule", "source_digest": digest,
                              "at": time.time(), "comment": url, "problems": problems}
-        prbot.openclaw_attention(f"blocked: {repo}#{number}", {"url": url, "title": issue["title"],
-                                 "problem": problems[0][:200]})
+        attention(worker, f"blocked: {repo}#{number}", {"url": url, "title": issue["title"],
+                  "problem": problems[0][:200]})
         log(f"{key}: blocked after a revision {url}")
 
 
@@ -1598,8 +1607,8 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo_filter=None)
                 url = post(worker, repo, number, body, "bot:blocked")
                 entry["blocked"] = True
                 entry["approval"] = {"source_digest": digest, "verdict": "policy", "at": time.time(), "comment": url}
-                prbot.openclaw_attention(f"blocked: {repo}#{number}", {"url": url, "title": issue["title"],
-                                         "problem": "policy gate", "violations": violations[:5]})
+                attention(worker, f"blocked: {repo}#{number}", {"url": url, "title": issue["title"],
+                          "problem": "policy gate", "violations": violations[:5]})
             continue
         approver_agent = APPROVERS[agent]
         level = approval_level(units)
@@ -1687,8 +1696,8 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo_filter=None)
             url = post(reviewer, repo, number, body, "bot:blocked")
             entry["blocked"] = True
             entry["approval"] = {"verdict": v["verdict"], "source_digest": digest, "at": time.time(), "comment": url}
-            prbot.openclaw_attention(f"blocked: {repo}#{number}", {"url": url, "title": issue["title"],
-                                     "problem": f"plan {v['verdict']} by {slug}"})
+            attention(worker, f"blocked: {repo}#{number}", {"url": url, "title": issue["title"],
+                      "problem": f"plan {v['verdict']} by {slug}"})
             log(f"{key}: {v['verdict']} by {slug} {url}")
     if not dry_run:
         save_state(state, since)
@@ -2631,7 +2640,7 @@ def block(entry, bot, repo, number, title, body, problem):
     entry["blocked"] = True
     entry["work"] = {**(entry.get("work") or {}), "status": "blocked", "at": time.time(), "comment": url,
                      "problem": problem[:300]}
-    prbot.openclaw_attention(f"blocked: {repo}#{number}", {"url": url, "title": title, "problem": problem[:300]})
+    attention(bot, f"blocked: {repo}#{number}", {"url": url, "title": title, "problem": problem[:300]})
     log(f"{repo}#{number}: blocked ({problem[:120]}) {url}")
 
 
@@ -3313,7 +3322,7 @@ def needs_kenny(key, entry, why):
                f"GitHub can merge it cleanly. Nothing more happens here until Kenny merges or closes it.",
                "bot:needs-kenny")
     w.update(status="needs-kenny", at=time.time(), comment=url, problem=short(why, 300))
-    prbot.openclaw_attention(f"needs-kenny: {key}", {"url": w["pr"], "problem": short(why, 300)})
+    attention(worker, f"needs-kenny: {key}", {"url": w["pr"], "problem": short(why, 300)})
     log(f"{key}: PR waits for Kenny ({short(why, 160)}) {url}")
 
 

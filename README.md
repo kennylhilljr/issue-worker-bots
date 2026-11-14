@@ -217,7 +217,7 @@ Commands may be prefixed with `@claude-dev-gh` or `@codex-dev-gh`. Editing the i
 
 ### OpenClaw
 
-Plans ready, questions posted and blocked issues appear in OpenClaw as `attention.required` events under one `github` run (Phase A of the bridge in [`DESIGN.md`](DESIGN.md)). They go through the orchestrator runtime's own event writer via `prbot`, and are skipped quietly if the runtime is not installed. No-code answers and dry runs send nothing.
+Plans ready, questions posted and blocked issues appear in OpenClaw as `attention.required` events under one `github` run (Phase A of the bridge in [`DESIGN.md`](DESIGN.md)). They go through the orchestrator runtime's own event writer via `prbot`, and are skipped quietly if the runtime is not installed. All bots share one Slack identity, so each event's reason starts with the worker bot's GitHub App login, such as `[claude-dev-gh] blocked: owner/repo#12` (`[iwb]` if no worker bot applies). No-code answers and dry runs send nothing.
 
 ## CLI reference
 

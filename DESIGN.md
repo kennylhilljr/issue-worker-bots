@@ -251,7 +251,7 @@ One detail drives the event choice below: the plugin creates a run entry for eve
 
 The bots already look at GitHub every 5 minutes. They also emit what they did into the event log.
 
-- **Writer.** `iwb` and `prbot` import `JsonlEventSink` from the installed runtime (`~/.local/share/openclaw-ecc-orchestrator/runtime/src`) and call `emit(type, run_id, unit_id, data)`. Locking, ordering, redaction and truncation come with it. If the runtime can't be imported or the file is locked for too long, the bot logs it once and carries on; GitHub work never waits on OpenClaw.
+- **Writer.** `iwb` and `prbot` import `JsonlEventSink` from the installed runtime (`~/.local/share/openclaw-ecc-orchestrator/runtime/src`) and call `emit(type, run_id, unit_id, data)`. The `reason` starts with a tag naming the bot it is about (`[claude-dev-gh]`, `[codex-dev-gh]`, `[claude-pr-gh]`, `[codex-pr-gh]`, or `[iwb]`/`[prbot]` when no single bot applies), because Slack shows every bot under one identity. Locking, ordering, redaction and truncation come with it. If the runtime can't be imported or the file is locked for too long, the bot logs it once and carries on; GitHub work never waits on OpenClaw.
 - **One pseudo-run.** All GitHub activity uses a single `run_id`, `github`, so OpenClaw shows one entry for it instead of one per issue.
 - **Only what needs Kenny, as `attention.required`.** This type renders today with no plugin change:
 
