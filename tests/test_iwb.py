@@ -6826,7 +6826,9 @@ class SharedSkills(unittest.TestCase):
                 self.assertFalse({"GIT_ASKPASS", "SSH_ASKPASS"} & set(k["env"]))     # nothing can prompt
                 real(["git", *LOCAL_PROTOCOLS, "clone", "-q", str(self.consumer), cmd[-1]], check=True,
                      capture_output=True)
-                return self.sp.CompletedProcess(cmd, 128, "", "remote: Write access to repository not granted.")
+                return self.sp.CompletedProcess(cmd, 128, "", "remote: Write access to repository not granted.\n"
+                                                "fatal: clone of '...' into submodule path '.agents/skills/shared' "
+                                                "failed")
             if "submodule" in cmd and "update" in cmd:
                 retries.append((list(cmd), k["env"]))
                 if not retry_ok:
@@ -6847,9 +6849,10 @@ class SharedSkills(unittest.TestCase):
         self.assertEqual(cmd[:3], ["git", "-c", "credential.helper="])
         self.assertIn("core.askPass=", cmd)
         self.assertFalse({"GIT_ASKPASS", "SSH_ASKPASS"} & set(env))
+        self.assertEqual((env["GIT_CONFIG_NOSYSTEM"], env["GIT_CONFIG_GLOBAL"]), ("1", os.devnull))   # no extraHeader
         self.assertEqual(cmd[-5:], ["submodule", "update", "--init", "--depth", "1"])
         self.assertNotIn("PRBOT_GIT_TOKEN", env)
-        self.assertFalse([k for k in env if k.startswith("GIT_CONFIG_")])
+        self.assertFalse([k for k in env if re.match(r"GIT_CONFIG_(COUNT|KEY_|VALUE_)", k)])   # prbot's helper
         self.assertTrue(any("retrying with an empty credential helper" in x for x in self.logs))
         self.assertIn(f"t: shared skills: {self.pinned} (fetched with an empty credential helper)", self.logs)
         self.assertFalse(any("tok-secret" in x for x in self.logs))
@@ -6914,7 +6917,8 @@ class SharedSkills(unittest.TestCase):
                 real(["git", *LOCAL_PROTOCOLS, "clone", "-q", str(self.consumer), cmd[-1]], check=True,
                      capture_output=True)
                 Path(cmd[-1], "a.py").unlink()                   # the checkout of the repository itself failed
-                return self.sp.CompletedProcess(cmd, 128, "", "error: unable to write file a.py")
+                return self.sp.CompletedProcess(cmd, 128, "", "error: unable to write file a.py\n"
+                                                "fatal: Failed to clone submodule")
             return real(cmd, *a, **k)
         with mock.patch.object(iwb.subprocess, "run", fake):
             with self.assertRaises(self.sp.CalledProcessError):
@@ -6959,5 +6963,38 @@ class SharedSkills(unittest.TestCase):
         self.assertEqual(label, "bot:blocked")
         self.assertIn("Analysis stopped: submodule URL not allowed.", body)
         self.assertTrue(entry["blocked"])
+        self.assertNotIn("analysis_failed_at", entry)      # removing bot:blocked restarts without the retry wait
         self.assertEqual(len(alerts), 1)
         self.assertIn(f"{self.REPO}#3: analysis stopped: submodule URL not allowed u", self.logs)
+
+    def test_clone_failure_without_a_submodule_error_is_not_retried(self):
+        real, calls = iwb.subprocess.run, []
+
+        def fake(cmd, *a, **k):
+            calls.append(list(cmd))
+            if "clone" in cmd:
+                real(["git", *LOCAL_PROTOCOLS, "clone", "-q", "--recurse-submodules", str(self.consumer), cmd[-1]],
+                     check=True, capture_output=True)
+                return self.sp.CompletedProcess(cmd, 1, "", "fatal: the remote end hung up unexpectedly")
+            return real(cmd, *a, **k)
+        with mock.patch.object(iwb.subprocess, "run", fake):
+            with self.assertRaises(self.sp.CalledProcessError):
+                iwb.clone_consumer(["-q"], f"https://github.com/{self.REPO}.git", self.root / "hung", {}, 60, "t")
+        self.assertFalse([c for c in calls if "submodule" in c])
+
+    def test_repair_checkout_refuses_a_head_that_moves_the_submodule(self):
+        w = self.root / "consumer.git-work"
+        for branch, change in (("bot/1-ok", lambda: (w / "a.py").write_text("y\n")),
+                               ("bot/1-bump", lambda: self.git("config", "-f", ".gitmodules",
+                                                               "submodule..agents/skills/shared.branch", "x", cwd=w))):
+            self.git("checkout", "-q", "-b", branch, "main", cwd=w)
+            change()
+            self.git("commit", "-qam", branch, cwd=w)
+            self.git("push", "-q", str(self.consumer), branch, cwd=w)
+        ok = self.git("rev-parse", "bot/1-ok", cwd=w)
+        d, _, got = iwb.checkout_pr(self.REPO, "claude-dev", "bot/1-ok", ok, "1", None, ())
+        self.assertEqual(got, ok)
+        bump = self.git("rev-parse", "bot/1-bump", cwd=w)
+        with self.assertRaises(iwb.WorkError) as e:
+            iwb.checkout_pr(self.REPO, "claude-dev", "bot/1-bump", bump, "1", None, ())
+        self.assertIn("changes the shared skills submodule", str(e.exception))
