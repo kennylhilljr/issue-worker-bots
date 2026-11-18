@@ -64,8 +64,8 @@
 
 Sign-in, tokens and repository lists come from prbot (PRBOT_PATH, default ../pr-review-bots/prbot).
 """
-import calendar, copy, datetime, hashlib, importlib.util, json, os, pwd, re, shlex, shutil, signal, stat, subprocess, \
-    sys, tempfile, time
+import calendar, copy, datetime, hashlib, importlib.util, json, os, posixpath, pwd, re, shlex, shutil, signal, stat, \
+    subprocess, sys, tempfile, time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -1453,7 +1453,7 @@ def policy_violations(units, repo, shared=()):
         for f in u["scope"]["files"]:
             if f.startswith("/") or ".." in f.split("/"):
                 out.append(f"{u['id']}: path outside the repository: {f}")
-            elif protected(clean_path(f) or f, rules):          # `./.gitmodules` is `.gitmodules`
+            elif protected(posixpath.normpath(f.strip()), rules):     # `.//.gitmodules` is `.gitmodules`
                 out.append(f"{u['id']}: protected path: {f}")
         for c in u["acceptance"]["commands"]:
             prog = denied_command(c)

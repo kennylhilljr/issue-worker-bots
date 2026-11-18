@@ -6890,7 +6890,9 @@ class SharedSkills(unittest.TestCase):
         self.assertEqual(iwb.policy_violations([coding_unit(files=[".gitmodules"])], self.REPO),
                          ["u1: protected path: .gitmodules"])
         # a leading ./ does not get around the root-anchored rules
-        for f in ("./.gitmodules", "./.agents/skills/shared/catalog.json", "././.claude/skills/shared-a"):
+        for f in ("./.gitmodules", ".//.gitmodules", "./.agents/skills/shared/catalog.json",
+                  ".agents/skills/./shared/catalog.json", ".agents//skills/shared", "././.claude/skills/shared-a",
+                  ".claude/skills/shared-a/", ".github//workflows/ci.yml"):
             self.assertEqual(iwb.policy_violations([coding_unit(files=[f])], self.REPO, shared),
                              [f"u1: protected path: {f}"], f)
 
