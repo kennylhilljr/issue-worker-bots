@@ -4595,6 +4595,8 @@ class Checkout(unittest.TestCase):
         self.addCleanup(lambda: [setattr(iwb.prbot, k, v) for k, v in saved.items()])
         self.addCleanup(lambda: setattr(iwb, "WORK_DIR", saved_dir))
         iwb.WORK_DIR = Path(tmp.name, "work")
+        self.addCleanup(setattr, iwb, "SUBMODULE_PROTOCOLS", iwb.SUBMODULE_PROTOCOLS)
+        iwb.SUBMODULE_PROTOCOLS = LOCAL_PROTOCOLS       # a local repository stands in for GitHub
         iwb.prbot.installation_token = lambda *a, **k: "tok"
         iwb.prbot.gh_read = lambda args: json.dumps({"b": "main"})
         iwb.prbot.git_env = lambda token=None, identity=None: dict(
@@ -4661,6 +4663,8 @@ class Checkout(unittest.TestCase):
         self.addCleanup(lambda: [setattr(iwb.prbot, k, v) for k, v in saved.items()])
         self.addCleanup(lambda: setattr(iwb, "WORK_DIR", saved_dir))
         iwb.WORK_DIR = Path(tmp.name, "work")
+        self.addCleanup(setattr, iwb, "SUBMODULE_PROTOCOLS", iwb.SUBMODULE_PROTOCOLS)
+        iwb.SUBMODULE_PROTOCOLS = LOCAL_PROTOCOLS       # a local repository stands in for GitHub
         iwb.prbot.installation_token = lambda *a, **k: "tok"
         iwb.prbot.gh_read = lambda args: json.dumps({"b": "main"})
         iwb.prbot.git_env = lambda token=None, identity=None: dict(
@@ -6643,3 +6647,371 @@ class AcceptanceRun(unittest.TestCase):
             run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x")
             runs = iwb.run_acceptance(["python3 ok.py", "python3 -c 'import sys; sys.exit(3)'"], str(repo))
         self.assertEqual([r["exit"] for r in runs], [0, 3])
+
+
+# The production protocol flags (SUB-7), plus file transport for the local repositories that stand in for GitHub and
+# the catalog in tests. The later -c wins, so production code keeps its own flags and order.
+PROD_PROTOCOLS = ["-c", "protocol.file.allow=never", "-c", "protocol.ext.allow=never", "-c", "protocol.allow=never",
+                  "-c", "protocol.https.allow=always"]
+LOCAL_PROTOCOLS = (*PROD_PROTOCOLS, "-c", "protocol.file.allow=always")
+
+
+class SharedSkills(unittest.TestCase):
+    """skills-catalog M3 (SUB-4, SUB-6, SUB-7, SUB-8, SUB-9, SUB-13): consumers carry the catalog as a submodule at
+    .agents/skills/shared. Local bare repositories stand in for the consumer and the catalog; iwb.CATALOG_URL is
+    pointed at the fake catalog (the test-only seam) and file transport is allowed only through LOCAL_PROTOCOLS."""
+    REPO = "kennylhilljr/demo"
+
+    def setUp(self):
+        import subprocess
+        self.sp = subprocess
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.production = iwb.SUBMODULE_PROTOCOLS
+        for k in ("CATALOG_URL", "SUBMODULE_PROTOCOLS", "WORK_DIR", "CONFIG", "log"):
+            self.addCleanup(setattr, iwb, k, getattr(iwb, k))
+        saved = {k: getattr(iwb.prbot, k) for k in ("git_env", "installation_token", "gh_read")}
+        self.addCleanup(lambda: [setattr(iwb.prbot, k, v) for k, v in saved.items()])
+        self.logs = []
+        iwb.log = self.logs.append
+        iwb.WORK_DIR = self.root / "work"
+        iwb.CONFIG = self.root / "config.json"         # never the operator's config
+        iwb.SUBMODULE_PROTOCOLS = LOCAL_PROTOCOLS
+        self.catalog = self.root / "catalog.git"
+        iwb.CATALOG_URL = self.catalog.as_uri()
+        self.git("init", "-q", "-b", "main", "--bare", str(self.catalog), cwd=self.root)
+        cw = self.root / "catalog-work"
+        self.git("init", "-q", "-b", "main", str(cw), cwd=self.root)
+        (cw / "catalog.json").write_text(json.dumps({"version": 1, "skills": [
+            {"name": "shared-a"}, {"name": "shared-b"}, {"name": "../escape"}, {"name": "Bad_Name"}, 7]}))
+        self.git("add", "-A", cwd=cw)
+        self.git("commit", "-qm", "catalog", cwd=cw)
+        self.git("push", "-q", str(self.catalog), "main", cwd=cw)
+        self.pinned = self.git("rev-parse", "HEAD", cwd=cw)
+        self.consumer = self.root / "consumer.git"
+        self.make_consumer(self.consumer)
+        iwb.prbot.installation_token = lambda *a, **k: "tok-secret"
+        iwb.prbot.gh_read = lambda args: json.dumps({"b": "main"})
+        consumer_uri = self.consumer.as_uri()
+        iwb.prbot.git_env = lambda token=None, identity=None: dict(
+            os.environ, PRBOT_GIT_TOKEN=token or "", GIT_CONFIG_COUNT="1",
+            GIT_CONFIG_KEY_0=f"url.{consumer_uri}.insteadOf", GIT_CONFIG_VALUE_0=f"https://github.com/{self.REPO}.git")
+
+    def git(self, *a, cwd):
+        return self.sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always",
+                            *a], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+    def make_consumer(self, bare, url=None, submodule=True):
+        w = self.root / (bare.name + "-work")
+        self.git("init", "-q", "-b", "main", str(w), cwd=self.root)
+        (w / "a.py").write_text("x\n")
+        if submodule:
+            self.git("submodule", "add", "-q", iwb.CATALOG_URL, ".agents/skills/shared", cwd=w)
+            if url is not None:
+                self.git("config", "-f", ".gitmodules", "submodule..agents/skills/shared.url", url, cwd=w)
+            (w / ".claude" / "skills").mkdir(parents=True)
+            os.symlink("../../.agents/skills/shared/skills/shared-a", w / ".claude" / "skills" / "shared-a")
+        self.git("add", "-A", cwd=w)
+        self.git("commit", "-qm", "consumer", cwd=w)
+        self.git("init", "-q", "-b", "main", "--bare", str(bare), cwd=self.root)
+        self.git("push", "-q", str(bare), "main", cwd=w)
+        return w
+
+    def plain_clone(self, bare, name, recurse=True):
+        dest = self.root / name
+        self.git("clone", "-q", *(["--recurse-submodules"] if recurse else []), str(bare), str(dest), cwd=self.root)
+        return dest
+
+    def test_production_clone_argv_has_the_sub4_and_sub7_flags(self):
+        calls = []
+
+        def fake(cmd, *a, **k):
+            calls.append(list(cmd))
+            if "clone" in cmd:
+                Path(cmd[-1], ".git", "info").mkdir(parents=True)
+            return self.sp.CompletedProcess(cmd, 0, "f" * 40 + "\n" if "rev-parse" in cmd else "", "")
+        iwb.SUBMODULE_PROTOCOLS = self.production
+        with mock.patch.object(iwb.subprocess, "run", fake):
+            w, _, _ = iwb.clone(self.REPO, "claude-dev")
+            self.addCleanup(__import__("shutil").rmtree, w, True)
+            iwb.checkout(self.REPO, "claude-dev", "bot/1-x")
+            got = iwb.head_clone(self.REPO, "claude-dev", "bot/1-x", "f" * 40)
+            self.addCleanup(__import__("shutil").rmtree, got[0], True)
+        clones = [c for c in calls if "clone" in c]
+        self.assertEqual(len(clones), 3)
+        for c in clones:
+            self.assertEqual(c[:12], ["git", *PROD_PROTOCOLS, "-c", "core.askPass=", "clone"])
+            self.assertEqual(c[-4:-2], ["--recurse-submodules", "--shallow-submodules"])
+            self.assertEqual(c[-2], f"https://github.com/{self.REPO}.git")
+
+    def test_production_protocols_are_the_sub7_flags(self):
+        loader = SourceFileLoader("iwb_fresh", str(ROOT / "iwb"))
+        fresh = importlib.util.module_from_spec(importlib.util.spec_from_loader("iwb_fresh", loader))
+        loader.exec_module(fresh)
+        self.assertEqual(list(fresh.SUBMODULE_PROTOCOLS), PROD_PROTOCOLS)
+        self.assertEqual(fresh.CATALOG_URL, "https://github.com/kennylhilljr/skills-catalog.git")
+        self.assertEqual(fresh.RECURSE, ("--recurse-submodules", "--shallow-submodules"))
+
+    def test_trusted_copy_does_not_recurse(self):
+        d = self.plain_clone(self.consumer, "work-clone")
+        base = self.git("rev-parse", "HEAD", cwd=d)
+        calls, real = [], iwb.subprocess.run
+
+        def spy(cmd, *a, **k):
+            calls.append(list(cmd))
+            return real(cmd, *a, **k)
+        with mock.patch.object(iwb.subprocess, "run", spy):
+            clean = iwb.trusted_copy(str(d), "main", base)
+        self.addCleanup(__import__("shutil").rmtree, clean, True)
+        fetch = next(c for c in calls if "fetch" in c)
+        self.assertIn("--no-recurse-submodules", fetch)
+        self.assertNotIn("--recurse-submodules", fetch)
+        self.assertFalse(Path(clean, "modules").exists())
+
+    def test_check_passes_on_a_pinned_submodule_and_returns_its_commit(self):
+        d = self.plain_clone(self.consumer, "ok")
+        self.assertEqual(iwb.shared_skills_check(str(d)), self.pinned)
+        self.assertEqual(iwb.shared_skill_names(str(d)), ["shared-a", "shared-b"])   # CAT-2 names only
+
+    def test_check_refuses_other_submodule_urls(self):
+        for i, url in enumerate(("https://github.com/someone/skills-catalog.git",
+                                 "ssh://git@github.com/kennylhilljr/skills-catalog.git",
+                                 (self.root / "evil.git").as_uri())):
+            w = self.make_consumer(self.root / f"bad{i}.git", url=url)
+            with self.assertRaises(iwb.SharedSkillsError) as e:
+                iwb.shared_skills_check(str(w))
+            self.assertEqual(str(e.exception), "submodule URL not allowed")
+
+    def test_check_finds_missing_shared_skills(self):
+        uninit = self.plain_clone(self.consumer, "uninit", recurse=False)
+        (uninit / ".agents/skills/shared/catalog.json").write_text("{}")   # even with the file there, "-" fails
+        plus = self.plain_clone(self.consumer, "plus")
+        self.git("commit", "-q", "--allow-empty", "-m", "drift", cwd=plus / ".agents/skills/shared")
+        nofile = self.plain_clone(self.consumer, "nofile")
+        (nofile / ".agents/skills/shared/catalog.json").unlink()
+        for d in (self.plain_clone(self.consumer, "uninit2", recurse=False), uninit, plus, nofile):
+            with self.assertRaises(iwb.SharedSkillsError) as e:
+                iwb.shared_skills_check(str(d))
+            self.assertEqual(str(e.exception), "shared skills missing", d)
+
+    def test_check_returns_none_without_an_entry(self):
+        d = self.make_consumer(self.root / "plain.git", submodule=False)
+        self.assertIsNone(iwb.shared_skills_check(str(d)))
+        (d / ".gitmodules").write_text('[submodule "other"]\n\tpath = vendor/other\n\turl = https://example.com/o.git\n')
+        self.assertIsNone(iwb.shared_skills_check(str(d)))
+
+    def test_run_log_records_the_pinned_commit(self):
+        w, _, _ = iwb.clone(self.REPO, "claude-dev")
+        self.addCleanup(__import__("shutil").rmtree, w, True)
+        self.assertIn(f"{self.REPO}: shared skills: {self.pinned} (fetched with the bot token)", self.logs)
+        d, _, _ = iwb.checkout(self.REPO, "claude-dev", "bot/1-x")
+        self.assertIn(f"{self.REPO} work clone: shared skills: {self.pinned} (fetched with the bot token)", self.logs)
+        self.assertEqual(iwb.SHARED_LINKS[d], ["shared-a", "shared-b"])
+        plain = self.root / "plain.git"
+        self.make_consumer(plain, submodule=False)
+        iwb.prbot.git_env = lambda token=None, identity=None: dict(
+            os.environ, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0=f"url.{plain.as_uri()}.insteadOf",
+            GIT_CONFIG_VALUE_0=f"https://github.com/{self.REPO}.git")
+        w, _, _ = iwb.clone(self.REPO, "claude-dev")
+        self.addCleanup(__import__("shutil").rmtree, w, True)
+        self.assertEqual(self.logs[-1], f"{self.REPO}: shared skills: none")
+
+    def fallback(self, retry_ok):
+        """clone_consumer where the submodule fetch fails while the token is in the environment (SUB-13)."""
+        real, retries = iwb.subprocess.run, []
+
+        def fake(cmd, *a, **k):
+            if "clone" in cmd:
+                self.assertEqual((k["env"] or {}).get("PRBOT_GIT_TOKEN"), "tok-secret")
+                self.assertFalse({"GIT_ASKPASS", "SSH_ASKPASS"} & set(k["env"]))     # nothing can prompt
+                real(["git", *LOCAL_PROTOCOLS, "clone", "-q", str(self.consumer), cmd[-1]], check=True,
+                     capture_output=True)
+                return self.sp.CompletedProcess(cmd, 128, "", "remote: Write access to repository not granted.\n"
+                                                "fatal: clone of '...' into submodule path '.agents/skills/shared' "
+                                                "failed")
+            if "submodule" in cmd and "update" in cmd:
+                retries.append((list(cmd), k["env"]))
+                if not retry_ok:
+                    return self.sp.CompletedProcess(cmd, 1, "", "fatal: could not read Username")
+            return real(cmd, *a, **k)
+        dest = self.root / f"fallback-{retry_ok}"
+        env = dict(iwb.prbot.git_env(token="tok-secret"), GIT_ASKPASS="/bin/echo", SSH_ASKPASS="/bin/echo")
+        with mock.patch.object(iwb.subprocess, "run", fake):
+            try:
+                return iwb.clone_consumer(["-q"], f"https://github.com/{self.REPO}.git", dest, env, 60, "t"), retries
+            finally:
+                self.retries = retries
+
+    def test_token_refused_then_empty_credential_retry_succeeds(self):
+        commit, retries = self.fallback(True)
+        self.assertEqual(commit, self.pinned)
+        (cmd, env), = retries
+        self.assertEqual(cmd[:3], ["git", "-c", "credential.helper="])
+        self.assertIn("core.askPass=", cmd)
+        self.assertFalse({"GIT_ASKPASS", "SSH_ASKPASS"} & set(env))
+        self.assertEqual((env["GIT_CONFIG_NOSYSTEM"], env["GIT_CONFIG_GLOBAL"]), ("1", os.devnull))   # no extraHeader
+        self.assertEqual(cmd[-5:], ["submodule", "update", "--init", "--depth", "1"])
+        self.assertNotIn("PRBOT_GIT_TOKEN", env)
+        self.assertFalse([k for k in env if re.match(r"GIT_CONFIG_(COUNT|KEY_|VALUE_)", k)])   # prbot's helper
+        self.assertTrue(any("retrying with an empty credential helper" in x for x in self.logs))
+        self.assertIn(f"t: shared skills: {self.pinned} (fetched with an empty credential helper)", self.logs)
+        self.assertFalse(any("tok-secret" in x for x in self.logs))
+
+    def test_second_fetch_failure_stops_the_run(self):
+        with self.assertRaises(iwb.SharedSkillsError) as e:
+            self.fallback(False)
+        self.assertEqual(str(e.exception), "shared skills missing")
+        self.assertEqual(len(self.retries), 1)                                   # retried once only
+        self.assertTrue(issubclass(iwb.SharedSkillsError, RuntimeError))        # stops like other clone failures
+
+    def test_failing_check_stops_the_work_clone(self):
+        bad = self.root / "repointed.git"
+        self.make_consumer(bad, url="https://github.com/someone/other.git")
+        iwb.prbot.git_env = lambda token=None, identity=None: dict(
+            os.environ, GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0=f"url.{bad.as_uri()}.insteadOf",
+            GIT_CONFIG_VALUE_0=f"https://github.com/{self.REPO}.git",
+            GIT_CONFIG_KEY_1=f"url.{self.catalog.as_uri()}.insteadOf",
+            GIT_CONFIG_VALUE_1="https://github.com/someone/other.git")
+        with self.assertRaises(iwb.SharedSkillsError) as e:
+            iwb.checkout(self.REPO, "claude-dev", "bot/1-x")
+        self.assertEqual(str(e.exception), "submodule URL not allowed")
+        self.assertIn(f"{self.REPO} work clone: shared skills: submodule URL not allowed", self.logs)
+
+    def test_plan_gate_protects_the_submodule_and_shared_links(self):
+        shared = ["shared-a", "shared-b"]
+        for f in (".gitmodules", ".agents/skills/shared", ".agents/skills/shared/catalog.json",
+                  ".claude/skills/shared-a", ".claude/skills/shared-b"):
+            self.assertEqual(iwb.policy_violations([coding_unit(files=[f])], self.REPO, shared),
+                             [f"u1: protected path: {f}"], f)
+        for f in (".claude/skills/own-skill", ".claude/skills/shared-ab", "docs/.gitmodules.md", ".agents/skills/x"):
+            self.assertEqual(iwb.policy_violations([coding_unit(files=[f])], self.REPO, shared), [], f)
+        # without a clone the submodule itself is still protected
+        self.assertEqual(iwb.policy_violations([coding_unit(files=[".gitmodules"])], self.REPO),
+                         ["u1: protected path: .gitmodules"])
+        # a leading ./ does not get around the root-anchored rules
+        for f in ("./.gitmodules", ".//.gitmodules", "./.agents/skills/shared/catalog.json",
+                  ".agents/skills/./shared/catalog.json", ".agents//skills/shared", "././.claude/skills/shared-a",
+                  ".claude/skills/shared-a/", ".github//workflows/ci.yml"):
+            self.assertEqual(iwb.policy_violations([coding_unit(files=[f])], self.REPO, shared),
+                             [f"u1: protected path: {f}"], f)
+
+    def test_reset_to_base_restores_the_submodule(self):
+        d = self.plain_clone(self.consumer, "reset")
+        sub = d / ".agents/skills/shared"
+        (sub / "catalog.json").write_text("changed\n")
+        (sub / "extra.txt").write_text("left by a command\n")
+        iwb.reset_to_base(str(d))
+        self.assertFalse((sub / "extra.txt").exists())
+        self.assertEqual(iwb.shared_skills_check(str(d)), self.pinned)
+        self.assertEqual(iwb.shared_skill_names(str(d)), ["shared-a", "shared-b"])
+
+    def test_post_run_scope_check_protects_them(self):
+        d = self.plain_clone(self.consumer, "run")
+        base = self.git("rev-parse", "HEAD", cwd=d)
+        iwb.SHARED_LINKS[str(d)] = iwb.shared_skill_names(str(d))
+        self.addCleanup(iwb.SHARED_LINKS.pop, str(d), None)
+        self.git("checkout", "-qb", "bot/1-x", cwd=d)
+        (d / ".gitmodules").write_text((d / ".gitmodules").read_text().replace("catalog.git", "evil.git"))
+        (d / ".claude/skills/shared-a").unlink()
+        (d / ".claude/skills/shared-a").write_text("mine\n")
+        (d / ".claude/skills/own").mkdir()
+        (d / ".claude/skills/own/SKILL.md").write_text("own\n")
+        self.git("add", "-A", cwd=d)
+        self.git("commit", "-qm", "run", cwd=d)
+        files = iwb.changed_files(str(d), base, "bot/1-x")
+        units = [coding_unit(files=files)]
+        problems = iwb.scope_problems(files, units, self.REPO, iwb.SHARED_LINKS[str(d)])
+        self.assertEqual(sorted(problems), ["`.claude/skills/shared-a` is a protected path",
+                                            "`.gitmodules` is a protected path"])
+
+    def test_a_failed_superproject_checkout_is_not_retried(self):
+        real, calls = iwb.subprocess.run, []
+
+        def fake(cmd, *a, **k):
+            calls.append(list(cmd))
+            if "clone" in cmd:
+                real(["git", *LOCAL_PROTOCOLS, "clone", "-q", str(self.consumer), cmd[-1]], check=True,
+                     capture_output=True)
+                Path(cmd[-1], "a.py").unlink()                   # the checkout of the repository itself failed
+                return self.sp.CompletedProcess(cmd, 128, "", "error: unable to write file a.py\n"
+                                                "fatal: Failed to clone submodule")
+            return real(cmd, *a, **k)
+        with mock.patch.object(iwb.subprocess, "run", fake):
+            with self.assertRaises(self.sp.CalledProcessError):
+                iwb.clone_consumer(["-q"], f"https://github.com/{self.REPO}.git", self.root / "half", {}, 60, "t")
+        self.assertFalse([c for c in calls if "submodule" in c])
+
+    def test_merge_gate_protects_the_heads_shared_links(self):
+        d = self.plain_clone(self.consumer, "head")
+        sha = self.git("rev-parse", "HEAD", cwd=d)
+        with mock.patch.object(iwb, "head_clone", lambda *a: (str(self.root / "unused"), str(d))):
+            ok, runs = iwb.acceptance_check(self.REPO, "claude-dev", "main", sha, [])
+        self.assertEqual((ok, runs), (True, []))
+        self.assertEqual(iwb.SHARED_LINKS[f"{self.REPO}@{sha}"], ["shared-a", "shared-b"])
+        kenny = []
+        entry = {"work": {"pr": "https://github.com/kennylhilljr/demo/pull/2"}, "agent": "claude"}
+        facts = {"pr": {"head": "bot/1-x", "sha": sha, "number": 2, "title": "X"},
+                 "files": ["a.py", ".claude/skills/shared-a"]}
+        with mock.patch.object(iwb, "acceptance_check", lambda *a: (True, [])), \
+                mock.patch.object(iwb, "kenny_unless_landed", lambda key, e, why: kenny.append(why)), \
+                mock.patch.object(iwb, "merge_pr", lambda *a: self.fail("merged")):
+            iwb.merge_now(f"{self.REPO}#1", entry, facts, {}, [], ["true"])
+        self.assertEqual(kenny, ["the PR changes protected paths: `.claude/skills/shared-a`"])
+        self.assertNotIn(f"{self.REPO}@{sha}", iwb.SHARED_LINKS)
+
+        def broken(*a):
+            raise iwb.SharedSkillsError("shared skills missing")
+        kenny.clear()
+        with mock.patch.object(iwb, "acceptance_check", broken), \
+                mock.patch.object(iwb, "kenny_unless_landed", lambda key, e, why: kenny.append(why)):
+            iwb.merge_now(f"{self.REPO}#1", entry, facts, {}, [], ["true"])
+        self.assertEqual(kenny, [f"the head `{sha[:10]}` fails the shared skills check: shared skills missing"])
+
+    def test_failed_check_in_analysis_blocks_the_issue_with_the_reason(self):
+        posts, alerts = [], []
+        entry = {}
+        job = {"key": f"{self.REPO}#3", "entry": entry, "repo": self.REPO, "number": "3",
+               "issue": {"title": "T"}, "digest": "d", "replan_at": 0, "bot": "claude-dev", "model": "m"}
+        with mock.patch.object(iwb, "post", lambda bot, repo, n, body, label: posts.append((body, label)) or "u"), \
+                mock.patch.object(iwb, "attention", lambda *a: alerts.append(a)):
+            iwb.finish_analysis(job, None, iwb.SharedSkillsError("submodule URL not allowed"), False)
+        (body, label), = posts
+        self.assertEqual(label, "bot:blocked")
+        self.assertIn("Analysis stopped: submodule URL not allowed.", body)
+        self.assertTrue(entry["blocked"])
+        self.assertNotIn("analysis_failed_at", entry)      # removing bot:blocked restarts without the retry wait
+        self.assertEqual(len(alerts), 1)
+        self.assertIn(f"{self.REPO}#3: analysis stopped: submodule URL not allowed u", self.logs)
+
+    def test_clone_failure_without_a_submodule_error_is_not_retried(self):
+        real, calls = iwb.subprocess.run, []
+
+        def fake(cmd, *a, **k):
+            calls.append(list(cmd))
+            if "clone" in cmd:
+                real(["git", *LOCAL_PROTOCOLS, "clone", "-q", "--recurse-submodules", str(self.consumer), cmd[-1]],
+                     check=True, capture_output=True)
+                return self.sp.CompletedProcess(cmd, 1, "", "fatal: the remote end hung up unexpectedly")
+            return real(cmd, *a, **k)
+        with mock.patch.object(iwb.subprocess, "run", fake):
+            with self.assertRaises(self.sp.CalledProcessError):
+                iwb.clone_consumer(["-q"], f"https://github.com/{self.REPO}.git", self.root / "hung", {}, 60, "t")
+        self.assertFalse([c for c in calls if "submodule" in c])
+
+    def test_repair_checkout_refuses_a_head_that_moves_the_submodule(self):
+        w = self.root / "consumer.git-work"
+        for branch, change in (("bot/1-ok", lambda: (w / "a.py").write_text("y\n")),
+                               ("bot/1-bump", lambda: self.git("config", "-f", ".gitmodules",
+                                                               "submodule..agents/skills/shared.branch", "x", cwd=w))):
+            self.git("checkout", "-q", "-b", branch, "main", cwd=w)
+            change()
+            self.git("commit", "-qam", branch, cwd=w)
+            self.git("push", "-q", str(self.consumer), branch, cwd=w)
+        ok = self.git("rev-parse", "bot/1-ok", cwd=w)
+        d, _, got = iwb.checkout_pr(self.REPO, "claude-dev", "bot/1-ok", ok, "1", None, ())
+        self.assertEqual(got, ok)
+        bump = self.git("rev-parse", "bot/1-bump", cwd=w)
+        with self.assertRaises(iwb.WorkError) as e:
+            iwb.checkout_pr(self.REPO, "claude-dev", "bot/1-bump", bump, "1", None, ())
+        self.assertIn("changes the shared skills submodule", str(e.exception))
