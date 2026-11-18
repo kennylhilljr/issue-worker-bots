@@ -6669,13 +6669,14 @@ class SharedSkills(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name).resolve()
         self.production = iwb.SUBMODULE_PROTOCOLS
-        for k in ("CATALOG_URL", "SUBMODULE_PROTOCOLS", "WORK_DIR", "log"):
+        for k in ("CATALOG_URL", "SUBMODULE_PROTOCOLS", "WORK_DIR", "CONFIG", "log"):
             self.addCleanup(setattr, iwb, k, getattr(iwb, k))
         saved = {k: getattr(iwb.prbot, k) for k in ("git_env", "installation_token", "gh_read")}
         self.addCleanup(lambda: [setattr(iwb.prbot, k, v) for k, v in saved.items()])
         self.logs = []
         iwb.log = self.logs.append
         iwb.WORK_DIR = self.root / "work"
+        iwb.CONFIG = self.root / "config.json"         # never the operator's config
         iwb.SUBMODULE_PROTOCOLS = LOCAL_PROTOCOLS
         self.catalog = self.root / "catalog.git"
         iwb.CATALOG_URL = self.catalog.as_uri()
@@ -6888,6 +6889,20 @@ class SharedSkills(unittest.TestCase):
         # without a clone the submodule itself is still protected
         self.assertEqual(iwb.policy_violations([coding_unit(files=[".gitmodules"])], self.REPO),
                          ["u1: protected path: .gitmodules"])
+        # a leading ./ does not get around the root-anchored rules
+        for f in ("./.gitmodules", "./.agents/skills/shared/catalog.json", "././.claude/skills/shared-a"):
+            self.assertEqual(iwb.policy_violations([coding_unit(files=[f])], self.REPO, shared),
+                             [f"u1: protected path: {f}"], f)
+
+    def test_reset_to_base_restores_the_submodule(self):
+        d = self.plain_clone(self.consumer, "reset")
+        sub = d / ".agents/skills/shared"
+        (sub / "catalog.json").write_text("changed\n")
+        (sub / "extra.txt").write_text("left by a command\n")
+        iwb.reset_to_base(str(d))
+        self.assertFalse((sub / "extra.txt").exists())
+        self.assertEqual(iwb.shared_skills_check(str(d)), self.pinned)
+        self.assertEqual(iwb.shared_skill_names(str(d)), ["shared-a", "shared-b"])
 
     def test_post_run_scope_check_protects_them(self):
         d = self.plain_clone(self.consumer, "run")

@@ -1453,7 +1453,7 @@ def policy_violations(units, repo, shared=()):
         for f in u["scope"]["files"]:
             if f.startswith("/") or ".." in f.split("/"):
                 out.append(f"{u['id']}: path outside the repository: {f}")
-            elif protected(f, rules):
+            elif protected(clean_path(f) or f, rules):          # `./.gitmodules` is `.gitmodules`
                 out.append(f"{u['id']}: protected path: {f}")
         for c in u["acceptance"]["commands"]:
             prog = denied_command(c)
@@ -1566,8 +1566,11 @@ def reset_to_base(repo_dir):
     """Put a git clone back to its committed tree, so each acceptance command sees the base code and not files an
     earlier command created (Codex review of PR #5)."""
     if Path(repo_dir, ".git").exists():
-        subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "-q"], capture_output=True)
+        # --recurse-submodules: the shared skills submodule goes back to its pinned commit and tree as well
+        subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "-q", "--recurse-submodules"], capture_output=True)
         subprocess.run(["git", "-C", repo_dir, "clean", "-fdxq"], capture_output=True)
+        subprocess.run(["git", "-C", repo_dir, "submodule", "--quiet", "foreach", "--recursive", "git clean -fdxq"],
+                       capture_output=True)
 
 
 def red_check(units, repo_dir):
