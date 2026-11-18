@@ -606,12 +606,21 @@ class SharedSkillsError(RuntimeError):
     """The shared skills submodule failed the check: the run stops like any other clone failure."""
 
 
-def tokenless_env():
-    """The environment without the bot token or prbot's credential config, for the SUB-13 retry."""
-    env = {k: v for k, v in os.environ.items() if k != "PRBOT_GIT_TOKEN" and not k.startswith("GIT_CONFIG_")
-           and k != "GITHUB_TOKEN"}
+ASKPASS_ENV = ("GIT_ASKPASS", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE")
+NO_ASKPASS = ("-c", "core.askPass=")      # git skips an empty askpass program, so nothing can prompt for a login
+
+
+def no_askpass(env):
+    """`env` without inherited askpass programs, so a submodule host that asks for a login gets none (SUB-7)."""
+    env = {k: v for k, v in env.items() if k not in ASKPASS_ENV}
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
+
+
+def tokenless_env():
+    """The environment without the bot token, prbot's credential config or askpass, for the SUB-13 retry."""
+    return no_askpass({k: v for k, v in os.environ.items() if k not in ("PRBOT_GIT_TOKEN", "GITHUB_TOKEN")
+                       and not k.startswith("GIT_CONFIG_")})
 
 
 def shared_submodule_urls(repo_dir):
@@ -681,19 +690,30 @@ def shared_skill_names(repo_dir):
     return sorted({n for n in names if isinstance(n, str) and len(n) <= 64 and SKILL_NAME.match(n)})
 
 
+def superproject_complete(dest):
+    """Whether a clone that exited non-zero got the repository itself fully checked out, so only a submodule can
+    have failed: HEAD resolves, .gitmodules exists, and with submodules ignored no tracked file differs from HEAD."""
+    if not (Path(dest) / ".git").is_dir() or not (Path(dest) / ".gitmodules").is_file():
+        return False
+    git = lambda *a: subprocess.run(["git", "-C", str(dest), *a], capture_output=True, text=True,
+                                    env=tokenless_env(), timeout=120)
+    if git("rev-parse", "--verify", "-q", "HEAD").returncode != 0:
+        return False
+    st = git("status", "--porcelain", "--ignore-submodules=all", "--untracked-files=no")
+    return st.returncode == 0 and not st.stdout.strip()
+
+
 def clone_consumer(args, url, dest, env, timeout, label):
     """`git clone <args> --recurse-submodules --shallow-submodules <url> <dest>` with only https allowed for any
     transport (SUB-4, SUB-7), then the shared skills check and its run log line (SUB-6, SUB-8). When the clone
     itself worked but the submodule fetch failed with the bot token in `env`, the fetch is retried once with an
     empty credential helper and no token (SUB-13). Raises CalledProcessError when the clone failed, and
     SharedSkillsError when the submodule is still missing or not allowed. Returns the pinned commit or None."""
-    cmd = ["git", *SUBMODULE_PROTOCOLS, "clone", *args, *RECURSE, url, str(dest)]
-    r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+    cmd = ["git", *SUBMODULE_PROTOCOLS, *NO_ASKPASS, "clone", *args, *RECURSE, url, str(dest)]
+    r = subprocess.run(cmd, env=no_askpass(env), capture_output=True, text=True, timeout=timeout)
     how = "fetched with the bot token"
     if r.returncode != 0:
-        head = subprocess.run(["git", "-C", str(dest), "rev-parse", "--verify", "-q", "HEAD"], capture_output=True,
-                              text=True, env=tokenless_env()) if (Path(dest) / ".git").is_dir() else None
-        if head is None or head.returncode != 0:
+        if not superproject_complete(dest):
             raise subprocess.CalledProcessError(r.returncode, cmd, r.stdout, r.stderr)
         problem = shared_url_problem(dest)
         if problem:
@@ -701,8 +721,8 @@ def clone_consumer(args, url, dest, env, timeout, label):
             raise SharedSkillsError(problem)
         log(f"{label}: shared skills: the submodule fetch failed with the bot token ({short(r.stderr, 300)}); "
             f"retrying with an empty credential helper")
-        retry = ["git", "-c", "credential.helper=", *SUBMODULE_PROTOCOLS, "-C", str(dest), "submodule", "update",
-                 "--init", "--depth", "1"]
+        retry = ["git", "-c", "credential.helper=", *SUBMODULE_PROTOCOLS, *NO_ASKPASS, "-C", str(dest), "submodule",
+                 "update", "--init", "--depth", "1"]
         rr = subprocess.run(retry, env=tokenless_env(), capture_output=True, text=True, timeout=timeout)
         if rr.returncode != 0:
             log(f"{label}: shared skills: the retry failed too ({short(rr.stderr, 300)})")
@@ -715,6 +735,17 @@ def clone_consumer(args, url, dest, env, timeout, label):
         raise
     log(f"{label}: shared skills: {commit} ({how})" if commit else f"{label}: shared skills: none")
     return commit
+
+
+def shared_skills_blocked(entry, bot, repo, number, title, marker, step, err):
+    """A failed submodule check stops the step with its reason on the issue (bot:blocked) and in the run log, since
+    a retry on the same default branch would fail the same way. Removing bot:blocked starts again from analysis."""
+    url = post(bot, repo, number, f"{marker}\n{step} stopped: {err}. The `.agents/skills/shared` submodule must "
+               f"point at `{CATALOG_URL}` and be pinned to a commit with `catalog.json`. Remove `bot:blocked` to "
+               f"start again from analysis.", "bot:blocked")
+    entry["blocked"] = True
+    attention(bot, f"blocked: {repo}#{number}", {"url": url, "title": title, "problem": str(err)})
+    log(f"{repo}#{number}: {step.lower()} stopped: {err} {url}")
 
 
 def clone(repo, bot):
@@ -1205,6 +1236,11 @@ def finish_analyses(jobs, results, dry_run):
 def finish_analysis(job, answer, err, dry_run):
     key, entry, repo, number, issue = job["key"], job["entry"], job["repo"], job["number"], job["issue"]
     digest, replan_at, bot, model = job["digest"], job["replan_at"], job["bot"], job["model"]
+    if isinstance(err, SharedSkillsError):
+        entry["analysis_failed_at"] = time.time()
+        if not dry_run:
+            shared_skills_blocked(entry, bot, repo, number, issue["title"], A_MARKER, "Analysis", err)
+        return
     if isinstance(err, (RuntimeError, subprocess.SubprocessError, SystemExit)):
         entry["analysis_failed_at"] = time.time()
         mark(key, "failed", f"analysis could not run; retrying in {RETRY_AFTER // 60} minutes: {err}")
@@ -1823,6 +1859,11 @@ def cmd_approve(dry_run=False, limit=APPROVE_LIMIT, only=None, repo_filter=None)
                      "changes": list(v.get("changes", [])) + [
                          f"Unit {uid}: added acceptance {c!r} dropped ({why}); replace it with one that meets the "
                          f"orchestrator's rules" for uid, c, why in dropped]}
+        except SharedSkillsError as e:
+            entry["approval_failed_at"] = time.time()
+            if not dry_run:
+                shared_skills_blocked(entry, worker, repo, number, issue["title"], P_MARKER, "Approval", e)
+            continue
         except (RuntimeError, subprocess.SubprocessError, SystemExit, ValueError) as e:
             entry["approval_failed_at"] = time.time()
             mark(key, "failed", f"approval could not finish; will retry: {e}")
@@ -3423,6 +3464,7 @@ def acceptance_check(repo, bot, branch, sha, commands):
     if got is None:
         return None, []
     try:
+        SHARED_LINKS[f"{repo}@{sha}"] = shared_skill_names(got[1])      # for merge_now's protected-path check
         runs = run_acceptance(commands, got[1])
     finally:
         shutil.rmtree(got[0], ignore_errors=True)
@@ -3613,9 +3655,19 @@ def merge_now(key, entry, facts, review, minor, commands):
     """Run the acceptance commands on the head, then squash-merge and label the issue bot:done."""
     repo, number = key.rsplit("#", 1)
     w, worker, pr = entry["work"], WORKERS[entry["agent"]], facts["pr"]
-    ok, runs = acceptance_check(repo, worker, pr["head"], pr["sha"], commands)
+    try:
+        ok, runs = acceptance_check(repo, worker, pr["head"], pr["sha"], commands)
+    except SharedSkillsError as e:
+        kenny_unless_landed(key, entry, f"the head `{pr['sha'][:10]}` fails the shared skills check: {e}")
+        return
     if ok is None:
         log(f"{key}: the PR head moved during the acceptance run; checking again next pass")
+        return
+    names = SHARED_LINKS.pop(f"{repo}@{pr['sha']}", ())
+    rules = path_rules(repo, names)
+    links = sorted({f for f in facts["files"] if protected(f, rules)})
+    if links:                       # the head's shared skill links (SUB-9); pr_gate saw the other protected paths
+        kenny_unless_landed(key, entry, "the PR changes protected paths: " + ", ".join(f"`{f}`" for f in links))
         return
     if not ok:
         bad = next(r for r in runs if r["exit"] != 0)

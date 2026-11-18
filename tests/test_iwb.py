@@ -6740,7 +6740,7 @@ class SharedSkills(unittest.TestCase):
         clones = [c for c in calls if "clone" in c]
         self.assertEqual(len(clones), 3)
         for c in clones:
-            self.assertEqual(c[:10], ["git", *PROD_PROTOCOLS, "clone"])
+            self.assertEqual(c[:12], ["git", *PROD_PROTOCOLS, "-c", "core.askPass=", "clone"])
             self.assertEqual(c[-4:-2], ["--recurse-submodules", "--shallow-submodules"])
             self.assertEqual(c[-2], f"https://github.com/{self.REPO}.git")
 
@@ -6823,6 +6823,7 @@ class SharedSkills(unittest.TestCase):
         def fake(cmd, *a, **k):
             if "clone" in cmd:
                 self.assertEqual((k["env"] or {}).get("PRBOT_GIT_TOKEN"), "tok-secret")
+                self.assertFalse({"GIT_ASKPASS", "SSH_ASKPASS"} & set(k["env"]))     # nothing can prompt
                 real(["git", *LOCAL_PROTOCOLS, "clone", "-q", str(self.consumer), cmd[-1]], check=True,
                      capture_output=True)
                 return self.sp.CompletedProcess(cmd, 128, "", "remote: Write access to repository not granted.")
@@ -6832,7 +6833,7 @@ class SharedSkills(unittest.TestCase):
                     return self.sp.CompletedProcess(cmd, 1, "", "fatal: could not read Username")
             return real(cmd, *a, **k)
         dest = self.root / f"fallback-{retry_ok}"
-        env = iwb.prbot.git_env(token="tok-secret")
+        env = dict(iwb.prbot.git_env(token="tok-secret"), GIT_ASKPASS="/bin/echo", SSH_ASKPASS="/bin/echo")
         with mock.patch.object(iwb.subprocess, "run", fake):
             try:
                 return iwb.clone_consumer(["-q"], f"https://github.com/{self.REPO}.git", dest, env, 60, "t"), retries
@@ -6844,6 +6845,8 @@ class SharedSkills(unittest.TestCase):
         self.assertEqual(commit, self.pinned)
         (cmd, env), = retries
         self.assertEqual(cmd[:3], ["git", "-c", "credential.helper="])
+        self.assertIn("core.askPass=", cmd)
+        self.assertFalse({"GIT_ASKPASS", "SSH_ASKPASS"} & set(env))
         self.assertEqual(cmd[-5:], ["submodule", "update", "--init", "--depth", "1"])
         self.assertNotIn("PRBOT_GIT_TOKEN", env)
         self.assertFalse([k for k in env if k.startswith("GIT_CONFIG_")])
@@ -6901,3 +6904,60 @@ class SharedSkills(unittest.TestCase):
         problems = iwb.scope_problems(files, units, self.REPO, iwb.SHARED_LINKS[str(d)])
         self.assertEqual(sorted(problems), ["`.claude/skills/shared-a` is a protected path",
                                             "`.gitmodules` is a protected path"])
+
+    def test_a_failed_superproject_checkout_is_not_retried(self):
+        real, calls = iwb.subprocess.run, []
+
+        def fake(cmd, *a, **k):
+            calls.append(list(cmd))
+            if "clone" in cmd:
+                real(["git", *LOCAL_PROTOCOLS, "clone", "-q", str(self.consumer), cmd[-1]], check=True,
+                     capture_output=True)
+                Path(cmd[-1], "a.py").unlink()                   # the checkout of the repository itself failed
+                return self.sp.CompletedProcess(cmd, 128, "", "error: unable to write file a.py")
+            return real(cmd, *a, **k)
+        with mock.patch.object(iwb.subprocess, "run", fake):
+            with self.assertRaises(self.sp.CalledProcessError):
+                iwb.clone_consumer(["-q"], f"https://github.com/{self.REPO}.git", self.root / "half", {}, 60, "t")
+        self.assertFalse([c for c in calls if "submodule" in c])
+
+    def test_merge_gate_protects_the_heads_shared_links(self):
+        d = self.plain_clone(self.consumer, "head")
+        sha = self.git("rev-parse", "HEAD", cwd=d)
+        with mock.patch.object(iwb, "head_clone", lambda *a: (str(self.root / "unused"), str(d))):
+            ok, runs = iwb.acceptance_check(self.REPO, "claude-dev", "main", sha, [])
+        self.assertEqual((ok, runs), (True, []))
+        self.assertEqual(iwb.SHARED_LINKS[f"{self.REPO}@{sha}"], ["shared-a", "shared-b"])
+        kenny = []
+        entry = {"work": {"pr": "https://github.com/kennylhilljr/demo/pull/2"}, "agent": "claude"}
+        facts = {"pr": {"head": "bot/1-x", "sha": sha, "number": 2, "title": "X"},
+                 "files": ["a.py", ".claude/skills/shared-a"]}
+        with mock.patch.object(iwb, "acceptance_check", lambda *a: (True, [])), \
+                mock.patch.object(iwb, "kenny_unless_landed", lambda key, e, why: kenny.append(why)), \
+                mock.patch.object(iwb, "merge_pr", lambda *a: self.fail("merged")):
+            iwb.merge_now(f"{self.REPO}#1", entry, facts, {}, [], ["true"])
+        self.assertEqual(kenny, ["the PR changes protected paths: `.claude/skills/shared-a`"])
+        self.assertNotIn(f"{self.REPO}@{sha}", iwb.SHARED_LINKS)
+
+        def broken(*a):
+            raise iwb.SharedSkillsError("shared skills missing")
+        kenny.clear()
+        with mock.patch.object(iwb, "acceptance_check", broken), \
+                mock.patch.object(iwb, "kenny_unless_landed", lambda key, e, why: kenny.append(why)):
+            iwb.merge_now(f"{self.REPO}#1", entry, facts, {}, [], ["true"])
+        self.assertEqual(kenny, [f"the head `{sha[:10]}` fails the shared skills check: shared skills missing"])
+
+    def test_failed_check_in_analysis_blocks_the_issue_with_the_reason(self):
+        posts, alerts = [], []
+        entry = {}
+        job = {"key": f"{self.REPO}#3", "entry": entry, "repo": self.REPO, "number": "3",
+               "issue": {"title": "T"}, "digest": "d", "replan_at": 0, "bot": "claude-dev", "model": "m"}
+        with mock.patch.object(iwb, "post", lambda bot, repo, n, body, label: posts.append((body, label)) or "u"), \
+                mock.patch.object(iwb, "attention", lambda *a: alerts.append(a)):
+            iwb.finish_analysis(job, None, iwb.SharedSkillsError("submodule URL not allowed"), False)
+        (body, label), = posts
+        self.assertEqual(label, "bot:blocked")
+        self.assertIn("Analysis stopped: submodule URL not allowed.", body)
+        self.assertTrue(entry["blocked"])
+        self.assertEqual(len(alerts), 1)
+        self.assertIn(f"{self.REPO}#3: analysis stopped: submodule URL not allowed u", self.logs)
