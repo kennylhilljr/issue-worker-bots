@@ -1,6 +1,7 @@
 """Tests for iwb intake. No network: GitHub reads and bot posts are faked. Run: python3 -m unittest discover -s tests"""
-import importlib.util, io, json, os, re, shlex, tempfile, time, unittest
+import importlib.util, io, json, os, re, shlex, shutil, tempfile, time, unittest
 from unittest import mock
+import contextlib
 from contextlib import redirect_stderr, redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -6697,6 +6698,9 @@ class SharedSkills(unittest.TestCase):
         iwb.prbot.git_env = lambda token=None, identity=None: dict(
             os.environ, PRBOT_GIT_TOKEN=token or "", GIT_CONFIG_COUNT="1",
             GIT_CONFIG_KEY_0=f"url.{consumer_uri}.insteadOf", GIT_CONFIG_VALUE_0=f"https://github.com/{self.REPO}.git")
+        restoring = self.restoring()          # Python 3.9 has no enterContext
+        restoring.__enter__()
+        self.addCleanup(restoring.__exit__, None, None, None)
 
     def git(self, *a, cwd):
         return self.sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always",
@@ -6898,13 +6902,377 @@ class SharedSkills(unittest.TestCase):
 
     def test_reset_to_base_restores_the_submodule(self):
         d = self.plain_clone(self.consumer, "reset")
+        base = iwb.capture_base(str(d))
         sub = d / ".agents/skills/shared"
         (sub / "catalog.json").write_text("changed\n")
         (sub / "extra.txt").write_text("left by a command\n")
-        iwb.reset_to_base(str(d))
+        for nested in (d / "scratch", sub / "scratch"):           # untracked nested repositories go too
+            self.git("init", "-q", str(nested), cwd=self.root)
+        iwb.reset_to_base(str(d), base)
         self.assertFalse((sub / "extra.txt").exists())
+        self.assertFalse((d / "scratch").exists())
+        self.assertFalse((sub / "scratch").exists())
         self.assertEqual(iwb.shared_skills_check(str(d)), self.pinned)
         self.assertEqual(iwb.shared_skill_names(str(d)), ["shared-a", "shared-b"])
+
+    # issue #100: restoration between acceptance commands, offline and on .git state that commands wrote
+
+    def unsandboxed(self, seen):
+        """subprocess.run with only the sandbox launcher replaced: `sandbox-exec -p <profile> argv` runs argv as
+        it is, so the runners' commands and their real git restoration execute where sandbox-exec can't (a nested
+        sandbox). `seen` gets the commands, without restoration's own git calls."""
+        real = iwb.subprocess.run
+
+        def run(cmd, *a, **k):
+            if cmd and cmd[0] == "sandbox-exec":
+                if "GIT_NO_REPLACE_OBJECTS" not in (k.get("env") or {}):     # not restoration's own calls
+                    seen.append(cmd[3:])
+                return real(cmd[3:], *a, **k)
+            return real(cmd, *a, **k)
+        return mock.patch.object(iwb.subprocess, "run", run)
+
+    def restoring(self):
+        """reset_to_base under its real sandbox-exec profile, or unsandboxed inside another sandbox, where only
+        the git hardening is checked."""
+        return self.unsandboxed([]) if nested_sandbox_error() else contextlib.nullcontext()
+
+    def hardened(self, d, *a):
+        """Fixture git on a clone with planted programs: no hooks or fsmonitor, so setup never runs them."""
+        return self.git(*iwb.TRUSTED_GIT, "-C", str(d), *a, cwd=self.root)
+
+    def test_reset_between_commands_restores_deinitialized_shared_skills(self):
+        cmds = ["git submodule deinit -f --all", "test -f .agents/skills/shared/catalog.json"]
+        d = self.plain_clone(self.consumer, "deinit")
+        units = [code_unit("u", cmds=cmds)]
+        seen = []
+        with self.unsandboxed(seen):
+            red = iwb.red_check(units, str(d))["u"]
+            self.assertEqual([r["exit"] for r in red["runs"]], [0, 0], red["runs"])
+            self.assertEqual(iwb.shared_skills_check(str(d)), self.pinned)
+            runs = iwb.run_acceptance(cmds, str(d))
+        self.assertEqual([r["exit"] for r in runs], [0, 0], runs)
+        self.assertEqual(seen, [c.split() for c in cmds] * 2)
+        self.assertEqual(iwb.shared_skills_check(str(d)), self.pinned)
+        self.assertEqual(iwb.shared_skill_names(str(d)), ["shared-a", "shared-b"])
+
+    def test_reset_restores_head_after_a_checkout_and_across_units(self):
+        d = self.plain_clone(self.consumer, "moved")
+        (d / "new.txt").write_text("only in the base\n")
+        self.git("add", "new.txt", cwd=d)
+        self.git("commit", "-qm", "base", cwd=d)
+        base_sha = self.git("rev-parse", "HEAD", cwd=d)
+        units = [code_unit("a", cmds=["git checkout -q HEAD~1"]), code_unit("b", cmds=["test -f new.txt"])]
+        with self.unsandboxed([]):
+            red = iwb.red_check(units, str(d))
+            self.assertEqual(red["b"]["runs"][0]["exit"], 0, red)
+            runs = iwb.run_acceptance(["git checkout -q HEAD~1", "test -f new.txt",
+                                       "git submodule deinit -f --all"], str(d))
+        self.assertEqual([r["exit"] for r in runs], [0, 0, 0])
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=d), base_sha)      # the final cleanup restored it
+        self.assertEqual(iwb.shared_skills_check(str(d)), self.pinned)
+
+    def test_reset_to_base_disables_hooks_and_fsmonitor(self):
+        d = self.plain_clone(self.consumer, "hooks")
+        markers = self.root / "markers"
+        markers.mkdir()
+        mod = d / ".git/modules/.agents/skills/shared"
+        scripts = {}
+        for name in ("super-fsmonitor", "sub-fsmonitor", "sub-post-checkout", "super-post-checkout",
+                     "super-reference-transaction", "sub-post-index-change"):
+            s = self.root / f"{name}.sh"
+            s.write_text(f"#!/bin/sh\necho ran > '{markers / name}'\n")
+            s.chmod(0o755)
+            scripts[name] = s
+        for where, hook in ((mod, "post-checkout"), (d / ".git", "post-checkout"),
+                            (d / ".git", "reference-transaction"), (mod, "post-index-change")):
+            (where / "hooks").mkdir(exist_ok=True)
+            side = "sub" if where == mod else "super"
+            shutil.copy(scripts[f"{side}-{hook}"], where / "hooks" / hook)
+        # planted before the capture too, so only iwb's -c options (top level and in submodule children) stop them
+        self.git("config", "-f", str(d / ".git/config"), "core.fsmonitor", str(scripts["super-fsmonitor"]),
+                 cwd=self.root)
+        self.git("config", "-f", str(mod / "config"), "core.fsmonitor", str(scripts["sub-fsmonitor"]), cwd=self.root)
+        base = iwb.capture_base(str(d))
+        self.hardened(d, "submodule", "deinit", "-q", "-f", "--all")
+        self.assertFalse((d / ".agents/skills/shared/catalog.json").exists())
+        (d / "a.py").write_text("dirty\n")
+        iwb.reset_to_base(str(d), base)
+        self.assertEqual(list(markers.iterdir()), [])
+        self.assertTrue((mod / "hooks/post-checkout").is_file())
+        self.assertIn("fsmonitor", (d / ".git/config").read_text())
+        self.assertIn("fsmonitor", (mod / "config").read_text())
+        self.assertEqual((d / "a.py").read_text(), "x\n")
+        self.assertEqual(iwb.shared_skills_check(str(d), pinned=(d / ".git", d)), self.pinned)
+        self.assertEqual(iwb.shared_skill_names(str(d)), ["shared-a", "shared-b"])
+        self.assertEqual(list(markers.iterdir()), [])
+
+    def swap_parent(self, d, where):
+        """Move the folder holding clone `d` into `where` and leave a symlink to it in its place: the same clone
+        inode, reached through a redirected folder above it."""
+        moved = where / d.parent.name
+        shutil.move(str(d.parent), str(moved))
+        os.symlink(moved, d.parent)
+
+    def test_reset_to_base_rejects_filters_and_path_redirection(self):
+        tmp_sentinel = Path(tempfile.mkdtemp(dir="/private/tmp"))     # temp space the command sandbox may write
+        self.addCleanup(shutil.rmtree, tmp_sentinel, True)
+        script = self.root / "filter.sh"
+        markers = self.root / "markers"
+        markers.mkdir()
+        script.write_text(f"#!/bin/sh\necho ran >> '{markers / 'filter'}'\ncat\n")
+        script.chmod(0o755)
+        mod_of = lambda d: d / ".git/modules/.agents/skills/shared"
+
+        def filters(gd):
+            with open(gd / "config", "a") as f:
+                f.write(f'[filter "x"]\n\tsmudge = {script}\n\tclean = {script}\n\tprocess = {script}\n')
+            (gd / "info").mkdir(exist_ok=True)
+            (gd / "info/attributes").write_text("* filter=x\n")
+
+        def include(gd):          # the filter comes from an included file
+            inc = gd.parent.parent / "included.cfg" if gd.name == ".git" else self.root / "included.cfg"
+            inc.write_text(f'[filter "x"]\n\tsmudge = {script}\n')
+            with open(gd / "config", "a") as f:
+                f.write(f"[include]\n\tpath = {inc}\n")
+            (gd / "info").mkdir(exist_ok=True)
+            (gd / "info/attributes").write_text("* filter=x\n")
+
+        def worktree(gd, where):
+            with open(gd / "config", "a") as f:
+                f.write(f"[core]\n\tworktree = {where}\n")
+
+        def ancestor(d):          # the modules folder moved to writable temp, a symlink left in its place
+            moved = tmp_sentinel / "modules"
+            shutil.move(str(d / ".git/modules"), str(moved))
+            os.symlink(moved, d / ".git/modules")
+        cases = {
+            "super-filter": (lambda d: filters(d / ".git"), "names a filter program"),
+            "module-filter": (lambda d: filters(mod_of(d)), "names a filter program"),
+            "super-include": (lambda d: include(d / ".git"), "names a filter program"),
+            "super-worktree": (lambda d: worktree(d / ".git", tmp_sentinel), "moves the work tree"),
+            "module-worktree": (lambda d: worktree(mod_of(d), tmp_sentinel), "moves the work tree"),
+            "combined": (lambda d: (filters(d / ".git"), filters(mod_of(d)), worktree(d / ".git", tmp_sentinel)),
+                         "names a filter program|moves the work tree"),
+            "module-ancestor": (ancestor, "cached git data of submodule"),
+            "escaping-gitfile": (lambda d: (d / ".agents/skills/shared/.git").write_text(
+                f"gitdir: {tmp_sentinel}\n"), "no longer points at its git directory"),
+            "clone-ancestor": (lambda d: self.swap_parent(d, tmp_sentinel), "clone folder was replaced"),
+            "replaced-git": (lambda d: (shutil.move(str(d / ".git"), str(tmp_sentinel / "git")),
+                                        os.symlink(tmp_sentinel / "git", d / ".git")),
+                             "no longer the directory captured"),
+        }
+        for name, (plant, why) in cases.items():
+            with self.subTest(name):
+                d = self.plain_clone(self.consumer, f"reject-{name}/clone")
+                base = iwb.capture_base(str(d))
+                for p in tmp_sentinel.iterdir():
+                    shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
+                (tmp_sentinel / "keep.txt").write_text("must survive\n")
+                (d / "a.py").write_text("dirty\n")
+                (d / ".agents/skills/shared/catalog.json").write_text("dirty\n")
+                (d / "untracked.txt").write_text("x\n")
+                plant(d)
+                with self.assertRaisesRegex(iwb.RestoreError, f"restoring the base failed at preflight: .*({why})"):
+                    iwb.reset_to_base(str(d), base)
+                self.assertFalse((markers / "filter").exists())
+                self.assertEqual((tmp_sentinel / "keep.txt").read_text(), "must survive\n")
+                # refused before any change: the dirty and untracked files are still there
+                self.assertEqual((d / "a.py").read_text(), "dirty\n")
+                self.assertTrue((d / "untracked.txt").exists())
+
+    def test_reset_to_base_fails_closed_when_locations_move(self):
+        cases = {
+            "gitfile": (lambda d: (shutil.move(str(d / ".git"), str(self.root / "elsewhere-gitfile")),
+                                   (d / ".git").write_text(f"gitdir: {self.root / 'elsewhere-gitfile'}\n")),
+                        "no longer the directory captured"),
+            "symlink": (lambda d: (shutil.move(str(d / ".git"), str(self.root / "elsewhere-link")),
+                                   os.symlink(self.root / "elsewhere-link", d / ".git")),
+                        "no longer the directory captured"),
+            "no-git": (lambda d: shutil.rmtree(d / ".git"), "no longer the directory captured"),
+            "sub-gitfile": (lambda d: (d / ".agents/skills/shared/.git").write_text(f"gitdir: {self.root}\n"),
+                            "no longer points at its git directory"),
+            "sub-cache": (lambda d: shutil.rmtree(d / ".git/modules"), "cached git data of submodule"),
+            "sub-path": (lambda d: (shutil.rmtree(d / ".agents/skills/shared"),
+                                    os.symlink(self.root, d / ".agents/skills/shared")), "is a symlink"),
+        }
+        for name, (break_it, why) in cases.items():
+            with self.subTest(name):
+                d = self.plain_clone(self.consumer, f"moved-{name}")
+                base = iwb.capture_base(str(d))
+                (d / "untracked.txt").write_text("x\n")
+                break_it(d)
+                with self.assertRaisesRegex(iwb.RestoreError, why):
+                    iwb.reset_to_base(str(d), base)
+                self.assertTrue((d / "untracked.txt").exists())     # nothing was cleaned anywhere
+        self.assertTrue((self.root / "catalog.git").is_dir())
+
+    def test_a_failed_restoration_stage_raises_and_stops_later_commands(self):
+        real = iwb.subprocess.run
+        for stage in ("reset", "clean", "update", "status"):
+            with self.subTest(stage):
+                d = self.plain_clone(self.consumer, f"stage-{stage}")
+                seen = []
+
+                def fake(cmd, *a, **k):
+                    restoring = "GIT_NO_REPLACE_OBJECTS" in (k.get("env") or {})
+                    if restoring and stage in cmd:
+                        return self.sp.CompletedProcess(cmd, 1, "", "fatal: broken\n")
+                    if cmd[0] == "sandbox-exec":
+                        if not restoring:
+                            seen.append(cmd[3:])
+                        return real(cmd[3:], *a, **k)
+                    return real(cmd, *a, **k)
+                with mock.patch.object(iwb.subprocess, "run", fake):
+                    # a failed status already stops the capture: no command runs on an unchecked base
+                    with self.assertRaisesRegex(iwb.RestoreError, "(restoring|capturing) the base failed"):
+                        iwb.run_acceptance(["true", "false"], str(d))
+                self.assertEqual(seen, [])      # the reset before the first command already stopped the run
+
+    def test_restoration_errors_stop_both_runners_and_cover_the_final_cleanup(self):
+        units = [code_unit("a", cmds=["rm -rf .git/modules"]), code_unit("b", cmds=["true"])]
+        d = self.plain_clone(self.consumer, "stop-red")
+        seen = []
+        with self.unsandboxed(seen):
+            with self.assertRaisesRegex(iwb.RestoreError, "cached git data"):
+                iwb.red_check(units, str(d))
+        self.assertEqual(seen, [["rm", "-rf", ".git/modules"]])
+        d = self.plain_clone(self.consumer, "stop-final")
+        seen = []
+        with self.unsandboxed(seen):
+            with self.assertRaisesRegex(iwb.RestoreError, "cached git data"):
+                iwb.run_acceptance(["true", "rm -rf .git/modules"], str(d))
+        self.assertEqual(seen, [["true"], ["rm", "-rf", ".git/modules"]])
+        self.assertTrue(issubclass(iwb.RestoreError, RuntimeError))         # approval's handler takes it
+        self.assertFalse(issubclass(iwb.RestoreError, iwb.SharedSkillsError))   # not a bot:blocked check failure
+
+    def test_restoration_git_calls_carry_the_restrictions(self):
+        d = self.plain_clone(self.consumer, "argv")
+        calls, real = [], iwb.subprocess.run
+
+        def record(cmd, *a, **k):
+            calls.append((list(cmd), dict(k.get("env") or {})))
+            return real(cmd[3:], *a, **k)          # without the launcher, so this also runs in another sandbox
+        with mock.patch.object(iwb.subprocess, "run", record):
+            base = iwb.capture_base(str(d))
+            iwb.reset_to_base(str(d), base)
+        self.assertEqual([c for c, _ in calls if c[0] != "sandbox-exec"], [])     # capture and checks included
+        gits = [c for c, _ in calls if c[3] == "git"]
+        writers = [c for c, _ in calls if c[3] != "git"]
+        self.assertTrue(any("update" in c for c in gits))
+        self.assertTrue(any("config" in c and "-f" in c for c in gits))
+        self.assertEqual([c[3:6] for c in writers], [[iwb.sys.executable, "-I", "-S"]])
+        n = len(iwb.RESTORE_GIT)
+        for c, env in calls:
+            self.assertEqual(c[:3], ["sandbox-exec", "-p", iwb.restore_profile(str(d))], c)
+            self.assertIn("(deny network*)", c[2])
+            self.assertEqual(set(env), {"PATH", "HOME", "LANG", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL",
+                                        "GIT_ATTR_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS", "GIT_PROTOCOL_FROM_USER",
+                                        "GIT_TERMINAL_PROMPT", "GIT_ALLOW_PROTOCOL"})
+            self.assertEqual((env["GIT_CONFIG_NOSYSTEM"], env["GIT_CONFIG_GLOBAL"], env["GIT_TERMINAL_PROMPT"],
+                              env["GIT_ALLOW_PROTOCOL"]), ("1", os.devnull, "0", ""))
+        self.assertTrue(any(c[4 + n].startswith("--git-dir=") and c[5 + n] == "config" for c in gits))   # preflight
+        for c in gits:
+            self.assertEqual(c[4:4 + n], list(iwb.RESTORE_GIT), c)
+            self.assertNotIn("foreach", c)
+            if c[4 + n] == "config":                       # `git config -f <file>` reads one file as data
+                self.assertIn("--no-includes", c)
+                self.assertIn("-f", c)
+            else:
+                self.assertTrue(c[4 + n].startswith("--git-dir="), c)
+                self.assertTrue(c[5 + n].startswith("--work-tree=") or c[5 + n] == "config", c)
+        opts = list(iwb.RESTORE_GIT)
+        allows = [opts[i + 1] for i, x in enumerate(opts) if x == "-c" and ".allow=" in opts[i + 1]]
+        self.assertIn("protocol.allow=never", allows)
+        self.assertEqual([a for a in allows if not a.endswith("=never")], [])
+        for p in ("file", "https", "http", "ssh", "git", "ext"):
+            self.assertIn(f"protocol.{p}.allow=never", allows)
+        for o in ("credential.helper=", "core.askPass=", "core.attributesFile=/dev/null"):
+            self.assertIn(o, opts)
+        self.assertEqual(opts[:len(iwb.TRUSTED_GIT)], list(iwb.TRUSTED_GIT))
+
+    def test_control_file_writes_stay_inside_the_command_sandbox(self):
+        # a leftover process swapped a verified git directory for a symlink to the home folder before the write
+        need_sandbox_exec(self)
+        with home_tmpdir(self) as home_tmp:
+            d = self.plain_clone(self.consumer, "swapped")
+            with self.assertRaisesRegex(iwb.RestoreError, "at control files"):
+                iwb._put_control(str(d), [(home_tmp, {"config": b"[core]\n", "info/attributes": None})])
+            self.assertEqual(os.listdir(home_tmp), [])
+
+    def test_restoration_contains_a_program_planted_during_restoration(self):
+        """The preflight refuses planted filters; this is the real-sandbox containment check for state a leftover
+        process plants after the preflight: the program runs, but only with the command sandbox's power."""
+        need_sandbox_exec(self)
+        with home_tmpdir(self) as home_tmp:
+            outside = Path(home_tmp, "escaped.txt")
+            d = self.plain_clone(self.consumer, "sandboxed")
+            mod = d / ".git/modules/.agents/skills/shared"
+            hook = self.root / "escape.sh"
+            ran = self.root / "filter-ran"         # next to the clone: the sandbox lets it write there
+            hook.write_text(f"#!/bin/sh\necho x > '{ran}'\necho x > '{outside}'\ncat\n")
+            hook.chmod(0o755)
+            base = iwb.capture_base(str(d))
+            self.hardened(d, "submodule", "deinit", "-q", "-f", "--all")
+            # as if a command's leftover process replanted a filter after iwb put the config back
+            real = iwb.subprocess.run
+
+            def replant(cmd, *a, **k):
+                if cmd[0] == "sandbox-exec" and "update" in cmd:
+                    with open(mod / "config", "a") as f:
+                        f.write(f'[filter "x"]\n\tsmudge = {hook}\n')
+                    (mod / "info").mkdir(exist_ok=True)
+                    (mod / "info/attributes").write_text("* filter=x\n")
+                return real(cmd, *a, **k)
+            with mock.patch.object(iwb.subprocess, "run", replant):
+                try:
+                    iwb.reset_to_base(str(d), base)
+                except iwb.RestoreError:
+                    pass            # the filter failed under the sandbox: restoration stopped, as it must
+            self.assertTrue(ran.exists())          # the replanted filter did run, but sandboxed
+            self.assertFalse(outside.exists())
+
+    def test_restoration_never_fetches_a_missing_submodule(self):
+        d = self.plain_clone(self.consumer, "nofetch")
+        base = iwb.capture_base(str(d))
+        mod = d / ".git/modules/.agents/skills/shared"
+        self.hardened(d, "submodule", "deinit", "-q", "-f", "--all")
+        objects = mod / "objects"
+        shutil.rmtree(objects)
+        objects.mkdir()
+        (objects / "info").mkdir()
+        (objects / "pack").mkdir()
+        with self.assertRaisesRegex(iwb.RestoreError, "restoring the base failed at submodule update"):
+            iwb.reset_to_base(str(d), base)
+
+    def test_reset_to_base_without_shared_skills(self):
+        bare = self.root / "plain.git"
+        self.make_consumer(bare, submodule=False)
+        d = self.plain_clone(bare, "plain")
+        base = iwb.capture_base(str(d))
+        self.assertIsNone(base["shared"])
+        self.assertEqual(base["modules"], [])
+        (d / "a.py").write_text("dirty\n")
+        (d / "junk").write_text("x\n")
+        iwb.reset_to_base(str(d), base)
+        self.assertEqual((d / "a.py").read_text(), "x\n")
+        self.assertFalse((d / "junk").exists())
+        self.assertIsNone(iwb.capture_base(str(self.root / "catalog-work" / "skills-missing")))
+        iwb.reset_to_base(str(self.root), None)            # a folder that was not a clone: nothing to restore
+
+    def test_merge_waits_for_kenny_after_a_restoration_error(self):
+        sha = "a" * 40
+        kenny = []
+        entry = {"work": {"pr": "https://github.com/kennylhilljr/demo/pull/2"}, "agent": "claude"}
+        facts = {"pr": {"head": "bot/1-x", "sha": sha, "number": 2, "title": "X"}, "files": ["a.py"]}
+
+        def broken(*a):
+            raise iwb.RestoreError("restoring the base failed at submodule update (exit 1): no objects")
+        with mock.patch.object(iwb, "acceptance_check", broken), \
+                mock.patch.object(iwb, "kenny_unless_landed", lambda key, e, why: kenny.append(why)), \
+                mock.patch.object(iwb, "merge_pr", lambda *a: self.fail("merged")):
+            iwb.merge_now(f"{self.REPO}#1", entry, facts, {}, [], ["true"])
+        self.assertEqual(kenny, [f"the acceptance run on the head `{sha[:10]}` stopped: restoring the base failed "
+                                 f"at submodule update (exit 1): no objects"])
 
     def test_post_run_scope_check_protects_them(self):
         d = self.plain_clone(self.consumer, "run")
