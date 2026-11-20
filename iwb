@@ -634,7 +634,7 @@ def shared_submodule_urls(repo_dir):
         return []
     if f.is_symlink():
         return [""]
-    r = subprocess.run(["git", "config", "--no-includes", "-z", "-f", str(f), "--get-regexp", r"^submodule\..*\.path$"],
+    r = subprocess.run(["git", *TRUSTED_GIT, "config", "--no-includes", "-z", "-f", str(f), "--get-regexp", r"^submodule\..*\.path$"],
                        capture_output=True, text=True, env=tokenless_env())
     if r.returncode not in (0, 1):
         return [""]
@@ -645,7 +645,7 @@ def shared_submodule_urls(repo_dir):
             names.append(key[len("submodule."):-len(".path")])
     urls = []
     for name in names:
-        u = subprocess.run(["git", "config", "--no-includes", "-f", str(f), "--get-all", f"submodule.{name}.url"],
+        u = subprocess.run(["git", *TRUSTED_GIT, "config", "--no-includes", "-f", str(f), "--get-all", f"submodule.{name}.url"],
                            capture_output=True, text=True, env=tokenless_env())
         got = u.stdout.splitlines() if u.returncode == 0 else []
         urls += got if got else [""]
@@ -659,10 +659,11 @@ def shared_url_problem(repo_dir):
     return None
 
 
-def shared_skills_check(repo_dir):
+def shared_skills_check(repo_dir, pinned=None):
     """The submodule check (SUB-6, skills-catalog DESIGN 4.2), run by the harness after every clone: None when
     .gitmodules has no SHARED_PATH entry, else the pinned catalog commit. Raises SharedSkillsError with exactly
-    "submodule URL not allowed" or "shared skills missing"."""
+    "submodule URL not allowed" or "shared skills missing". reset_to_base passes `pinned` (git dir, work tree):
+    the status call then runs restore_git on those directories, since commands have written to the clone."""
     urls = shared_submodule_urls(repo_dir)
     if not urls:
         return None
@@ -672,10 +673,16 @@ def shared_skills_check(repo_dir):
     catalog = Path(repo_dir) / SHARED_PATH / "catalog.json"
     if not catalog.is_file() or catalog.is_symlink():
         raise SharedSkillsError("shared skills missing")
-    r = subprocess.run(["git", "-C", str(repo_dir), "submodule", "status", "--", SHARED_PATH], capture_output=True,
-                       text=True, env=tokenless_env(), timeout=120)
-    lines = [x for x in r.stdout.splitlines() if x[41:].strip().split(" (")[0] == SHARED_PATH] if r.returncode == 0 \
-        else []
+    if pinned:
+        try:
+            out = restore_git("submodule status", *pinned, "submodule", "status", "--", SHARED_PATH, timeout=120)
+        except RestoreError:
+            out = None
+    else:
+        r = subprocess.run(["git", *TRUSTED_GIT, "-C", str(repo_dir), "submodule", "status", "--", SHARED_PATH],
+                           capture_output=True, text=True, env=tokenless_env(), timeout=120)
+        out = r.stdout if r.returncode == 0 else None
+    lines = [x for x in out.splitlines() if x[41:].strip().split(" (")[0] == SHARED_PATH] if out is not None else []
     if len(lines) != 1 or lines[0][:1] != " " or not re.fullmatch(r"[0-9a-f]{40}", lines[0][1:41]):
         raise SharedSkillsError("shared skills missing")
     return lines[0][1:41]
@@ -1562,29 +1569,215 @@ def sandbox_profile(workdir):
             '(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))')
 
 
-def reset_to_base(repo_dir):
-    """Put a git clone back to its committed tree, so each acceptance command sees the base code and not files an
-    earlier command created (Codex review of PR #5)."""
-    if Path(repo_dir, ".git").exists():
-        # --recurse-submodules: the shared skills submodule goes back to its pinned commit and tree as well
-        subprocess.run(["git", "-C", repo_dir, "reset", "--hard", "-q", "--recurse-submodules"], capture_output=True)
-        subprocess.run(["git", "-C", repo_dir, "clean", "-fdxq"], capture_output=True)
-        subprocess.run(["git", "-C", repo_dir, "submodule", "--quiet", "foreach", "--recursive", "git clean -fdxq"],
-                       capture_output=True)
+class RestoreError(RuntimeError):
+    """reset_to_base could not put a clone back to its captured base. It stops the run: it is never a command's
+    result, so a later command never runs on a tree iwb could not restore."""
+
+
+# The files in a git directory through which repository state can run a program (filter drivers, fsmonitor,
+# hooksPath, includes) or move the repository (core.worktree, commondir, a worktree config). reset_to_base puts
+# them back to the bytes captured before any command ran; a file that did not exist then is removed.
+CONTROL_FILES = ("config", "config.worktree", "commondir", "gitdir", "info/attributes")
+
+
+def restore_git_env():
+    """tokenless_env without inherited repository redirection, attributes from the system, replace refs or a
+    protocol allowlist: restoration and its checks read only the clone's captured config and iwb's options."""
+    env = {k: v for k, v in tokenless_env().items() if k not in UNTRUSTED_GIT_ENV and k != "GIT_ALLOW_PROTOCOL"}
+    env.update(GIT_ATTR_NOSYSTEM="1", GIT_NO_REPLACE_OBJECTS="1", GIT_PROTOCOL_FROM_USER="0",
+               GIT_TERMINAL_PROMPT="0")
+    return env
+
+
+def restore_git(stage, git_dir, work_tree, *args, timeout=300):
+    """git with RESTORE_GIT on the top-level command (git hands -c options on to submodule children), the
+    repository pinned by --git-dir/--work-tree and restore_git_env. Raises RestoreError naming `stage` on a
+    non-zero exit, a launch error or a timeout. Returns stdout."""
+    cmd = ["git", *RESTORE_GIT, f"--git-dir={git_dir}", f"--work-tree={work_tree}", *args]
+    try:
+        r = subprocess.run(cmd, cwd=str(work_tree), env=restore_git_env(), capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RestoreError(f"restoring the base failed at {stage}: timed out after {timeout}s")
+    except OSError as e:
+        raise RestoreError(f"restoring the base failed at {stage}: {short(e, 300)}")
+    if r.returncode != 0:
+        raise RestoreError(f"restoring the base failed at {stage} (exit {r.returncode}): "
+                           f"{short(r.stderr or r.stdout, 300)}")
+    return r.stdout
+
+
+def _same_dir(path, ident):
+    """Whether `path` is still the real directory (not a symlink) with the captured (st_dev, st_ino)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and (st.st_dev, st.st_ino) == ident
+
+
+def _dir_ident(path):
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        raise RestoreError(f"capturing the base failed: {path} is not a directory")
+    return st.st_dev, st.st_ino
+
+
+def _read_control(git_dir):
+    files = {}
+    for name in CONTROL_FILES:
+        p = Path(git_dir, name)
+        try:
+            files[name] = p.read_bytes() if p.is_file() and not p.is_symlink() else None
+        except OSError:
+            files[name] = None
+    return files
+
+
+def capture_base(repo_dir):
+    """What reset_to_base restores, read before any command runs in `repo_dir` (iwb's own clone, so still
+    trusted): the HEAD commit, the real .git and submodule git directories with their control files, each
+    submodule's gitfile and the pinned shared skills commit. None for a directory that is not a git clone (some
+    tests run commands in a plain folder). Raises RestoreError when a clone's base can't be read."""
+    top = Path(repo_dir).resolve()
+    git_dir = top / ".git"
+    if not os.path.lexists(git_dir):
+        return None
+    if git_dir.is_symlink() or not git_dir.is_dir():
+        raise RestoreError("capturing the base failed: the clone's .git is not a directory")
+    modules = []
+    root = git_dir / "modules"
+    if root.is_dir() and not root.is_symlink():
+        for d, dirs, files in os.walk(root):
+            dirs[:] = sorted(x for x in dirs if not Path(d, x).is_symlink())
+            if "HEAD" not in files or "config" not in files:
+                continue
+            gd = Path(d)
+            got = subprocess.run(["git", *TRUSTED_GIT, "config", "--no-includes", "-f", str(gd / "config"),
+                                  "--get", "core.worktree"], capture_output=True, text=True, env=restore_git_env(),
+                                 timeout=60)
+            wt = os.path.normpath(gd / got.stdout.strip()) if got.returncode == 0 and got.stdout.strip() else None
+            if wt is None or os.path.commonpath([str(top), wt]) != str(top) or wt == str(top):
+                raise RestoreError(f"capturing the base failed: the submodule git directory "
+                                   f"{gd.relative_to(top)} has no work tree inside the clone")
+            gitfile = Path(wt, ".git")
+            modules.append({"git_dir": str(gd), "work_tree": wt, "ident": _dir_ident(gd),
+                            "control": _read_control(gd),
+                            "gitfile": gitfile.read_bytes() if gitfile.is_file() and not gitfile.is_symlink()
+                            else None})
+    sha = restore_git("capture", git_dir, top, "rev-parse", "--verify", "-q", "HEAD^{commit}").strip()
+    try:
+        shared = shared_skills_check(top, pinned=(git_dir, top))
+    except SharedSkillsError as e:
+        raise RestoreError(f"capturing the base failed: shared skills check: {e}")
+    return {"top": str(top), "top_ident": _dir_ident(top), "git_dir": str(git_dir), "ident": _dir_ident(git_dir),
+            "control": _read_control(git_dir), "sha": sha, "modules": modules, "shared": shared}
+
+
+def _put_control(git_dir, files):
+    """Write the captured control files back into the verified `git_dir` without following symlinks a command
+    may have left there (the file itself or its info/ folder), and remove the ones that did not exist."""
+    for name, data in files.items():
+        p = Path(git_dir, name)
+        parent = p.parent
+        if parent != Path(git_dir):
+            if parent.is_symlink() or (os.path.lexists(parent) and not parent.is_dir()):
+                parent.unlink()
+            if data is not None:
+                parent.mkdir(exist_ok=True)
+        if os.path.lexists(p):
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+        if data is not None:
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+
+
+def _no_symlink_between(top, path):
+    """Whether no folder from `top` down to `path` (both included) is a symlink or a non-directory."""
+    p, rel = Path(top), Path(path).relative_to(top)
+    for part in ("",) + rel.parts:
+        p = p / part if part else p
+        if os.path.lexists(p) and (p.is_symlink() or not p.is_dir()):
+            return False
+    return True
+
+
+def reset_to_base(repo_dir, base):
+    """Put a git clone back to the base captured by capture_base, so each acceptance command sees the base code
+    and git state and not what an earlier command left (Codex review of PR #5, issue #100): HEAD at the base
+    commit, tracked files, no untracked or ignored files, and the shared skills submodule re-initialized from
+    its cached objects at the pinned commit. Command-written .git state is untrusted: git runs with RESTORE_GIT
+    (no hooks, no fsmonitor, no transport, no credential helper), the repository and each submodule are pinned
+    to the directories captured at the start, and the config and attributes files are put back before git reads
+    them. Raises RestoreError, naming the failed stage, when any of that fails or a location was moved."""
+    if base is None:
+        return
+    try:
+        _reset_to_base(base)
+    except OSError as e:
+        raise RestoreError(f"restoring the base failed: {short(e, 300)}")
+
+
+def _reset_to_base(base):
+    top, git_dir = Path(base["top"]), Path(base["git_dir"])
+    if not _same_dir(top, base["top_ident"]):
+        raise RestoreError("restoring the base failed: the clone folder was replaced or removed")
+    if not _same_dir(git_dir, base["ident"]):
+        raise RestoreError("restoring the base failed: the clone's .git is no longer the directory captured at "
+                           "the start (removed, or replaced by a symlink or gitfile)")
+    for m in base["modules"]:
+        rel = os.path.relpath(m["work_tree"], top)
+        if not _same_dir(m["git_dir"], m["ident"]):
+            raise RestoreError(f"restoring the base failed: the cached git data of submodule {rel} is missing or "
+                               f"was replaced, and restoration never fetches")
+        if not _no_symlink_between(top, m["work_tree"]):
+            raise RestoreError(f"restoring the base failed: submodule path {rel} is a symlink or not a folder")
+        gitfile = Path(m["work_tree"], ".git")
+        if os.path.lexists(gitfile) and (gitfile.is_symlink() or not gitfile.is_file()
+                                         or gitfile.read_bytes() != m["gitfile"]):
+            raise RestoreError(f"restoring the base failed: the .git of submodule {rel} no longer points at its "
+                               f"git directory inside the clone's .git/modules")
+    _put_control(git_dir, base["control"])
+    for m in base["modules"]:
+        _put_control(m["git_dir"], m["control"])
+    restore_git("reset", git_dir, top, "reset", "--hard", "-q", "--no-recurse-submodules", base["sha"])
+    restore_git("clean", git_dir, top, "clean", "-fdxq")
+    if base["modules"]:
+        restore_git("submodule update", git_dir, top, "submodule", "update", "--init", "--no-fetch", "--checkout",
+                    "--force", "--recursive", "-q")
+        for m in base["modules"]:
+            rel = os.path.relpath(m["work_tree"], top)
+            restore_git(f"submodule clean {rel}", m["git_dir"], m["work_tree"], "clean", "-fdxq")
+    head = restore_git("check", git_dir, top, "rev-parse", "--verify", "-q", "HEAD^{commit}").strip()
+    if head != base["sha"]:
+        raise RestoreError(f"restoring the base failed at check: HEAD is {head[:10]}, not {base['sha'][:10]}")
+    try:
+        shared = shared_skills_check(top, pinned=(git_dir, top))
+    except SharedSkillsError as e:
+        raise RestoreError(f"restoring the base failed at the shared skills check: {e}")
+    if shared != base["shared"]:
+        raise RestoreError(f"restoring the base failed at the shared skills check: pinned {shared} is not "
+                           f"{base['shared']}")
 
 
 def red_check(units, repo_dir):
     """Run each unit's acceptance commands against the unchanged code. A unit that adds or fixes behavior should
-    see at least one command fail; whether the failure means something is the approver's call."""
+    see at least one command fail; whether the failure means something is the approver's call. Raises
+    RestoreError when the clone can't be put back between commands; no further command runs then."""
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tempfile.gettempdir(), "LANG": "en_US.UTF-8",
            "PYTHONDONTWRITEBYTECODE": "1"}
     profile = sandbox_profile(str(Path(repo_dir).resolve().parent))
+    base = capture_base(repo_dir)
     results = {}
     for u in units:
         runs = []
         for c in u["acceptance"]["commands"]:
+            reset_to_base(repo_dir, base)
             try:
-                reset_to_base(repo_dir)
                 argv = shlex.split(c)
                 r = subprocess.run(["sandbox-exec", "-p", profile] + argv, cwd=repo_dir, env=env,
                                    capture_output=True, text=True, timeout=RED_TIMEOUT)
@@ -1596,7 +1789,7 @@ def red_check(units, repo_dir):
         mechanical = "mechanical" in u.get("traits", []) or is_docs_unit(u)
         red = any(x["exit"] != 0 for x in runs)
         results[u["id"]] = {"runs": runs, "red": red, "mechanical": mechanical, "ok": red or mechanical}
-    reset_to_base(repo_dir)
+    reset_to_base(repo_dir, base)
     return results
 
 
@@ -2942,6 +3135,12 @@ def no_learning(d, team, own=None):
 # global or repository config but iwb's own, and runs no hooks. Only that repository ever sees a token.
 RESULT_REF = "refs/iwb/result"
 TRUSTED_GIT = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+# reset_to_base and its checks: TRUSTED_GIT, no attributes file from the home folder, no credential helper or
+# askpass, and every transport refused (https and file included), so restoring never fetches; no automatic gc.
+RESTORE_GIT = (*TRUSTED_GIT, "-c", "core.attributesFile=/dev/null", "-c", "credential.helper=", "-c", "core.askPass=",
+               "-c", "protocol.allow=never", *(x for p in ("file", "ext", "https", "http", "ssh", "git")
+                                               for x in ("-c", f"protocol.{p}.allow=never")),
+               "-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.untrackedCache=false")
 UNTRUSTED_GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_CONFIG",
                      "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG_PARAMETERS", "GIT_NAMESPACE")
 GITHUB_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]*[A-Za-z0-9_-][A-Za-z0-9._-]*\Z")
@@ -3442,14 +3641,16 @@ def head_clone(repo, bot, branch, sha):
 
 def run_acceptance(commands, repo_dir):
     """Run each command on the committed tree, as the red check does (sandboxed, no network, no shell, the tree
-    reset between commands). Returns [{command, exit, output}]."""
+    reset to the captured base between commands). Returns [{command, exit, output}]; raises RestoreError when
+    the clone can't be put back, before any later command runs."""
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tempfile.gettempdir(), "LANG": "en_US.UTF-8",
            "PYTHONDONTWRITEBYTECODE": "1"}
     profile = sandbox_profile(str(Path(repo_dir).resolve().parent))
+    base = capture_base(repo_dir)
     runs = []
     for c in commands:
+        reset_to_base(repo_dir, base)
         try:
-            reset_to_base(repo_dir)
             r = subprocess.run(["sandbox-exec", "-p", profile] + shlex.split(c), cwd=repo_dir, env=env,
                                capture_output=True, text=True, timeout=ACCEPT_TIMEOUT)
             runs.append({"command": c, "exit": r.returncode, "output": (r.stdout + r.stderr)[-1500:]})
@@ -3457,7 +3658,7 @@ def run_acceptance(commands, repo_dir):
             runs.append({"command": c, "exit": None, "output": f"timed out after {ACCEPT_TIMEOUT}s"})
         except (ValueError, OSError) as e:
             runs.append({"command": c, "exit": None, "output": f"could not run: {e}"})
-    reset_to_base(repo_dir)
+    reset_to_base(repo_dir, base)
     return runs
 
 
@@ -3669,6 +3870,9 @@ def merge_now(key, entry, facts, review, minor, commands):
         ok, runs = acceptance_check(repo, worker, pr["head"], pr["sha"], commands)
     except SharedSkillsError as e:
         kenny_unless_landed(key, entry, f"the head `{pr['sha'][:10]}` fails the shared skills check: {e}")
+        return
+    except RestoreError as e:       # the clone could not be put back between commands: no verdict, no merge
+        kenny_unless_landed(key, entry, f"the acceptance run on the head `{pr['sha'][:10]}` stopped: {short(e, 300)}")
         return
     if ok is None:
         log(f"{key}: the PR head moved during the acceptance run; checking again next pass")
