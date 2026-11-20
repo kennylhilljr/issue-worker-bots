@@ -64,7 +64,7 @@
 
 Sign-in, tokens and repository lists come from prbot (PRBOT_PATH, default ../pr-review-bots/prbot).
 """
-import calendar, copy, datetime, hashlib, importlib.util, json, os, posixpath, pwd, re, shlex, shutil, signal, stat, \
+import base64, calendar, copy, datetime, hashlib, importlib.util, json, os, posixpath, pwd, re, shlex, shutil, signal, stat, \
     subprocess, sys, tempfile, time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -626,16 +626,22 @@ def tokenless_env():
     return env
 
 
-def shared_submodule_urls(repo_dir):
+def shared_submodule_urls(repo_dir, sandbox=None):
     """The URLs of every .gitmodules entry whose path is SHARED_PATH ([] when there is none). Read as data with
-    `git config -f`, includes off; a .gitmodules git can't parse counts as an entry with no allowed URL."""
+    `git config -f`, includes off; a .gitmodules git can't parse counts as an entry with no allowed URL.
+    reset_to_base passes `sandbox`, the clone, so these calls run through restore_run like the rest."""
     f = Path(repo_dir) / ".gitmodules"
     if not f.is_file() and not f.is_symlink():
         return []
     if f.is_symlink():
         return [""]
-    r = subprocess.run(["git", *TRUSTED_GIT, "config", "--no-includes", "-z", "-f", str(f), "--get-regexp", r"^submodule\..*\.path$"],
-                       capture_output=True, text=True, env=tokenless_env())
+
+    def config(*args):
+        argv = ["git", *(RESTORE_GIT if sandbox else TRUSTED_GIT), "config", "--no-includes", *args]
+        if sandbox:
+            return restore_run("shared skills check", sandbox, argv, check=False, timeout=60)
+        return subprocess.run(argv, capture_output=True, text=True, env=tokenless_env())
+    r = config("-z", "-f", str(f), "--get-regexp", r"^submodule\..*\.path$")
     if r.returncode not in (0, 1):
         return [""]
     names = []
@@ -645,16 +651,15 @@ def shared_submodule_urls(repo_dir):
             names.append(key[len("submodule."):-len(".path")])
     urls = []
     for name in names:
-        u = subprocess.run(["git", *TRUSTED_GIT, "config", "--no-includes", "-f", str(f), "--get-all", f"submodule.{name}.url"],
-                           capture_output=True, text=True, env=tokenless_env())
+        u = config("-f", str(f), "--get-all", f"submodule.{name}.url")
         got = u.stdout.splitlines() if u.returncode == 0 else []
         urls += got if got else [""]
     return urls
 
 
-def shared_url_problem(repo_dir):
+def shared_url_problem(repo_dir, sandbox=None):
     """"submodule URL not allowed" when an SHARED_PATH entry names anything but CATALOG_URL, else None."""
-    if any(u != CATALOG_URL for u in shared_submodule_urls(repo_dir)):
+    if any(u != CATALOG_URL for u in shared_submodule_urls(repo_dir, sandbox)):
         return "submodule URL not allowed"
     return None
 
@@ -664,10 +669,11 @@ def shared_skills_check(repo_dir, pinned=None):
     .gitmodules has no SHARED_PATH entry, else the pinned catalog commit. Raises SharedSkillsError with exactly
     "submodule URL not allowed" or "shared skills missing". reset_to_base passes `pinned` (git dir, work tree):
     the status call then runs restore_git on those directories, since commands have written to the clone."""
-    urls = shared_submodule_urls(repo_dir)
+    sandbox = pinned[1] if pinned else None
+    urls = shared_submodule_urls(repo_dir, sandbox)
     if not urls:
         return None
-    problem = shared_url_problem(repo_dir)
+    problem = shared_url_problem(repo_dir, sandbox)
     if problem:
         raise SharedSkillsError(problem)
     catalog = Path(repo_dir) / SHARED_PATH / "catalog.json"
@@ -1598,26 +1604,31 @@ def restore_profile(top):
     return sandbox_profile(str(parent)) + (f"(allow file-read-metadata {above})" if above else "")
 
 
-def restore_git(stage, top, git_dir, work_tree, *args, timeout=300):
-    """git for reset_to_base: under the same sandbox-exec profile as the commands for the clone `top` (no network,
-    writes only next to the clone and in temp, no home folder or Keychain), so a program that command-written
-    .git state still manages to name gets no more power than the command that wrote it; with RESTORE_GIT on the
-    top-level command (git hands -c options on to submodule children); pinned by --git-dir/--work-tree; with
-    restore_git_env. Raises RestoreError naming `stage` on a non-zero exit, a launch error (no sandbox-exec
-    included) or a timeout. Returns stdout."""
-    cmd = ["sandbox-exec", "-p", restore_profile(top), "git", *RESTORE_GIT, f"--git-dir={git_dir}", f"--work-tree={work_tree}",
-           *args]
+def restore_run(stage, top, argv, check=True, input=None, timeout=300):
+    """`argv` for reset_to_base under the same sandbox-exec profile as the commands for the clone `top` (no
+    network, writes only next to the clone and in temp, no home folder or Keychain) and with restore_git_env, so
+    what command-written .git state can make it do gets no more power than the command that wrote it, even when a
+    process the command left running changes that state meanwhile. Raises RestoreError naming `stage` on a launch
+    error (no sandbox-exec included), a timeout and, with `check`, a non-zero exit. Returns the CompletedProcess."""
+    cmd = ["sandbox-exec", "-p", restore_profile(top), *argv]
     try:
-        r = subprocess.run(cmd, cwd=str(work_tree), env=restore_git_env(), capture_output=True, text=True,
+        r = subprocess.run(cmd, cwd=str(top), env=restore_git_env(), capture_output=True, text=True, input=input,
                            timeout=timeout)
     except subprocess.TimeoutExpired:
         raise RestoreError(f"restoring the base failed at {stage}: timed out after {timeout}s")
     except OSError as e:
         raise RestoreError(f"restoring the base failed at {stage}: {short(e, 300)}")
-    if r.returncode != 0:
+    if check and r.returncode != 0:
         raise RestoreError(f"restoring the base failed at {stage} (exit {r.returncode}): "
                            f"{short(r.stderr or r.stdout, 300)}")
-    return r.stdout
+    return r
+
+
+def restore_git(stage, top, git_dir, work_tree, *args, timeout=300):
+    """git through restore_run, with RESTORE_GIT on the top-level command (git hands -c options on to submodule
+    children) and the repository pinned by --git-dir/--work-tree. Returns stdout."""
+    return restore_run(stage, top, ["git", *RESTORE_GIT, f"--git-dir={git_dir}", f"--work-tree={work_tree}",
+                                    *args], timeout=timeout).stdout
 
 
 def _same_dir(path, ident):
@@ -1666,9 +1677,8 @@ def capture_base(repo_dir):
             if "HEAD" not in files or "config" not in files:
                 continue
             gd = Path(d)
-            got = subprocess.run(["git", *TRUSTED_GIT, "config", "--no-includes", "-f", str(gd / "config"),
-                                  "--get", "core.worktree"], capture_output=True, text=True, env=restore_git_env(),
-                                 timeout=60)
+            got = restore_run("capture", top, ["git", *RESTORE_GIT, "config", "--no-includes", "-f",
+                                               str(gd / "config"), "--get", "core.worktree"], check=False, timeout=60)
             wt = os.path.normpath(gd / got.stdout.strip()) if got.returncode == 0 and got.stdout.strip() else None
             if wt is None or os.path.commonpath([str(top), wt]) != str(top) or wt == str(top):
                 raise RestoreError(f"capturing the base failed: the submodule git directory "
@@ -1687,26 +1697,38 @@ def capture_base(repo_dir):
             "control": _read_control(git_dir), "sha": sha, "modules": modules, "shared": shared}
 
 
-def _put_control(git_dir, files):
-    """Write the captured control files back into the verified `git_dir` without following symlinks a command
-    may have left there (the file itself or its info/ folder), and remove the ones that did not exist."""
+# Runs as `python3 -I -S -c` under restore_run, so its writes stay inside the command sandbox even if a leftover
+# process swaps a folder for a symlink meanwhile. stdin: [[git dir, {name: base64 bytes or null}], ...].
+PUT_CONTROL = r"""
+import base64, json, os, shutil, sys
+for git_dir, files in json.load(sys.stdin):
     for name, data in files.items():
-        p = Path(git_dir, name)
-        parent = p.parent
-        if parent != Path(git_dir):
-            if parent.is_symlink() or (os.path.lexists(parent) and not parent.is_dir()):
-                parent.unlink()
-            if data is not None:
-                parent.mkdir(exist_ok=True)
+        p = os.path.join(git_dir, name)
+        parent = os.path.dirname(p)
+        if os.path.normpath(parent) != os.path.normpath(git_dir):
+            if os.path.islink(parent) or (os.path.lexists(parent) and not os.path.isdir(parent)):
+                os.unlink(parent)
+            if data is not None and not os.path.isdir(parent):
+                os.mkdir(parent)
         if os.path.lexists(p):
-            if p.is_dir() and not p.is_symlink():
+            if os.path.isdir(p) and not os.path.islink(p):
                 shutil.rmtree(p)
             else:
-                p.unlink()
+                os.unlink(p)
         if data is not None:
-            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
             with os.fdopen(fd, "wb") as f:
-                f.write(data)
+                f.write(base64.b64decode(data))
+"""
+
+
+def _put_control(top, dirs):
+    """Write the captured control files back into the verified git directories, [(git dir, {name: bytes or
+    None})], without following symlinks a command may have left (the file or its info/ folder), and remove the
+    ones that did not exist. The writes run sandboxed (restore_run)."""
+    data = [[str(d), {k: None if v is None else base64.b64encode(v).decode() for k, v in files.items()}]
+            for d, files in dirs]
+    restore_run("control files", top, [sys.executable, "-I", "-S", "-c", PUT_CONTROL], input=json.dumps(data))
 
 
 def _no_symlink_between(top, path):
@@ -1754,9 +1776,7 @@ def _reset_to_base(base):
                                          or gitfile.read_bytes() != m["gitfile"]):
             raise RestoreError(f"restoring the base failed: the .git of submodule {rel} no longer points at its "
                                f"git directory inside the clone's .git/modules")
-    _put_control(git_dir, base["control"])
-    for m in base["modules"]:
-        _put_control(m["git_dir"], m["control"])
+    _put_control(top, [(git_dir, base["control"])] + [(m["git_dir"], m["control"]) for m in base["modules"]])
     restore_git("reset", top, git_dir, top, "reset", "--hard", "-q", "--no-recurse-submodules", base["sha"])
     restore_git("clean", top, git_dir, top, "clean", "-fdxq")
     if base["modules"]:

@@ -6921,7 +6921,7 @@ class SharedSkills(unittest.TestCase):
 
         def run(cmd, *a, **k):
             if cmd and cmd[0] == "sandbox-exec":
-                if not (cmd[3] == "git" and any(x.startswith("--git-dir=") for x in cmd)):
+                if "GIT_NO_REPLACE_OBJECTS" not in (k.get("env") or {}):     # not restoration's own calls
                     seen.append(cmd[3:])
                 return real(cmd[3:], *a, **k)
             return real(cmd, *a, **k)
@@ -7066,7 +7066,7 @@ class SharedSkills(unittest.TestCase):
                 seen = []
 
                 def fake(cmd, *a, **k):
-                    restoring = any(x.startswith("--git-dir=") for x in cmd)
+                    restoring = "GIT_NO_REPLACE_OBJECTS" in (k.get("env") or {})
                     if restoring and stage in cmd:
                         return self.sp.CompletedProcess(cmd, 1, "", "fatal: broken\n")
                     if cmd[0] == "sandbox-exec":
@@ -7107,30 +7107,29 @@ class SharedSkills(unittest.TestCase):
         with mock.patch.object(iwb.subprocess, "run", record):
             base = iwb.capture_base(str(d))
             iwb.reset_to_base(str(d), base)
-        repo_calls = [(c, e) for c, e in calls if c[0] == "sandbox-exec"]
-        data_reads = [(c, e) for c, e in calls if c[0] != "sandbox-exec"]
-        self.assertTrue(any("update" in c for c, _ in repo_calls))
-        self.assertTrue(data_reads)
-        for c, env in data_reads:           # `git config -f` on a file, outside any repository
-            self.assertEqual(c[:2 + len(iwb.TRUSTED_GIT)], ["git", *iwb.TRUSTED_GIT, "config"], c)
-            self.assertIn("--no-includes", c)
-        for c, env in calls:
-            self.assertNotIn("PRBOT_GIT_TOKEN", env)
-            for k in iwb.UNTRUSTED_GIT_ENV + ("GIT_ASKPASS", "SSH_ASKPASS", "GIT_ALLOW_PROTOCOL", "GITHUB_TOKEN"):
-                self.assertNotIn(k, env)
+        self.assertEqual([c for c, _ in calls if c[0] != "sandbox-exec"], [])     # capture and checks included
+        gits = [c for c, _ in calls if c[3] == "git"]
+        writers = [c for c, _ in calls if c[3] != "git"]
+        self.assertTrue(any("update" in c for c in gits))
+        self.assertTrue(any("config" in c and "-f" in c for c in gits))
+        self.assertEqual([c[3:6] for c in writers], [[iwb.sys.executable, "-I", "-S"]])
         n = len(iwb.RESTORE_GIT)
-        for c, env in repo_calls:
-            self.assertEqual(c[:4], ["sandbox-exec", "-p", iwb.restore_profile(str(d)), "git"], c)
+        for c, env in calls:
+            self.assertEqual(c[:3], ["sandbox-exec", "-p", iwb.restore_profile(str(d))], c)
             self.assertIn("(deny network*)", c[2])
-            self.assertEqual(c[4:4 + n], list(iwb.RESTORE_GIT), c)
-            self.assertTrue(c[4 + n].startswith("--git-dir="), c)
-            self.assertTrue(c[5 + n].startswith("--work-tree="), c)
-            self.assertNotIn("foreach", c)
             self.assertEqual(set(env), {"PATH", "HOME", "LANG", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL",
                                         "GIT_ATTR_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS", "GIT_PROTOCOL_FROM_USER",
                                         "GIT_TERMINAL_PROMPT"})
             self.assertEqual((env["GIT_CONFIG_NOSYSTEM"], env["GIT_CONFIG_GLOBAL"], env["GIT_TERMINAL_PROMPT"]),
                              ("1", os.devnull, "0"))
+        for c in gits:
+            self.assertEqual(c[4:4 + n], list(iwb.RESTORE_GIT), c)
+            self.assertNotIn("foreach", c)
+            if "config" not in c[4 + n:5 + n]:             # `git config -f <file>` reads one file as data
+                self.assertTrue(c[4 + n].startswith("--git-dir="), c)
+                self.assertTrue(c[5 + n].startswith("--work-tree="), c)
+            else:
+                self.assertIn("--no-includes", c)
         opts = list(iwb.RESTORE_GIT)
         allows = [opts[i + 1] for i, x in enumerate(opts) if x == "-c" and ".allow=" in opts[i + 1]]
         self.assertIn("protocol.allow=never", allows)
@@ -7147,6 +7146,15 @@ class SharedSkills(unittest.TestCase):
         if r.returncode:
             raise AssertionError(f"{cmd}: {r.stderr}")
         return r.stdout, r.stderr
+
+    def test_control_file_writes_stay_inside_the_command_sandbox(self):
+        # a leftover process swapped a verified git directory for a symlink to the home folder before the write
+        need_sandbox_exec(self)
+        with home_tmpdir(self) as home_tmp:
+            d = self.plain_clone(self.consumer, "swapped")
+            with self.assertRaisesRegex(iwb.RestoreError, "at control files"):
+                iwb._put_control(str(d), [(home_tmp, {"config": b"[core]\n", "info/attributes": None})])
+            self.assertEqual(os.listdir(home_tmp), [])
 
     def test_restoration_runs_under_the_command_sandbox(self):
         need_sandbox_exec(self)
