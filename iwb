@@ -1785,8 +1785,8 @@ def _check_config(top, git_dir, work_tree, label):
 
 def _reset_to_base(base):
     top, git_dir = Path(base["top"]), Path(base["git_dir"])
-    if not _same_dir(top, base["top_ident"]):
-        raise _preflight_error("the clone folder was replaced or removed")
+    if not _same_dir(top, base["top_ident"]) or os.path.realpath(top) != str(top):
+        raise _preflight_error("the clone folder was replaced, moved or removed (a folder above it included)")
     if not _same_dir(git_dir, base["ident"]):
         raise _preflight_error("the clone's .git is no longer the directory captured at the start (removed, or "
                                "replaced by a symlink or gitfile)")

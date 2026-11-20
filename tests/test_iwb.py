@@ -7002,6 +7002,13 @@ class SharedSkills(unittest.TestCase):
         self.assertEqual(iwb.shared_skill_names(str(d)), ["shared-a", "shared-b"])
         self.assertEqual(list(markers.iterdir()), [])
 
+    def swap_parent(self, d, where):
+        """Move the folder holding clone `d` into `where` and leave a symlink to it in its place: the same clone
+        inode, reached through a redirected folder above it."""
+        moved = where / d.parent.name
+        shutil.move(str(d.parent), str(moved))
+        os.symlink(moved, d.parent)
+
     def test_reset_to_base_rejects_filters_and_path_redirection(self):
         tmp_sentinel = Path(tempfile.mkdtemp(dir="/private/tmp"))     # temp space the command sandbox may write
         self.addCleanup(shutil.rmtree, tmp_sentinel, True)
@@ -7019,7 +7026,7 @@ class SharedSkills(unittest.TestCase):
             (gd / "info/attributes").write_text("* filter=x\n")
 
         def include(gd):          # the filter comes from an included file
-            inc = self.root / "included.cfg"
+            inc = gd.parent.parent / "included.cfg" if gd.name == ".git" else self.root / "included.cfg"
             inc.write_text(f'[filter "x"]\n\tsmudge = {script}\n')
             with open(gd / "config", "a") as f:
                 f.write(f"[include]\n\tpath = {inc}\n")
@@ -7045,13 +7052,14 @@ class SharedSkills(unittest.TestCase):
             "module-ancestor": (ancestor, "cached git data of submodule"),
             "escaping-gitfile": (lambda d: (d / ".agents/skills/shared/.git").write_text(
                 f"gitdir: {tmp_sentinel}\n"), "no longer points at its git directory"),
+            "clone-ancestor": (lambda d: self.swap_parent(d, tmp_sentinel), "clone folder was replaced"),
             "replaced-git": (lambda d: (shutil.move(str(d / ".git"), str(tmp_sentinel / "git")),
                                         os.symlink(tmp_sentinel / "git", d / ".git")),
                              "no longer the directory captured"),
         }
         for name, (plant, why) in cases.items():
             with self.subTest(name):
-                d = self.plain_clone(self.consumer, f"reject-{name}")
+                d = self.plain_clone(self.consumer, f"reject-{name}/clone")
                 base = iwb.capture_base(str(d))
                 for p in tmp_sentinel.iterdir():
                     shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
