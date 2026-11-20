@@ -7002,35 +7002,71 @@ class SharedSkills(unittest.TestCase):
         self.assertEqual(iwb.shared_skill_names(str(d)), ["shared-a", "shared-b"])
         self.assertEqual(list(markers.iterdir()), [])
 
-    def test_reset_to_base_neutralizes_planted_filters_and_worktree_redirection(self):
-        d = self.plain_clone(self.consumer, "filters")
-        base = iwb.capture_base(str(d))
-        mod = d / ".git/modules/.agents/skills/shared"
-        markers, sentinel = self.root / "markers", self.root / "sentinel"
-        markers.mkdir()
-        sentinel.mkdir()
-        (sentinel / "keep.txt").write_text("must survive\n")
+    def test_reset_to_base_rejects_filters_and_path_redirection(self):
+        tmp_sentinel = Path(tempfile.mkdtemp(dir="/private/tmp"))     # temp space the command sandbox may write
+        self.addCleanup(shutil.rmtree, tmp_sentinel, True)
         script = self.root / "filter.sh"
+        markers = self.root / "markers"
+        markers.mkdir()
         script.write_text(f"#!/bin/sh\necho ran >> '{markers / 'filter'}'\ncat\n")
         script.chmod(0o755)
-        config_before = {p: p.read_bytes() for p in (d / ".git/config", mod / "config")}
-        for gd in (d / ".git", mod):
+        mod_of = lambda d: d / ".git/modules/.agents/skills/shared"
+
+        def filters(gd):
             with open(gd / "config", "a") as f:
                 f.write(f'[filter "x"]\n\tsmudge = {script}\n\tclean = {script}\n\tprocess = {script}\n')
             (gd / "info").mkdir(exist_ok=True)
             (gd / "info/attributes").write_text("* filter=x\n")
-        with open(d / ".git/config", "a") as f:
-            f.write(f"[core]\n\tworktree = {sentinel}\n")
-        (d / "a.py").write_text("dirty\n")
-        (d / ".agents/skills/shared/catalog.json").write_text("dirty\n")
-        iwb.reset_to_base(str(d), base)
-        self.assertFalse((markers / "filter").exists())
-        self.assertEqual((sentinel / "keep.txt").read_text(), "must survive\n")
-        self.assertEqual({p: p.read_bytes() for p in config_before}, config_before)
-        for gd in (d / ".git", mod):
-            self.assertFalse((gd / "info/attributes").exists())
-        self.assertEqual((d / "a.py").read_text(), "x\n")
-        self.assertEqual(iwb.shared_skill_names(str(d)), ["shared-a", "shared-b"])
+
+        def include(gd):          # the filter comes from an included file
+            inc = self.root / "included.cfg"
+            inc.write_text(f'[filter "x"]\n\tsmudge = {script}\n')
+            with open(gd / "config", "a") as f:
+                f.write(f"[include]\n\tpath = {inc}\n")
+            (gd / "info").mkdir(exist_ok=True)
+            (gd / "info/attributes").write_text("* filter=x\n")
+
+        def worktree(gd, where):
+            with open(gd / "config", "a") as f:
+                f.write(f"[core]\n\tworktree = {where}\n")
+
+        def ancestor(d):          # the modules folder moved to writable temp, a symlink left in its place
+            moved = tmp_sentinel / "modules"
+            shutil.move(str(d / ".git/modules"), str(moved))
+            os.symlink(moved, d / ".git/modules")
+        cases = {
+            "super-filter": (lambda d: filters(d / ".git"), "names a filter program"),
+            "module-filter": (lambda d: filters(mod_of(d)), "names a filter program"),
+            "super-include": (lambda d: include(d / ".git"), "names a filter program"),
+            "super-worktree": (lambda d: worktree(d / ".git", tmp_sentinel), "moves the work tree"),
+            "module-worktree": (lambda d: worktree(mod_of(d), tmp_sentinel), "moves the work tree"),
+            "combined": (lambda d: (filters(d / ".git"), filters(mod_of(d)), worktree(d / ".git", tmp_sentinel)),
+                         "names a filter program|moves the work tree"),
+            "module-ancestor": (ancestor, "cached git data of submodule"),
+            "escaping-gitfile": (lambda d: (d / ".agents/skills/shared/.git").write_text(
+                f"gitdir: {tmp_sentinel}\n"), "no longer points at its git directory"),
+            "replaced-git": (lambda d: (shutil.move(str(d / ".git"), str(tmp_sentinel / "git")),
+                                        os.symlink(tmp_sentinel / "git", d / ".git")),
+                             "no longer the directory captured"),
+        }
+        for name, (plant, why) in cases.items():
+            with self.subTest(name):
+                d = self.plain_clone(self.consumer, f"reject-{name}")
+                base = iwb.capture_base(str(d))
+                for p in tmp_sentinel.iterdir():
+                    shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
+                (tmp_sentinel / "keep.txt").write_text("must survive\n")
+                (d / "a.py").write_text("dirty\n")
+                (d / ".agents/skills/shared/catalog.json").write_text("dirty\n")
+                (d / "untracked.txt").write_text("x\n")
+                plant(d)
+                with self.assertRaisesRegex(iwb.RestoreError, f"restoring the base failed at preflight: .*({why})"):
+                    iwb.reset_to_base(str(d), base)
+                self.assertFalse((markers / "filter").exists())
+                self.assertEqual((tmp_sentinel / "keep.txt").read_text(), "must survive\n")
+                # refused before any change: the dirty and untracked files are still there
+                self.assertEqual((d / "a.py").read_text(), "dirty\n")
+                self.assertTrue((d / "untracked.txt").exists())
 
     def test_reset_to_base_fails_closed_when_locations_move(self):
         cases = {
@@ -7103,7 +7139,7 @@ class SharedSkills(unittest.TestCase):
 
         def record(cmd, *a, **k):
             calls.append((list(cmd), dict(k.get("env") or {})))
-            return self.sp.CompletedProcess(cmd, 0, *[x or "" for x in self.fake_git(real, cmd, *a, **k)])
+            return real(cmd[3:], *a, **k)          # without the launcher, so this also runs in another sandbox
         with mock.patch.object(iwb.subprocess, "run", record):
             base = iwb.capture_base(str(d))
             iwb.reset_to_base(str(d), base)
@@ -7119,17 +7155,19 @@ class SharedSkills(unittest.TestCase):
             self.assertIn("(deny network*)", c[2])
             self.assertEqual(set(env), {"PATH", "HOME", "LANG", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL",
                                         "GIT_ATTR_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS", "GIT_PROTOCOL_FROM_USER",
-                                        "GIT_TERMINAL_PROMPT"})
-            self.assertEqual((env["GIT_CONFIG_NOSYSTEM"], env["GIT_CONFIG_GLOBAL"], env["GIT_TERMINAL_PROMPT"]),
-                             ("1", os.devnull, "0"))
+                                        "GIT_TERMINAL_PROMPT", "GIT_ALLOW_PROTOCOL"})
+            self.assertEqual((env["GIT_CONFIG_NOSYSTEM"], env["GIT_CONFIG_GLOBAL"], env["GIT_TERMINAL_PROMPT"],
+                              env["GIT_ALLOW_PROTOCOL"]), ("1", os.devnull, "0", ""))
+        self.assertTrue(any(c[4 + n].startswith("--git-dir=") and c[5 + n] == "config" for c in gits))   # preflight
         for c in gits:
             self.assertEqual(c[4:4 + n], list(iwb.RESTORE_GIT), c)
             self.assertNotIn("foreach", c)
-            if "config" not in c[4 + n:5 + n]:             # `git config -f <file>` reads one file as data
-                self.assertTrue(c[4 + n].startswith("--git-dir="), c)
-                self.assertTrue(c[5 + n].startswith("--work-tree="), c)
-            else:
+            if c[4 + n] == "config":                       # `git config -f <file>` reads one file as data
                 self.assertIn("--no-includes", c)
+                self.assertIn("-f", c)
+            else:
+                self.assertTrue(c[4 + n].startswith("--git-dir="), c)
+                self.assertTrue(c[5 + n].startswith("--work-tree=") or c[5 + n] == "config", c)
         opts = list(iwb.RESTORE_GIT)
         allows = [opts[i + 1] for i, x in enumerate(opts) if x == "-c" and ".allow=" in opts[i + 1]]
         self.assertIn("protocol.allow=never", allows)
@@ -7140,13 +7178,6 @@ class SharedSkills(unittest.TestCase):
             self.assertIn(o, opts)
         self.assertEqual(opts[:len(iwb.TRUSTED_GIT)], list(iwb.TRUSTED_GIT))
 
-    def fake_git(self, real, cmd, *a, **k):
-        """Run `cmd` for real, without the sandbox launcher (so this also works inside another sandbox)."""
-        r = real(cmd[3:] if cmd[0] == "sandbox-exec" else cmd, *a, **k)
-        if r.returncode:
-            raise AssertionError(f"{cmd}: {r.stderr}")
-        return r.stdout, r.stderr
-
     def test_control_file_writes_stay_inside_the_command_sandbox(self):
         # a leftover process swapped a verified git directory for a symlink to the home folder before the write
         need_sandbox_exec(self)
@@ -7156,7 +7187,9 @@ class SharedSkills(unittest.TestCase):
                 iwb._put_control(str(d), [(home_tmp, {"config": b"[core]\n", "info/attributes": None})])
             self.assertEqual(os.listdir(home_tmp), [])
 
-    def test_restoration_runs_under_the_command_sandbox(self):
+    def test_restoration_contains_a_program_planted_during_restoration(self):
+        """The preflight refuses planted filters; this is the real-sandbox containment check for state a leftover
+        process plants after the preflight: the program runs, but only with the command sandbox's power."""
         need_sandbox_exec(self)
         with home_tmpdir(self) as home_tmp:
             outside = Path(home_tmp, "escaped.txt")

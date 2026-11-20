@@ -1593,7 +1593,8 @@ def restore_git_env():
     home = "/var/empty" if os.path.isdir("/var/empty") else tempfile.gettempdir()     # nothing for git to read
     return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home, "LANG": "en_US.UTF-8",
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_ATTR_NOSYSTEM": "1",
-            "GIT_NO_REPLACE_OBJECTS": "1", "GIT_PROTOCOL_FROM_USER": "0", "GIT_TERMINAL_PROMPT": "0"}
+            "GIT_NO_REPLACE_OBJECTS": "1", "GIT_PROTOCOL_FROM_USER": "0", "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ALLOW_PROTOCOL": ""}       # empty: no transport at all, in every child git as well
 
 
 def restore_profile(top):
@@ -1745,10 +1746,12 @@ def reset_to_base(repo_dir, base):
     """Put a git clone back to the base captured by capture_base, so each acceptance command sees the base code
     and git state and not what an earlier command left (Codex review of PR #5, issue #100): HEAD at the base
     commit, tracked files, no untracked or ignored files, and the shared skills submodule re-initialized from
-    its cached objects at the pinned commit. Command-written .git state is untrusted: git runs with RESTORE_GIT
-    (no hooks, no fsmonitor, no transport, no credential helper), the repository and each submodule are pinned
-    to the directories captured at the start, and the config and attributes files are put back before git reads
-    them. Raises RestoreError, naming the failed stage, when any of that fails or a location was moved."""
+    its cached objects at the pinned commit. Command-written .git state is untrusted. Before anything changes,
+    restoration refuses a moved or replaced clone, .git, submodule git directory or gitfile, a filter program or
+    a core.worktree in the effective config. Everything then runs under the commands' sandbox (restore_run):
+    git with RESTORE_GIT (no hooks, no fsmonitor, no transport, no credential helper) pinned to the captured
+    directories, after the config and attributes files are put back to their captured bytes. Raises
+    RestoreError, naming the failed stage, when any of that fails."""
     if base is None:
         return
     try:
@@ -1757,31 +1760,57 @@ def reset_to_base(repo_dir, base):
         raise RestoreError(f"restoring the base failed: {short(e, 300)}")
 
 
+def _preflight_error(why):
+    return RestoreError(f"restoring the base failed at preflight: {why}")
+
+
+def _check_config(top, git_dir, work_tree, label):
+    """Refuse, before anything is changed, effective config (includes followed, read sandboxed) that would make
+    restoration run a filter program or move the work tree: any non-empty filter.*.smudge, clean or process, and
+    a core.worktree other than the captured one (`work_tree`; None for the superproject, which has none)."""
+    r = restore_run("preflight", top, ["git", *RESTORE_GIT, f"--git-dir={git_dir}", "config", "-z", "--get-regexp",
+                                       r"^(filter\..*\.(smudge|clean|process)|core\.worktree)$"], check=False,
+                    timeout=60)
+    if r.returncode not in (0, 1):
+        raise _preflight_error(f"the config of {label} can't be read: {short(r.stderr, 200)}")
+    for item in filter(None, r.stdout.split("\0")):
+        key, _, value = item.partition("\n")
+        if key.lower() == "core.worktree":
+            got = os.path.normpath(Path(git_dir, value))
+            if work_tree is None or got != work_tree:
+                raise _preflight_error(f"the config of {label} moves the work tree (core.worktree)")
+        elif value.strip():
+            raise _preflight_error(f"the config of {label} names a filter program ({short(key, 80)})")
+
+
 def _reset_to_base(base):
     top, git_dir = Path(base["top"]), Path(base["git_dir"])
     if not _same_dir(top, base["top_ident"]):
-        raise RestoreError("restoring the base failed: the clone folder was replaced or removed")
+        raise _preflight_error("the clone folder was replaced or removed")
     if not _same_dir(git_dir, base["ident"]):
-        raise RestoreError("restoring the base failed: the clone's .git is no longer the directory captured at "
-                           "the start (removed, or replaced by a symlink or gitfile)")
+        raise _preflight_error("the clone's .git is no longer the directory captured at the start (removed, or "
+                               "replaced by a symlink or gitfile)")
     for m in base["modules"]:
         rel = os.path.relpath(m["work_tree"], top)
-        if not _same_dir(m["git_dir"], m["ident"]):
-            raise RestoreError(f"restoring the base failed: the cached git data of submodule {rel} is missing or "
-                               f"was replaced, and restoration never fetches")
+        if not _no_symlink_between(git_dir, m["git_dir"]) or not _same_dir(m["git_dir"], m["ident"]):
+            raise _preflight_error(f"the cached git data of submodule {rel} is missing or was replaced, and "
+                                   f"restoration never fetches")
         if not _no_symlink_between(top, m["work_tree"]):
-            raise RestoreError(f"restoring the base failed: submodule path {rel} is a symlink or not a folder")
+            raise _preflight_error(f"submodule path {rel} is a symlink or not a folder")
         gitfile = Path(m["work_tree"], ".git")
         if os.path.lexists(gitfile) and (gitfile.is_symlink() or not gitfile.is_file()
                                          or gitfile.read_bytes() != m["gitfile"]):
-            raise RestoreError(f"restoring the base failed: the .git of submodule {rel} no longer points at its "
-                               f"git directory inside the clone's .git/modules")
+            raise _preflight_error(f"the .git of submodule {rel} no longer points at its git directory inside the "
+                                   f"clone's .git/modules")
+    _check_config(top, git_dir, None, "the clone")
+    for m in base["modules"]:
+        _check_config(top, m["git_dir"], m["work_tree"], f"submodule {os.path.relpath(m['work_tree'], top)}")
     _put_control(top, [(git_dir, base["control"])] + [(m["git_dir"], m["control"]) for m in base["modules"]])
     restore_git("reset", top, git_dir, top, "reset", "--hard", "-q", "--no-recurse-submodules", base["sha"])
     restore_git("clean", top, git_dir, top, "clean", "-fdxq")
     if base["modules"]:
-        restore_git("submodule update", top, git_dir, top, "submodule", "update", "--init", "--no-fetch", "--checkout",
-                    "--force", "--recursive", "-q")
+        restore_git("submodule update", top, git_dir, top, "submodule", "update", "--init", "--no-fetch",
+                    "--checkout", "--force", "--recursive", "-q")
         for m in base["modules"]:
             rel = os.path.relpath(m["work_tree"], top)
             restore_git(f"submodule clean {rel}", top, m["git_dir"], m["work_tree"], "clean", "-fdxq")
