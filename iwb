@@ -675,7 +675,8 @@ def shared_skills_check(repo_dir, pinned=None):
         raise SharedSkillsError("shared skills missing")
     if pinned:
         try:
-            out = restore_git("submodule status", *pinned, "submodule", "status", "--", SHARED_PATH, timeout=120)
+            out = restore_git("submodule status", pinned[1], *pinned, "submodule", "status", "--", SHARED_PATH,
+                              timeout=120)
         except RestoreError:
             out = None
     else:
@@ -1581,19 +1582,31 @@ CONTROL_FILES = ("config", "config.worktree", "commondir", "gitdir", "info/attri
 
 
 def restore_git_env():
-    """tokenless_env without inherited repository redirection, attributes from the system, replace refs or a
-    protocol allowlist: restoration and its checks read only the clone's captured config and iwb's options."""
-    env = {k: v for k, v in tokenless_env().items() if k not in UNTRUSTED_GIT_ENV and k != "GIT_ALLOW_PROTOCOL"}
-    env.update(GIT_ATTR_NOSYSTEM="1", GIT_NO_REPLACE_OBJECTS="1", GIT_PROTOCOL_FROM_USER="0",
-               GIT_TERMINAL_PROMPT="0")
-    return env
+    """A minimal environment for restoration and its checks, as for the commands (PATH, LANG, an empty HOME):
+    no token, askpass or inherited git variables, no system or global config or attributes, no replace refs."""
+    home = "/var/empty" if os.path.isdir("/var/empty") else tempfile.gettempdir()     # nothing for git to read
+    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home, "LANG": "en_US.UTF-8",
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1", "GIT_PROTOCOL_FROM_USER": "0", "GIT_TERMINAL_PROMPT": "0"}
 
 
-def restore_git(stage, git_dir, work_tree, *args, timeout=300):
-    """git with RESTORE_GIT on the top-level command (git hands -c options on to submodule children), the
-    repository pinned by --git-dir/--work-tree and restore_git_env. Raises RestoreError naming `stage` on a
-    non-zero exit, a launch error or a timeout. Returns stdout."""
-    cmd = ["git", *RESTORE_GIT, f"--git-dir={git_dir}", f"--work-tree={work_tree}", *args]
+def restore_profile(top):
+    """sandbox_profile for the clone's folder, plus reading the metadata (not contents) of the folders above it:
+    git resolves the real path of its work tree, which fails when the clone lives under the home folder."""
+    parent = Path(top).parent
+    above = " ".join(f'(literal "{p}")' for p in parent.parents)
+    return sandbox_profile(str(parent)) + (f"(allow file-read-metadata {above})" if above else "")
+
+
+def restore_git(stage, top, git_dir, work_tree, *args, timeout=300):
+    """git for reset_to_base: under the same sandbox-exec profile as the commands for the clone `top` (no network,
+    writes only next to the clone and in temp, no home folder or Keychain), so a program that command-written
+    .git state still manages to name gets no more power than the command that wrote it; with RESTORE_GIT on the
+    top-level command (git hands -c options on to submodule children); pinned by --git-dir/--work-tree; with
+    restore_git_env. Raises RestoreError naming `stage` on a non-zero exit, a launch error (no sandbox-exec
+    included) or a timeout. Returns stdout."""
+    cmd = ["sandbox-exec", "-p", restore_profile(top), "git", *RESTORE_GIT, f"--git-dir={git_dir}", f"--work-tree={work_tree}",
+           *args]
     try:
         r = subprocess.run(cmd, cwd=str(work_tree), env=restore_git_env(), capture_output=True, text=True,
                            timeout=timeout)
@@ -1665,7 +1678,7 @@ def capture_base(repo_dir):
                             "control": _read_control(gd),
                             "gitfile": gitfile.read_bytes() if gitfile.is_file() and not gitfile.is_symlink()
                             else None})
-    sha = restore_git("capture", git_dir, top, "rev-parse", "--verify", "-q", "HEAD^{commit}").strip()
+    sha = restore_git("capture", top, git_dir, top, "rev-parse", "--verify", "-q", "HEAD^{commit}").strip()
     try:
         shared = shared_skills_check(top, pinned=(git_dir, top))
     except SharedSkillsError as e:
@@ -1744,15 +1757,15 @@ def _reset_to_base(base):
     _put_control(git_dir, base["control"])
     for m in base["modules"]:
         _put_control(m["git_dir"], m["control"])
-    restore_git("reset", git_dir, top, "reset", "--hard", "-q", "--no-recurse-submodules", base["sha"])
-    restore_git("clean", git_dir, top, "clean", "-fdxq")
+    restore_git("reset", top, git_dir, top, "reset", "--hard", "-q", "--no-recurse-submodules", base["sha"])
+    restore_git("clean", top, git_dir, top, "clean", "-fdxq")
     if base["modules"]:
-        restore_git("submodule update", git_dir, top, "submodule", "update", "--init", "--no-fetch", "--checkout",
+        restore_git("submodule update", top, git_dir, top, "submodule", "update", "--init", "--no-fetch", "--checkout",
                     "--force", "--recursive", "-q")
         for m in base["modules"]:
             rel = os.path.relpath(m["work_tree"], top)
-            restore_git(f"submodule clean {rel}", m["git_dir"], m["work_tree"], "clean", "-fdxq")
-    head = restore_git("check", git_dir, top, "rev-parse", "--verify", "-q", "HEAD^{commit}").strip()
+            restore_git(f"submodule clean {rel}", top, m["git_dir"], m["work_tree"], "clean", "-fdxq")
+    head = restore_git("check", top, git_dir, top, "rev-parse", "--verify", "-q", "HEAD^{commit}").strip()
     if head != base["sha"]:
         raise RestoreError(f"restoring the base failed at check: HEAD is {head[:10]}, not {base['sha'][:10]}")
     try:
@@ -3137,7 +3150,8 @@ RESULT_REF = "refs/iwb/result"
 TRUSTED_GIT = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
 # reset_to_base and its checks: TRUSTED_GIT, no attributes file from the home folder, no credential helper or
 # askpass, and every transport refused (https and file included), so restoring never fetches; no automatic gc.
-RESTORE_GIT = (*TRUSTED_GIT, "-c", "core.attributesFile=/dev/null", "-c", "credential.helper=", "-c", "core.askPass=",
+RESTORE_GIT = (*TRUSTED_GIT, "-c", "core.attributesFile=/dev/null", "-c", "core.excludesFile=/dev/null",
+               "-c", "credential.helper=", "-c", "core.askPass=",
                "-c", "protocol.allow=never", *(x for p in ("file", "ext", "https", "http", "ssh", "git")
                                                for x in ("-c", f"protocol.{p}.allow=never")),
                "-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.untrackedCache=false")

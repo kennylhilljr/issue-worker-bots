@@ -1,6 +1,7 @@
 """Tests for iwb intake. No network: GitHub reads and bot posts are faked. Run: python3 -m unittest discover -s tests"""
 import importlib.util, io, json, os, re, shlex, shutil, tempfile, time, unittest
 from unittest import mock
+import contextlib
 from contextlib import redirect_stderr, redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -6697,6 +6698,9 @@ class SharedSkills(unittest.TestCase):
         iwb.prbot.git_env = lambda token=None, identity=None: dict(
             os.environ, PRBOT_GIT_TOKEN=token or "", GIT_CONFIG_COUNT="1",
             GIT_CONFIG_KEY_0=f"url.{consumer_uri}.insteadOf", GIT_CONFIG_VALUE_0=f"https://github.com/{self.REPO}.git")
+        restoring = self.restoring()          # Python 3.9 has no enterContext
+        restoring.__enter__()
+        self.addCleanup(restoring.__exit__, None, None, None)
 
     def git(self, *a, cwd):
         return self.sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always",
@@ -6911,15 +6915,22 @@ class SharedSkills(unittest.TestCase):
 
     def unsandboxed(self, seen):
         """subprocess.run with only the sandbox launcher replaced: `sandbox-exec -p <profile> argv` runs argv as
-        it is, so the runners' real git restoration executes where sandbox-exec can't (a nested sandbox)."""
+        it is, so the runners' commands and their real git restoration execute where sandbox-exec can't (a nested
+        sandbox). `seen` gets the commands, without restoration's own git calls."""
         real = iwb.subprocess.run
 
         def run(cmd, *a, **k):
             if cmd and cmd[0] == "sandbox-exec":
-                seen.append(cmd[3:])
+                if not (cmd[3] == "git" and any(x.startswith("--git-dir=") for x in cmd)):
+                    seen.append(cmd[3:])
                 return real(cmd[3:], *a, **k)
             return real(cmd, *a, **k)
         return mock.patch.object(iwb.subprocess, "run", run)
+
+    def restoring(self):
+        """reset_to_base under its real sandbox-exec profile, or unsandboxed inside another sandbox, where only
+        the git hardening is checked."""
+        return self.unsandboxed([]) if nested_sandbox_error() else contextlib.nullcontext()
 
     def hardened(self, d, *a):
         """Fixture git on a clone with planted programs: no hooks or fsmonitor, so setup never runs them."""
@@ -7055,11 +7066,13 @@ class SharedSkills(unittest.TestCase):
                 seen = []
 
                 def fake(cmd, *a, **k):
-                    if cmd[0] == "sandbox-exec":
-                        seen.append(cmd[3:])
-                        return real(cmd[3:], *a, **k)
-                    if any(x.startswith("--git-dir=") for x in cmd) and stage in cmd:
+                    restoring = any(x.startswith("--git-dir=") for x in cmd)
+                    if restoring and stage in cmd:
                         return self.sp.CompletedProcess(cmd, 1, "", "fatal: broken\n")
+                    if cmd[0] == "sandbox-exec":
+                        if not restoring:
+                            seen.append(cmd[3:])
+                        return real(cmd[3:], *a, **k)
                     return real(cmd, *a, **k)
                 with mock.patch.object(iwb.subprocess, "run", fake):
                     # a failed status already stops the capture: no command runs on an unchecked base
@@ -7090,25 +7103,34 @@ class SharedSkills(unittest.TestCase):
 
         def record(cmd, *a, **k):
             calls.append((list(cmd), dict(k.get("env") or {})))
-            return real(cmd, *a, **k)
+            return self.sp.CompletedProcess(cmd, 0, *[x or "" for x in self.fake_git(real, cmd, *a, **k)])
         with mock.patch.object(iwb.subprocess, "run", record):
             base = iwb.capture_base(str(d))
             iwb.reset_to_base(str(d), base)
-        gits = [(c, e) for c, e in calls if c[0] == "git"]
-        repo_calls = [(c, e) for c, e in gits if "config" not in c[:len(iwb.TRUSTED_GIT) + 2]]
-        self.assertTrue(any("submodule" in c and "update" in c for c, _ in repo_calls))
-        for c, env in gits:
-            self.assertEqual(c[1:1 + len(iwb.TRUSTED_GIT)], list(iwb.TRUSTED_GIT), c)
+        repo_calls = [(c, e) for c, e in calls if c[0] == "sandbox-exec"]
+        data_reads = [(c, e) for c, e in calls if c[0] != "sandbox-exec"]
+        self.assertTrue(any("update" in c for c, _ in repo_calls))
+        self.assertTrue(data_reads)
+        for c, env in data_reads:           # `git config -f` on a file, outside any repository
+            self.assertEqual(c[:2 + len(iwb.TRUSTED_GIT)], ["git", *iwb.TRUSTED_GIT, "config"], c)
+            self.assertIn("--no-includes", c)
+        for c, env in calls:
             self.assertNotIn("PRBOT_GIT_TOKEN", env)
+            for k in iwb.UNTRUSTED_GIT_ENV + ("GIT_ASKPASS", "SSH_ASKPASS", "GIT_ALLOW_PROTOCOL", "GITHUB_TOKEN"):
+                self.assertNotIn(k, env)
+        n = len(iwb.RESTORE_GIT)
         for c, env in repo_calls:
-            self.assertEqual(c[1:1 + len(iwb.RESTORE_GIT)], list(iwb.RESTORE_GIT), c)
-            self.assertTrue(c[1 + len(iwb.RESTORE_GIT)].startswith("--git-dir="), c)
-            self.assertTrue(c[2 + len(iwb.RESTORE_GIT)].startswith("--work-tree="), c)
+            self.assertEqual(c[:4], ["sandbox-exec", "-p", iwb.restore_profile(str(d)), "git"], c)
+            self.assertIn("(deny network*)", c[2])
+            self.assertEqual(c[4:4 + n], list(iwb.RESTORE_GIT), c)
+            self.assertTrue(c[4 + n].startswith("--git-dir="), c)
+            self.assertTrue(c[5 + n].startswith("--work-tree="), c)
             self.assertNotIn("foreach", c)
+            self.assertEqual(set(env), {"PATH", "HOME", "LANG", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL",
+                                        "GIT_ATTR_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS", "GIT_PROTOCOL_FROM_USER",
+                                        "GIT_TERMINAL_PROMPT"})
             self.assertEqual((env["GIT_CONFIG_NOSYSTEM"], env["GIT_CONFIG_GLOBAL"], env["GIT_TERMINAL_PROMPT"]),
                              ("1", os.devnull, "0"))
-            for k in iwb.UNTRUSTED_GIT_ENV + ("GIT_ASKPASS", "GIT_ALLOW_PROTOCOL"):
-                self.assertNotIn(k, env)
         opts = list(iwb.RESTORE_GIT)
         allows = [opts[i + 1] for i, x in enumerate(opts) if x == "-c" and ".allow=" in opts[i + 1]]
         self.assertIn("protocol.allow=never", allows)
@@ -7117,6 +7139,44 @@ class SharedSkills(unittest.TestCase):
             self.assertIn(f"protocol.{p}.allow=never", allows)
         for o in ("credential.helper=", "core.askPass=", "core.attributesFile=/dev/null"):
             self.assertIn(o, opts)
+        self.assertEqual(opts[:len(iwb.TRUSTED_GIT)], list(iwb.TRUSTED_GIT))
+
+    def fake_git(self, real, cmd, *a, **k):
+        """Run `cmd` for real, without the sandbox launcher (so this also works inside another sandbox)."""
+        r = real(cmd[3:] if cmd[0] == "sandbox-exec" else cmd, *a, **k)
+        if r.returncode:
+            raise AssertionError(f"{cmd}: {r.stderr}")
+        return r.stdout, r.stderr
+
+    def test_restoration_runs_under_the_command_sandbox(self):
+        need_sandbox_exec(self)
+        with home_tmpdir(self) as home_tmp:
+            outside = Path(home_tmp, "escaped.txt")
+            d = self.plain_clone(self.consumer, "sandboxed")
+            mod = d / ".git/modules/.agents/skills/shared"
+            hook = self.root / "escape.sh"
+            ran = self.root / "filter-ran"         # next to the clone: the sandbox lets it write there
+            hook.write_text(f"#!/bin/sh\necho x > '{ran}'\necho x > '{outside}'\ncat\n")
+            hook.chmod(0o755)
+            base = iwb.capture_base(str(d))
+            self.hardened(d, "submodule", "deinit", "-q", "-f", "--all")
+            # as if a command's leftover process replanted a filter after iwb put the config back
+            real = iwb.subprocess.run
+
+            def replant(cmd, *a, **k):
+                if cmd[0] == "sandbox-exec" and "update" in cmd:
+                    with open(mod / "config", "a") as f:
+                        f.write(f'[filter "x"]\n\tsmudge = {hook}\n')
+                    (mod / "info").mkdir(exist_ok=True)
+                    (mod / "info/attributes").write_text("* filter=x\n")
+                return real(cmd, *a, **k)
+            with mock.patch.object(iwb.subprocess, "run", replant):
+                try:
+                    iwb.reset_to_base(str(d), base)
+                except iwb.RestoreError:
+                    pass            # the filter failed under the sandbox: restoration stopped, as it must
+            self.assertTrue(ran.exists())          # the replanted filter did run, but sandboxed
+            self.assertFalse(outside.exists())
 
     def test_restoration_never_fetches_a_missing_submodule(self):
         d = self.plain_clone(self.consumer, "nofetch")
