@@ -6906,8 +6906,12 @@ class SharedSkills(unittest.TestCase):
         sub = d / ".agents/skills/shared"
         (sub / "catalog.json").write_text("changed\n")
         (sub / "extra.txt").write_text("left by a command\n")
+        for nested in (d / "scratch", sub / "scratch"):           # untracked nested repositories go too
+            self.git("init", "-q", str(nested), cwd=self.root)
         iwb.reset_to_base(str(d), base)
         self.assertFalse((sub / "extra.txt").exists())
+        self.assertFalse((d / "scratch").exists())
+        self.assertFalse((sub / "scratch").exists())
         self.assertEqual(iwb.shared_skills_check(str(d)), self.pinned)
         self.assertEqual(iwb.shared_skill_names(str(d)), ["shared-a", "shared-b"])
 

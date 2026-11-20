@@ -1807,13 +1807,13 @@ def _reset_to_base(base):
         _check_config(top, m["git_dir"], m["work_tree"], f"submodule {os.path.relpath(m['work_tree'], top)}")
     _put_control(top, [(git_dir, base["control"])] + [(m["git_dir"], m["control"]) for m in base["modules"]])
     restore_git("reset", top, git_dir, top, "reset", "--hard", "-q", "--no-recurse-submodules", base["sha"])
-    restore_git("clean", top, git_dir, top, "clean", "-fdxq")
+    restore_git("clean", top, git_dir, top, "clean", "-ffdxq")      # -ff: untracked nested repositories too
     if base["modules"]:
         restore_git("submodule update", top, git_dir, top, "submodule", "update", "--init", "--no-fetch",
                     "--checkout", "--force", "--recursive", "-q")
         for m in base["modules"]:
             rel = os.path.relpath(m["work_tree"], top)
-            restore_git(f"submodule clean {rel}", top, m["git_dir"], m["work_tree"], "clean", "-fdxq")
+            restore_git(f"submodule clean {rel}", top, m["git_dir"], m["work_tree"], "clean", "-ffdxq")
     head = restore_git("check", top, git_dir, top, "rev-parse", "--verify", "-q", "HEAD^{commit}").strip()
     if head != base["sha"]:
         raise RestoreError(f"restoring the base failed at check: HEAD is {head[:10]}, not {base['sha'][:10]}")
