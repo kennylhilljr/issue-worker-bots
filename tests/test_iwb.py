@@ -1903,7 +1903,7 @@ class ScanFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = {k: getattr(iwb, k) for k in ("STATE", "CONFIG", "WORK_DIR", "clone", "run_cli", "run_gh_as",
-                                                   "post")}
+                                                   "post", "drive_env")}
         self.saved_attention = iwb.prbot.openclaw_attention
         self.saved_gh_read = iwb.prbot.gh_read
         self.saved_load_config = iwb.prbot.load_config
@@ -1926,8 +1926,12 @@ class ScanFixture(unittest.TestCase):
             return d, "main", "abc123def456"
         iwb.clone = fake_clone
 
-        def fake_cli(cmd, stdin, cwd=None, timeout=None):
+        self.envs = []
+        iwb.drive_env = lambda: {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"}   # the real one runs CLI --version
+
+        def fake_cli(cmd, stdin, cwd=None, timeout=None, env=None):
             self.cmds.append(cmd)
+            self.envs.append(env)
             a = self.answers.pop(0) if self.answers else self.good()
             if isinstance(a, BaseException):
                 raise a
@@ -1980,6 +1984,17 @@ class Scan(ScanFixture):
         self.assertNotIn("--mcp-config", claude)
         self.assertIn(["-s", "read-only"], [codex[i:i + 2] for i in range(len(codex) - 1)])
         self.assertEqual(json.loads(iwb.STATE.read_text())["_last_scan_agent"], "claude")
+
+    def test_clone_settings_hooks_and_environment_are_not_used(self):
+        # the clone is a target repository a bot may have changed: its .claude/settings.json hooks or Codex hooks
+        # must not run, and the CLI gets drive_env's scrubbed environment, not iwb's own (issue #103)
+        self.scan(force=True)
+        self.scan(force=True)
+        claude, codex = self.cmds[0], self.cmds[1]
+        self.assertEqual(claude[claude.index("--setting-sources") + 1], "user")
+        self.assertNotIn("--settings", claude)
+        self.assertIn(["--disable", "hooks"], [codex[i:i + 2] for i in range(len(codex) - 1)])
+        self.assertEqual(self.envs, [{"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"}] * 2)
 
     def test_prompt_categories(self):
         self.scan(force=True)
@@ -3987,6 +4002,15 @@ class DriveProcess(unittest.TestCase):
         finally:
             iwb.subprocess.Popen, iwb.shutil.which = saved
         self.assertEqual(started, [["/usr/bin/caffeinate", "-i", "-w", str(iwb.os.getpid())]])
+
+    def test_model_env_replaces_the_parent_environment(self):
+        cli = Path(self.tmp.name, "cli")
+        cli.write_text("#!/bin/sh\necho \"[$IWB_TEST_SECRET_TOKEN][$IWB_KEEP]\"\n")
+        cli.chmod(0o755)
+        os.environ["IWB_TEST_SECRET_TOKEN"] = "leak"
+        self.addCleanup(os.environ.pop, "IWB_TEST_SECRET_TOKEN", None)
+        self.assertEqual(iwb.run_cli([str(cli)], "", timeout=10, env={"IWB_KEEP": "1"}), (0, "[][1]\n", ""))
+        self.assertEqual(iwb.run_cli([str(cli)], "", timeout=10), (0, "[leak][]\n", ""))
 
     def test_model_output_and_stdin(self):
         cli = Path(self.tmp.name, "cli")
