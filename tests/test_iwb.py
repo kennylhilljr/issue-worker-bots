@@ -3712,6 +3712,22 @@ class Code(unittest.TestCase):
         self.assertIs(iwb.protected("x/y", ([], [("", iwb.re.compile(""))], [])), True)
         self.assertIs(iwb.protected("src/a.py", iwb.path_rules(ecc)), False)
 
+    def test_files_that_steer_later_runs_are_protected(self):
+        # regression (#104): agent settings, hooks, instructions and more credential files passed the policy gate
+        rules = iwb.path_rules("kennylhilljr/demo")
+        for p in (".claude/settings.json", ".claude/settings.local.json", ".claude/hooks/check_tool.py",
+                  ".claude/commands/x.md", ".claude/agents/a.md", ".claude", "sub/.claude/settings.json",
+                  ".Claude/Settings.json", ".claude/skillsx/a", ".codex", ".codex/config.toml", "AGENTS.md",
+                  "pkg/AGENTS.md", "CLAUDE.md", "docs/claude.md", ".mcp.json", ".husky", ".husky/pre-commit",
+                  ".pre-commit-config.yaml", ".npmrc", "web/.npmrc", ".pypirc", ".netrc", "cert.p12", "a/b.pfx",
+                  ".aws", ".aws/credentials", ".aws/config"):
+            self.assertTrue(iwb.protected(p, rules), p)
+            self.assertEqual(iwb.policy_violations([coding_unit(files=[p])], "kennylhilljr/demo"),
+                             [f"u1: protected path: {p}"], p)
+        for p in (".claude/skills/own/SKILL.md", ".claude/skills", "src/claude.py", "docs/agents.md.txt",
+                  "AGENTS.md.bak", "mcp.json", "src/aws/s3.py", "husky.md", "a.p12.txt"):
+            self.assertFalse(iwb.protected(p, rules), p)
+
     def test_expiring_certifications_wait_without_posting(self):
         # regression: certifications expire weekly (cert-latest.json, 2026-11-01 13:00Z); a run started shortly before
         # would lose its runners half way, after the issue was labeled bot:in-progress
