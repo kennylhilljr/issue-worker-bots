@@ -39,6 +39,9 @@ class BackupReview(unittest.TestCase):
         steps = "\n".join(text for _, text in self.review_steps())
         self.assertIn("--json headRefOid,isCrossRepository", steps)
         self.assertRegex(steps, r'if \[ "\$fork" != "false" \]; then')
+        texts = [text for _, text in self.review_steps()]
+        claude = texts.index("- id: claude")
+        self.assertEqual(texts[claude + 1], "if: env.SKIP != '1'")
 
     def test_checkout_is_default_branch_not_pr_head(self):
         steps = self.review_steps()
@@ -51,8 +54,8 @@ class BackupReview(unittest.TestCase):
             if child_level <= level:
                 break
             options.append(text)
-        self.assertIn("ref: ${{ github.event.repository.default_branch }}", options)
-        self.assertIn("persist-credentials: false", options)
+        self.assertEqual(options, ["with:", "ref: ${{ github.event.repository.default_branch }}",
+                                   "persist-credentials: false"])
         for _, text in self.lines:
             if text.startswith("ref:"):
                 self.assertNotIn("matrix.pr", text)
