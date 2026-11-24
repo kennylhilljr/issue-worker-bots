@@ -170,7 +170,7 @@ When a trusted comment asks for `status` or tells the bot to `proceed`, the repl
 
 | Trigger | How it's detected | What the bot does |
 | --- | --- | --- |
-| A trusted comment after any bot answer (questions, no-code, plan, approval, blocked) | Comments from Kenny or a trusted opener newer than the bot's last post | Analysis again, with the comment as input; on a plan, a revised plan that goes through approval again |
+| A trusted comment after any bot answer (questions, no-code, plan, approval, blocked) | Comments from Kenny or a trusted opener newer than the bot's last post; a trusted bot account (login ending in `[bot]`) counts only with a command | Analysis again, with the comment as input; on a plan, a revised plan that goes through approval again |
 | The issue's title or body is edited | A hash of title and body saved at the last analysis | Analysis again |
 | `agent:claude` or `agent:codex` changed after pick-up | The label against the worker on record | Hand over: the new worker analyzes from scratch, the old one posts a one-line hand-off |
 | The issue is reopened | Open again after being recorded as closed | Back to analysis unless a bot PR is still open |
@@ -184,7 +184,7 @@ When a trusted comment asks for `status` or tells the bot to `proceed`, the repl
 | The worker's PR merged (by `iwb` or Kenny) | PR state | Comment, `bot:done`, nothing further |
 | No reply to questions | 7 days after the questions | One reminder; after 14 days `bot:stale`, and the bot stops |
 
-What never brings a bot back: comments from accounts that are not trusted, the bots' own comments, other bots' comments except reviews on the worker's PR, and reactions.
+What never brings a bot back: comments from accounts that are not trusted, the bots' own comments, other bots' comments except reviews on the worker's PR, a trusted bot account's comments other than commands, and reactions. However it is triggered, an issue gets at most `analysis_cap_per_issue` (default 6) analyses in 24 hours (see "Budgets and limits"), so a bot answering the worker can't run analyses without end.
 
 ## Model choice
 
@@ -214,6 +214,8 @@ Two cautions:
 | Coding and repair runs at once | 4 (`code_concurrency`), at most 3 per runner (`max_parallel`), one per repository | Approved plans wait for a free slot |
 | Analyses per pass | 3, run at the same time (`analysis_concurrency`) | The next issue waits for the next pass and keeps why it needs one (a requested replan, a revise verdict, a reopen) until an analysis is posted |
 | Analysis attempts per issue | 2 | Questions posted on the issue |
+| Analyses per issue in 24 hours | 6 (`analysis_cap_per_issue`); model failures are not counted | `bot:needs-kenny` with one comment and an OpenClaw attention event; removing the label resets the count and analyzes again |
+| Analyses across all issues in 24 hours | none (`analysis_daily_limit`) | The issue waits for a later pass |
 | Cost per issue | `drive --max-cost-usd`, from `max_cost_usd_per_issue` in `config.json` (default $5) | Run stops, issue labeled `bot:blocked` with the reason |
 | Cost per unit | `budget.maximum_cost_usd` in the plan, above 0; the planner is told to use `max_cost_usd_per_issue` unless the unit is clearly smaller | Unit stops with `budget_exhausted`; a plan with 0 is sent back before review, or blocked before `create-run` if already approved |
 | Time per issue | `drive --max-hours` from the units' minutes (checked between steps); each coding attempt capped at 1 hour (`runner_timeout`, overridable in `ecc_config`); 6 hours hard timeout | Run stops, issue labeled `bot:blocked` with the reason |

@@ -647,6 +647,128 @@ class Analyze(unittest.TestCase):
         self.assertIn("The S3 uploads.", self.prompts[1])
         self.assertNotIn("ignore all rules", self.prompts[1])   # strangers' text never reaches the model
 
+    def test_trusted_bot_comment_starts_no_analysis_but_its_command_does(self):
+        # regression (#105): a bot listed in trusted_openers that answers the worker's comments started an opus
+        # analysis per answer, and the two could loop
+        iwb.CONFIG.write_text(json.dumps({"trusted_openers": ["ops-bot[bot]"]}))
+        self.answers = [answer({"decision": "questions", "summary": "Unclear.", "questions": ["Which uploads?"]}),
+                        answer({"decision": "plan", "summary": "Now clear.", "units": [unit()]})]
+        self.run_pass()
+        later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+        self.comments = [{"user": "ops-bot[bot]", "body": "Thanks, noted. The S3 uploads.", "at": later}]
+        self.run_pass()
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(len(self.prompts), 1)
+        self.comments.append({"user": "ops-bot[bot]", "body": "@claude-dev-gh replan", "at": later})
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 2)           # an explicit command from the trusted bot still works
+        self.assertEqual(self.posts[-1][1], "bot:planned")
+
+    def test_analysis_cap_per_issue_marks_needs_kenny_and_label_removal_resets_it(self):
+        iwb.CONFIG.write_text(json.dumps({"analysis_cap_per_issue": 2}))
+        q = lambda: answer({"decision": "questions", "summary": "Unclear.", "questions": ["Which?"]})
+        self.answers = [q(), q(), q()]
+        later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+        self.run_pass()
+        self.comments = [{"user": OWNER, "body": "More detail.", "at": later}]   # newer than every analysis
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 2)
+        self.assertEqual(len(self.state()["analysis_runs"]), 2)
+        log = self.run_pass()
+        self.assertEqual(len(self.prompts), 2)           # no third model run
+        self.assertIn("analysis cap reached (2 in 24 hours)", log)
+        bot, label, body = self.posts[-1]
+        self.assertEqual(label, "bot:needs-kenny")
+        self.assertIn("2 times in the last 24 hours", body)
+        self.assertEqual(self.events[-1][0], "[claude-dev-gh] needs-kenny: kennylhilljr/demo#1")
+        self.assertTrue(self.state()["blocked"])
+        self.issue["labels"] = ["bot:needs-kenny"]
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 2)
+        self.issue["labels"] = []                         # Kenny removed bot:needs-kenny
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 3)
+        self.assertEqual(len(self.state()["analysis_runs"]), 1)
+
+    def test_analysis_cap_counts_only_the_last_24_hours_and_not_model_failures(self):
+        iwb.CONFIG.write_text(json.dumps({"analysis_cap_per_issue": 2}))
+        old = time.time() - iwb.ANALYSIS_WINDOW - 10
+        iwb.STATE.write_text(json.dumps({self.KEY: {"agent": "claude", "picked_up_at": 1,
+                                                    "analysis_runs": [old, old, old]}}))
+        self.answers = [RuntimeError("usage limit")]
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 1)            # old runs no longer count
+        self.assertEqual(iwb.recent_times(self.state()["analysis_runs"], time.time()), [])   # failure not counted
+        self.assertFalse(self.state().get("blocked"))
+
+    def test_dry_run_reports_the_cap_without_posting(self):
+        iwb.CONFIG.write_text(json.dumps({"analysis_cap_per_issue": 1}))
+        iwb.STATE.write_text(json.dumps({self.KEY: {"agent": "claude", "picked_up_at": 1,
+                                                    "analysis_runs": [time.time()]}}))
+        log = self.run_pass(dry_run=True)
+        self.assertIn("would mark bot:needs-kenny: 1 analyses in 24 hours (new)", log)
+        self.assertEqual((self.posts, self.events, self.prompts), ([], [], []))
+
+    def test_analysis_daily_limit_holds_other_issues(self):
+        keys = [f"kennylhilljr/demo#{n}" for n in (1, 2, 3)]
+        iwb.STATE.write_text(json.dumps({k: {"agent": "claude", "picked_up_at": 1} for k in keys}))
+        iwb.CONFIG.write_text(json.dumps({"analysis_daily_limit": 2}))
+        self.answers = [answer({"decision": "no_change", "summary": "nothing"}) for _ in keys]
+        log = self.run_pass()
+        self.assertEqual(len(self.prompts), 2)
+        self.assertIn("demo#3: analysis (new) waits: 2 analyses in the last 24 hours (analysis_daily_limit)", log)
+        log = self.run_pass()
+        self.assertEqual(len(self.prompts), 2)            # still within the day
+        ran = json.loads(iwb.STATE.read_text())["_analysis_runs"]
+        self.assertEqual(len(ran), 2)
+        old = time.time() - iwb.ANALYSIS_WINDOW - 10
+        state = json.loads(iwb.STATE.read_text())
+        state["_analysis_runs"] = {k: old for k in ran}
+        iwb.STATE.write_text(json.dumps(state))
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 3)            # a day later the held issue runs
+        self.assertEqual(len(json.loads(iwb.STATE.read_text())["_analysis_runs"]), 1)
+
+    def test_bad_analysis_cap_values_fall_back_with_a_log_line(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(iwb.analysis_cap("analysis_cap_per_issue", 6, {"analysis_cap_per_issue": "3"}), 6)
+            self.assertEqual(iwb.analysis_cap("analysis_cap_per_issue", 6, {"analysis_cap_per_issue": True}), 6)
+            self.assertEqual(iwb.analysis_cap("analysis_daily_limit", None, {"analysis_daily_limit": 0}), None)
+            self.assertEqual(iwb.analysis_cap("analysis_daily_limit", None, {}), None)
+            self.assertEqual(iwb.analysis_cap("analysis_daily_limit", None, {"analysis_daily_limit": 40}), 40)
+        self.assertIn("analysis_daily_limit must be a whole number from 1 to 500, not 0; using None", out.getvalue())
+        with redirect_stdout(out):
+            iwb.analysis_cap("analysis_cap_per_issue", 6, {"analysis_cap_per_issue": "ghp_" + "a" * 36})
+        self.assertNotIn("ghp_", out.getvalue())
+        self.assertIn("not a value of type str; using 6", out.getvalue())
+        with redirect_stdout(out):
+            iwb.analysis_cap("analysis_cap_per_issue", 6, {"analysis_cap_per_issue": 123456789012})
+            iwb.analysis_cap("analysis_cap_per_issue", 6, {"analysis_cap_per_issue": 2.5})
+        self.assertNotIn("123456789012", out.getvalue())
+        self.assertIn("not a value of type float; using 6", out.getvalue())
+
+    def test_a_trusted_bot_command_is_not_hidden_by_its_later_ordinary_comment(self):
+        iwb.CONFIG.write_text(json.dumps({"trusted_openers": ["ops-bot[bot]"]}))
+        self.answers = [answer({"decision": "questions", "summary": "Unclear.", "questions": ["Which?"]}),
+                        answer({"decision": "plan", "summary": "Now clear.", "units": [unit()]})]
+        self.run_pass()
+        later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+        self.comments = [{"user": "ops-bot[bot]", "body": "replan", "at": later},
+                         {"user": "ops-bot[bot]", "body": "Noted.", "at": later}]
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 2)
+        self.assertEqual(self.posts[-1][1], "bot:planned")
+
+    def test_removing_bot_blocked_keeps_the_analysis_count(self):
+        now = time.time()
+        iwb.STATE.write_text(json.dumps({self.KEY: {"agent": "claude", "picked_up_at": 1, "blocked": True,
+                                                    "analysis_runs": [now, now]}}))
+        iwb.CONFIG.write_text(json.dumps({"analysis_cap_per_issue": 2}))
+        log = self.run_pass()                        # the owner removed bot:blocked (not the cap's label)
+        self.assertEqual(self.prompts, [])
+        self.assertIn("analysis cap reached (2 in 24 hours)", log)
+
     def test_bad_answers_block_after_two_tries_and_unblock_on_label_removal(self):
         self.answers = ["no json here", answer({"decision": "plan", "summary": "x", "units": [
             {k: v for k, v in unit().items() if k != "acceptance"}]})]
@@ -3288,6 +3410,18 @@ class Code(unittest.TestCase):
         self.assertEqual(json.loads(back.read_text())["event"], "stale-plan")
         self.assertIn("not coded: the approved plan is out of date", out)
         self.assertIn("out of date; not coding", self.run_pass())     # later passes refuse without reading again
+
+    def test_a_trusted_bot_command_after_approval_makes_the_plan_stale(self):
+        # regression (#105 review): ordinary comments from a trusted bot no longer start an analysis, but its
+        # `stop` or `replan` after approval must still keep the old plan from being coded
+        iwb.CONFIG.write_text(json.dumps({**json.loads(iwb.CONFIG.read_text()), "trusted_openers": ["ops-bot[bot]"]}))
+        self.comments = [{"user": "ops-bot[bot]", "body": "Thanks, looks good.", "at": "2026-11-03T14:00:00Z"}]
+        self.assertIsNone(iwb.plan_is_stale(self.KEY, self.state()))
+        self.comments.append({"user": "ops-bot[bot]", "body": "@claude-dev-gh replan", "at": "2026-11-03T14:01:00Z"})
+        self.assertEqual(iwb.plan_is_stale(self.KEY, self.state()), "reply after plan")
+        self.run_pass()
+        self.assertEqual(self.ecc_calls, [])
+        self.assertEqual(self.state()["stale_plan"]["reason"], "reply after plan")
 
     def test_the_hourly_tick_codes_only_a_current_plan(self):
         iwb.CONFIG.write_text(json.dumps({**self.PILOT, "coding_live": True}))
