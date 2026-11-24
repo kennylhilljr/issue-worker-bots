@@ -53,8 +53,8 @@ class BackupReview(unittest.TestCase):
             options.append(text)
         self.assertIn("ref: ${{ github.event.repository.default_branch }}", options)
         self.assertIn("persist-credentials: false", options)
-        for text in self.text.splitlines():
-            if "ref:" in text:
+        for _, text in self.lines:
+            if text.startswith("ref:"):
                 self.assertNotIn("matrix.pr", text)
                 self.assertNotIn("head", text.lower())
 
