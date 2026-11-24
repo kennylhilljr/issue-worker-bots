@@ -741,12 +741,12 @@ class Analyze(unittest.TestCase):
         with redirect_stdout(out):
             iwb.analysis_cap("analysis_cap_per_issue", 6, {"analysis_cap_per_issue": "ghp_" + "a" * 36})
         self.assertNotIn("ghp_", out.getvalue())
-        self.assertIn("not a str; using 6", out.getvalue())
+        self.assertIn("not a value of type str; using 6", out.getvalue())
         with redirect_stdout(out):
             iwb.analysis_cap("analysis_cap_per_issue", 6, {"analysis_cap_per_issue": 123456789012})
             iwb.analysis_cap("analysis_cap_per_issue", 6, {"analysis_cap_per_issue": 2.5})
         self.assertNotIn("123456789012", out.getvalue())
-        self.assertIn("not a float; using 6", out.getvalue())
+        self.assertIn("not a value of type float; using 6", out.getvalue())
 
     def test_a_trusted_bot_command_is_not_hidden_by_its_later_ordinary_comment(self):
         iwb.CONFIG.write_text(json.dumps({"trusted_openers": ["ops-bot[bot]"]}))

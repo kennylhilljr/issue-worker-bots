@@ -516,9 +516,9 @@ def analysis_cap(name, default, conf=None):
         return None
     if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= ANALYSIS_CAP_CEILING:
         small = isinstance(v, (bool, int)) and -10 ** 6 < v < 10 ** 6
-        shown = repr(v) if v is None or small else f"a {type(v).__name__}"
+        shown = repr(v) if v is None or small else f"a value of type {type(v).__name__}"
         log(f"config.json {name} must be a whole number from 1 to {ANALYSIS_CAP_CEILING}, not {shown}; "
-            f"using {default}")   # never the value itself when it is text: it could be a pasted token
+            f"using {default}")   # only None and small whole numbers are shown: a pasted token is not
         return default
     return v
 
