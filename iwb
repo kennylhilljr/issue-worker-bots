@@ -515,8 +515,9 @@ def analysis_cap(name, default, conf=None):
     if v is None and default is None:
         return None
     if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= ANALYSIS_CAP_CEILING:
-        log(f"config.json {name} must be a whole number from 1 to {ANALYSIS_CAP_CEILING}, not {v!r}; "
-            f"using {default}")
+        shown = repr(v) if v is None or isinstance(v, (bool, int, float)) else f"a {type(v).__name__}"
+        log(f"config.json {name} must be a whole number from 1 to {ANALYSIS_CAP_CEILING}, not {shown}; "
+            f"using {default}")   # never the value itself when it is text: it could be a pasted token
         return default
     return v
 
@@ -1180,7 +1181,7 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
     conf, now = read_config(), time.time()
     per_issue = analysis_cap("analysis_cap_per_issue", ANALYSIS_CAP, conf)
     daily = analysis_cap("analysis_daily_limit", None, conf)           # no daily cap unless config.json sets one
-    ran = state.setdefault("_analysis_runs", {})     # "<repo>#<n>@<time>": time, for analysis_daily_limit
+    ran = state.setdefault("_analysis_runs", {})     # daily ledger, "<repo>#<n>@<time>": time; analysis_daily_limit
     if not isinstance(ran, dict):
         ran = state["_analysis_runs"] = {}
     for k in [k for k, t in ran.items() if not recent_times([t], now)]:
@@ -1217,7 +1218,8 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
                 continue
             entry.pop("blocked")
             entry["attempts"] = 0
-            entry.pop("analysis_runs", None)  # removing the label is Kenny's go-ahead: the per-issue cap starts over
+            if entry.pop("cap_blocked", None):
+                entry.pop("analysis_runs", None)  # Kenny's go-ahead after the cap: the 24-hour count starts over
             if entry.pop("blocked_label", None) == "bot:needs-kenny":
                 entry["replan"] = True    # Kenny removed bot:needs-kenny: analyze again; budgets and plan are kept
             else:                         # the owner removed bot:blocked: try again from scratch
@@ -1230,7 +1232,8 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
         replan_at = None                      # a replan command is acknowledged only once its analysis posts
         if a:   # short commands get an answer, not another expensive analysis
             cutoff = max(a["at"], entry.get("handled_at", 0))
-            new = [c for c in comments if c["user"] in trusted and iso_epoch(c["at"]) > cutoff]
+            new = [c for c in comments if c["user"] in trusted and iso_epoch(c["at"]) > cutoff
+                   and (not is_bot_login(c["user"]) or command_of(c["body"], worker_slugs))]   # see needs_analysis
             cmd = command_of(new[-1]["body"], worker_slugs) if new else None
             if cmd == "replan":
                 entry["replan"], replan_at = True, iso_epoch(new[-1]["at"])
@@ -1305,8 +1308,7 @@ def cap_blocked(key, entry, repo, number, issue, why, count, dry_run):
     except RuntimeError as e:
         mark(key, "failed", f"analysis cap reached; could not post, will retry: {e}")
         return
-    entry["blocked"] = True
-    entry["blocked_label"] = "bot:needs-kenny"
+    entry.update(blocked=True, blocked_label="bot:needs-kenny", cap_blocked=True)
     attention(bot, f"needs-kenny: {repo}#{number}", {"url": url, "title": issue["title"], "worker": slug,
                                                        "problem": f"{count} analyses in 24 hours"})
     log(f"{key}: analysis cap reached ({count} in 24 hours); marked bot:needs-kenny {url}")

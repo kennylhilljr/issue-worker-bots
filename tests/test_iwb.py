@@ -738,6 +738,31 @@ class Analyze(unittest.TestCase):
             self.assertEqual(iwb.analysis_cap("analysis_daily_limit", None, {}), None)
             self.assertEqual(iwb.analysis_cap("analysis_daily_limit", None, {"analysis_daily_limit": 40}), 40)
         self.assertIn("analysis_daily_limit must be a whole number from 1 to 500, not 0; using None", out.getvalue())
+        with redirect_stdout(out):
+            iwb.analysis_cap("analysis_cap_per_issue", 6, {"analysis_cap_per_issue": "ghp_" + "a" * 36})
+        self.assertNotIn("ghp_", out.getvalue())
+        self.assertIn("not a str; using 6", out.getvalue())
+
+    def test_a_trusted_bot_command_is_not_hidden_by_its_later_ordinary_comment(self):
+        iwb.CONFIG.write_text(json.dumps({"trusted_openers": ["ops-bot[bot]"]}))
+        self.answers = [answer({"decision": "questions", "summary": "Unclear.", "questions": ["Which?"]}),
+                        answer({"decision": "plan", "summary": "Now clear.", "units": [unit()]})]
+        self.run_pass()
+        later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+        self.comments = [{"user": "ops-bot[bot]", "body": "replan", "at": later},
+                         {"user": "ops-bot[bot]", "body": "Noted.", "at": later}]
+        self.run_pass()
+        self.assertEqual(len(self.prompts), 2)
+        self.assertEqual(self.posts[-1][1], "bot:planned")
+
+    def test_removing_bot_blocked_keeps_the_analysis_count(self):
+        now = time.time()
+        iwb.STATE.write_text(json.dumps({self.KEY: {"agent": "claude", "picked_up_at": 1, "blocked": True,
+                                                    "analysis_runs": [now, now]}}))
+        iwb.CONFIG.write_text(json.dumps({"analysis_cap_per_issue": 2}))
+        log = self.run_pass()                        # the owner removed bot:blocked (not the cap's label)
+        self.assertEqual(self.prompts, [])
+        self.assertIn("analysis cap reached (2 in 24 hours)", log)
 
     def test_bad_answers_block_after_two_tries_and_unblock_on_label_removal(self):
         self.answers = ["no json here", answer({"decision": "plan", "summary": "x", "units": [
