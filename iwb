@@ -1368,7 +1368,10 @@ RED_TIMEOUT = 600
 P_MARKER = "<!-- iwb:approval -->"
 DENY_PATHS = (r"(^|/)\.github/workflows/", r"(^|/)\.env", r"\.pem$", r"\.key$", r"(^|/)secrets?/",
               r"(^|/)credentials", r"(^|/)id_(rsa|ed25519)",
-              r"^\.gitmodules$", r"^\.agents/skills/shared(/|$)")     # the shared skills submodule (SUB-9)
+              r"^\.gitmodules$", r"^\.agents/skills/shared(/|$)",     # the shared skills submodule (SUB-9)
+              # Claude Code settings, hooks, commands and agents run or steer later runs; the repository's own
+              # .claude/skills stay editable (the shared links are protected per clone in path_rules) (#104)
+              r"(?i)(^|/)\.claude(/(?!skills(/|$))|$)")
 DENY_PROGRAMS = {"curl", "wget", "ssh", "scp", "sftp", "rsync", "sudo", "nc", "ncat", "telnet", "docker", "brew",
                  "security", "prbot", "gh", "pip", "pip3", "npm", "npx", "yarn", "pnpm", "open", "osascript", "launchctl"}
 
@@ -2756,7 +2759,11 @@ DRIVE_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "TER
              "UV_PYTHON_INSTALL_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
              "XDG_DATA_HOME", "XDG_STATE_HOME")
 SECRET_ENV = re.compile(r"^(GH_|GITHUB_|PRBOT_)|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.I)
-ALWAYS_BLOCKED = (".github/workflows/**", "**/.env*", "**/*.pem", "**/*.key", "**/secrets/**")
+ALWAYS_BLOCKED = (".github/workflows/**", "**/.env*", "**/*.pem", "**/*.key", "**/secrets/**",
+                  # files that execute or steer later agent, hook or package-manager runs, and more credentials (#104)
+                  "**/.codex", "**/.codex/**", "**/AGENTS.md", "**/CLAUDE.md", "**/.mcp.json", "**/.husky",
+                  "**/.husky/**", "**/.pre-commit-config.yaml", "**/.npmrc", "**/.pypirc", "**/.netrc", "**/*.p12",
+                  "**/*.pfx", "**/.aws", "**/.aws/**")
 SEED_POLICY = {"kennylhilljr/ecc-customization": ["bootstrap.sh", "stack.conf", "machine/**"]}
 W_MARKER = "<!-- iwb:work -->"
 # The orchestrator's practices pass (team.json "learning") has the delivery lead merge lessons into AGENTS.md,
