@@ -72,8 +72,10 @@ git clone https://github.com/kennylhilljr/issue-worker-bots.git ~/Documents/GitH
 Run the tests before first use:
 
 ```bash
-cd ~/Documents/GitHub/issue-worker-bots && python3 -m unittest discover -s tests -v
+cd ~/Documents/GitHub/issue-worker-bots && python3 scripts/check.py
 ```
+
+`scripts/check.py` runs the suite with a fresh `TMPDIR` and `PRBOT_PATH` set to the bundled `tests/prbot_stub.py`, which the tests need; a bare `python3 -m unittest discover -s tests` without them can fail on a fresh checkout. See [docs/ci.md](docs/ci.md).
 
 ### Register the worker Apps (once)
 
@@ -96,6 +98,8 @@ Kenny's own issues are always picked up. Add other accounts, for example Kenny's
 ```json
 {"trusted_openers": ["openclaw-ops-assist[bot]"]}
 ```
+
+A trusted bot account's ordinary comments go into the analysis prompt but never start an analysis on their own, so a bot that answers the worker's comments can't loop with it. Its short commands (`replan`, `status`, `stop`, ...) still work.
 
 ### Start the timer
 
@@ -157,6 +161,8 @@ The model answers with exactly one of:
 
 Plans are checked before posting: 1 to 8 units, unique ids, every work-unit field present, files and acceptance commands on every unit, dependencies that exist, and a `budget.maximum_cost_usd` above 0 on every unit. The orchestrator treats that field as a hard limit per unit and stops a unit whose cost has reached it, so 0 or no value means the unit never gets a first attempt. The planner's example unit and prompt use `max_cost_usd_per_issue` from `config.json` (default 5) for it. Two unusable answers mark the issue `bot:blocked`; removing that label tries again. A model failure such as a usage limit retries after an hour.
 
+Each issue gets at most `analysis_cap_per_issue` (default 6) analyses in 24 hours. Replies, edits and `replan` past that label the issue `bot:needs-kenny`, with one comment and an OpenClaw attention event, instead of starting another analysis; removing the label resets the count and analyzes again. A model that could not run (usage limit, outage, crash) is not counted. `analysis_daily_limit` (no default) caps analyses across all issues in 24 hours; issues past it wait for a later pass.
+
 The red check and the acceptance run on a PR head start each command, and finish, from the clone's base captured before the first command. A command that deinitializes the shared skills submodule or checks out another commit does not change what the next command sees: `iwb` resets HEAD to the captured commit, cleans the tree (untracked nested repositories included) and re-initializes the submodule from its cached objects without any network (`git submodule update --init --no-fetch`, every transport refused). The clone's `.git` is treated as untrusted after a command. Before changing anything, restoration refuses a configured filter program (`filter.*.smudge`, `clean` or `process`, includes followed), a `core.worktree` that moves a work tree, a `.git` or submodule git directory that was removed, moved or redirected, and a submodule `.git` file that points anywhere else (one removed by `git submodule deinit` is restored). Git then runs under the commands' own sandbox profile (no network or home folder; writes next to the clone and in the system temp folders), without hooks, fsmonitor or any transport, pinned to the captured directories, after the config and attributes files are put back to their captured contents. If any of that fails, the run stops with the reason: no later command runs, the approval is retried on a later pass, and an acceptance run hands the PR to Kenny without merging. See "Restoring the base between commands" in `DESIGN.md`.
 
 In step 4a a plan can go back to the planner twice at most: once when `lint-plan` or the fixable gates reject it (a shell in an acceptance command, a unit cost limit of 0), and once when the reviewer answers `revise`. The two budgets are separate, so a plan that failed lint once still gets the reviewer's revision. A second send-back of the same kind marks the issue `bot:blocked`. A send-back that the per-pass analysis limit holds, or whose analysis fails, is still replanned on a later pass: the request is cleared only once a new analysis is posted. While a send-back is pending (the latest approval comment is "Plan needs changes" and no newer plan exists), the next analysis must post a revised plan or questions: its prompt says so, and a no-code answer counts as an unusable answer instead of labelling the issue `bot:no-code`. Only a new plan ends this state; questions answered in between or removing a label do not. If the tries run out that way, the issue gets `bot:needs-kenny` instead of `bot:blocked`; removing that label analyzes again and, unlike removing `bot:blocked`, keeps both send-back budgets. A state entry written before the split has only `revisions`, which counts as the reviewer's revision. Removing `bot:blocked` resets both budgets.
@@ -190,6 +196,8 @@ Settings in `~/.config/issue-worker-bots/config.json`; nothing is coded until bo
 | `max_parallel` | 3 | Of those, the most one runner CLI (`claude` or `codex`) codes at once. |
 | `runner_fallback` | false | When the runner that would code a plan is at its usage limit, the other runner codes it instead of waiting, whatever the plan's approver; the PR's cross-review comes from the family other than the runner that wrote the code (see below). |
 | `analysis_concurrency` | 3 | Analyses per pass, run at the same time. |
+| `analysis_cap_per_issue` | 6 | Analyses one issue may get in 24 hours before it is labeled `bot:needs-kenny` (1 to 500). |
+| `analysis_daily_limit` | none | Analyses across all issues in 24 hours; past it, issues wait for a later pass (1 to 500). |
 
 #### Parallel runs
 

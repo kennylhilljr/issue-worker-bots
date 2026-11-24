@@ -414,6 +414,9 @@ def cmd_intake(dry_run=False, baseline=False, limit=LIMIT, only=None, repo_filte
 ANALYSIS_MODELS = {"claude": {"model": "opus", "effort": "high"}, "codex": {"model": "gpt-6-astra", "effort": "high"}}
 ANALYZE_LIMIT = 3         # analyses per pass, run in parallel; config.json "analysis_concurrency"
 MAX_ATTEMPTS = 2          # unusable answers before the issue is marked bot:blocked
+ANALYSIS_CAP = 6          # analyses per issue in ANALYSIS_WINDOW, then bot:needs-kenny; "analysis_cap_per_issue"
+ANALYSIS_WINDOW = 86400   # seconds the per-issue and daily analysis caps look back
+ANALYSIS_CAP_CEILING = 500  # the most either analysis cap may be set to
 RETRY_AFTER = 3600        # seconds before retrying after a model failure (usage limit, outage)
 A_MARKER = "<!-- iwb:analysis -->"
 R_MARKER = "<!-- iwb:reply -->"
@@ -503,6 +506,24 @@ def conf_count(name, default, conf=None):
 def analysis_limit(conf=None):
     """Analyses per pass, run at the same time: config.json "analysis_concurrency" (default ANALYZE_LIMIT)."""
     return conf_count("analysis_concurrency", ANALYZE_LIMIT, conf)
+
+
+def analysis_cap(name, default, conf=None):
+    """config.json `name` as a whole number from 1 to ANALYSIS_CAP_CEILING; `default` when it is missing, and with a
+    log line when it is anything else. A default of None means no cap unless the key is set."""
+    v = (read_config() if conf is None else conf).get(name, default)
+    if v is None and default is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= ANALYSIS_CAP_CEILING:
+        log(f"config.json {name} must be a whole number from 1 to {ANALYSIS_CAP_CEILING}, not {v!r}; "
+            f"using {default}")
+        return default
+    return v
+
+
+def recent_times(times, now):
+    """The numbers in `times` (epoch seconds) inside the last ANALYSIS_WINDOW; anything else is dropped."""
+    return [t for t in times if isinstance(t, (int, float)) and not isinstance(t, bool) and now - t < ANALYSIS_WINDOW]
 
 
 MAX_COST_CEILING = 100    # the most config.json "max_cost_usd_per_issue" may be; a typo shouldn't buy a $1e9 run
@@ -940,12 +961,19 @@ def last_edited(repo, number):
     return iso_epoch(at) if at else None
 
 
+def is_bot_login(login):
+    """Whether a GitHub login is an App's bot account; those always end in "[bot]"."""
+    return isinstance(login, str) and login.endswith("[bot]")
+
+
 def needs_analysis(entry, comments, trusted, digest, edited_at=None):
     """Why this picked-up issue should be analyzed now, or None. A trusted comment after any bot answer
     (plan included) or an edit to the title or body brings the bot back. An analysis stored before digests were
     (no "digest") is compared by `edited_at`, the body's last edit, and then gets the current digest. The
     "reason" and "replan" flags are only read here: a hold (per-pass limit) or a failed run must not lose them,
-    so they are cleared once an analysis has been posted."""
+    so they are cleared once an analysis has been posted. A comment from a bot account (a login ending in "[bot]")
+    is never a reply here, even when trusted_openers lists it: a trusted bot that answers the worker's comments
+    would otherwise start an analysis per answer. Its short commands still work through cmd_analyze."""
     if "agent" not in entry or entry.get("closed") or entry.get("blocked"):
         return None
     if (entry.get("work") or {}).get("status") in ("in-progress", "pushed") + PR_STATUSES:
@@ -964,7 +992,8 @@ def needs_analysis(entry, comments, trusted, digest, edited_at=None):
     cutoff = max(a["at"], entry.get("handled_at", 0))
     if entry.get("replan"):
         return "replan requested"
-    replies = [c for c in comments if c["user"] in trusted and iso_epoch(c["at"]) > cutoff]
+    replies = [c for c in comments if c["user"] in trusted and not is_bot_login(c["user"])
+               and iso_epoch(c["at"]) > cutoff]
     return f"reply after {a['decision']}" if replies else None
 
 
@@ -1148,6 +1177,14 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
     worker_slugs = [cfg[b]["slug"] for b in WORKERS.values() if b in cfg]
     approver_logins = {cfg[b]["slug"] + "[bot]" for b in ("claude", "codex") if b in cfg}   # the review bots
     runs, jobs = 0, []
+    conf, now = read_config(), time.time()
+    per_issue = analysis_cap("analysis_cap_per_issue", ANALYSIS_CAP, conf)
+    daily = analysis_cap("analysis_daily_limit", None, conf)           # no daily cap unless config.json sets one
+    ran = state.setdefault("_analysis_runs", {})     # "<repo>#<n>@<time>": time, for analysis_daily_limit
+    if not isinstance(ran, dict):
+        ran = state["_analysis_runs"] = {}
+    for k in [k for k, t in ran.items() if not recent_times([t], now)]:
+        del ran[k]
     for key, entry in sorted((k, v) for k, v in state.items() if not k.startswith("_")):
         if "agent" not in entry or paused or only is not None and key not in only \
                 or repo_filter is not None and not key.startswith(repo_filter + "#"):
@@ -1180,6 +1217,7 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
                 continue
             entry.pop("blocked")
             entry["attempts"] = 0
+            entry.pop("analysis_runs", None)  # removing the label is Kenny's go-ahead: the per-issue cap starts over
             if entry.pop("blocked_label", None) == "bot:needs-kenny":
                 entry["replan"] = True    # Kenny removed bot:needs-kenny: analyze again; budgets and plan are kept
             else:                         # the owner removed bot:blocked: try again from scratch
@@ -1225,6 +1263,13 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
         why = needs_analysis(entry, comments, trusted, digest, edited_at)
         if not why:
             continue
+        recent = recent_times(entry.get("analysis_runs") or [], now)
+        if len(recent) >= per_issue:
+            cap_blocked(key, entry, repo, number, issue, why, len(recent), dry_run)
+            continue
+        if daily is not None and len(ran) + runs >= daily:
+            mark(key, "held", f"analysis ({why}) waits: {daily} analyses in the last 24 hours (analysis_daily_limit)")
+            continue
         if runs >= limit:
             mark(key, "held", f"analysis ({why}) waits for the next pass (limit {limit})")
             continue
@@ -1235,7 +1280,7 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
         log(f"{key}: analyzing with {model} ({why})")
         jobs.append({"key": key, "entry": entry, "repo": repo, "number": number, "issue": issue, "text": text,
                      "digest": digest, "replan_at": replan_at, "agent": agent, "bot": bot, "model": model,
-                     "revision_pending": revision_pending(entry)})
+                     "revision_pending": revision_pending(entry), "ran": ran})
     try:
         finish_analyses(jobs, run_parallel(analyze_one, jobs, limit), dry_run)
     finally:                                  # a post failing part way never loses the answers posted before it
@@ -1243,6 +1288,28 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
             save_state(state, since)
     log(f"analysis pass done: {runs} run{'s' if runs != 1 else ''}")
     return 0
+
+
+def cap_blocked(key, entry, repo, number, issue, why, count, dry_run):
+    """An issue that reached analysis_cap_per_issue: label it bot:needs-kenny with one comment and tell OpenClaw,
+    instead of starting another analysis. Removing the label resets the count and analyzes again (cmd_analyze)."""
+    if dry_run:
+        log(f"{key}: would mark bot:needs-kenny: {count} analyses in 24 hours ({why})")
+        return
+    bot = WORKERS[entry["agent"]]
+    slug = prbot.bot_config(bot)["slug"]
+    try:
+        url = post(bot, repo, number, f"{A_MARKER}\n`{slug}` has analyzed this issue {count} times in the last 24 "
+                   f"hours, the most allowed, and stopped instead of starting another analysis ({why}). If a bot "
+                   f"keeps answering here, stop it; then remove `bot:needs-kenny` to analyze again.", "bot:needs-kenny")
+    except RuntimeError as e:
+        mark(key, "failed", f"analysis cap reached; could not post, will retry: {e}")
+        return
+    entry["blocked"] = True
+    entry["blocked_label"] = "bot:needs-kenny"
+    attention(bot, f"needs-kenny: {repo}#{number}", {"url": url, "title": issue["title"], "worker": slug,
+                                                       "problem": f"{count} analyses in 24 hours"})
+    log(f"{key}: analysis cap reached ({count} in 24 hours); marked bot:needs-kenny {url}")
 
 
 def finish_analyses(jobs, results, dry_run):
@@ -1272,6 +1339,10 @@ def finish_analysis(job, answer, err, dry_run):
         mark(key, "failed", f"analysis crashed; retrying in {RETRY_AFTER // 60} minutes: "
              f"{type(err).__name__}: {short(err, 300)}")
         return
+    now = time.time()                    # the model ran: it counts toward the analysis caps
+    entry["analysis_runs"] = recent_times(entry.get("analysis_runs") or [], now) + [now]
+    if isinstance(job.get("ran"), dict):
+        job["ran"][f"{key}@{now:.6f}"] = now
     stuck = "bot:blocked"
     if err is None and answer.get("decision") == "no_change" and job.get("revision_pending"):
         # a plan revision is pending: no_change is an analysis failure, never the issue's answer (see #89)
