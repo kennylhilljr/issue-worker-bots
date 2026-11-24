@@ -353,6 +353,8 @@ When the fallback errors too, the finding is skipped and logged. The scan sets `
 
 `scripts/check.py` is the one check for this repository, locally and in CI. It byte-compiles `iwb` and every Python file under `tests/` and stops there on a syntax error, then runs unittest discovery with a fresh `TMPDIR` under `/tmp` and `PRBOT_PATH` set to the bundled `tests/prbot_stub.py`, so no sibling pr-review-bots checkout or credentials are needed. The GitHub Actions workflow that runs it is documented in [docs/ci.md](docs/ci.md); Kenny installs it by hand because `.github/workflows/**` is always blocked for bots.
 
+`.github/workflows/backup-review.yml` reviews PRs that `prbot watch` has left unreviewed for two hours, as claude[bot] through the Claude Code GitHub Action. The repository is public and the job holds `CLAUDE_CODE_OAUTH_TOKEN`, so it reviews same-repository PRs only (`isCrossRepository` is false, checked when the PR is picked and again before Claude runs), checks out the default branch rather than the PR head, and gives Claude the PR as diff text in `$RUNNER_TEMP`. Claude Code loads `CLAUDE.md` and `.claude/settings.json` hooks from its working directory, and a head checkout would let a PR supply both. Actions are pinned to full commit SHAs. `id-token: write` stays because the action exchanges the OIDC token for the App token that posts the review.
+
 ## Where it lives
 
 A new repository, `issue-worker-bots`, holds the intake watcher, the analysis prompt and its output schema, the clarity gate, and the glue that starts orchestrator runs and opens PRs. It depends on two existing pieces:

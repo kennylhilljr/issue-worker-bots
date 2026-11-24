@@ -276,6 +276,7 @@ Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bo
 | `bots/` | App specs for `prbot register --spec`, including each App's permissions. |
 | `logos/` | Bot logos: SVG sources and 512 px PNGs uploaded to GitHub. |
 | `docs/assets/` | The README header (SVG source and WebP). |
+| `.github/workflows/backup-review.yml` | Backup PR review by the Claude Code GitHub Action when `prbot watch` has not reviewed a head commit for two hours. |
 | `tests/` | Unit tests with fake GitHub, models and orchestrator: pick-up, analysis, plan approval, coding and label changes. |
 | [`DESIGN.md`](DESIGN.md) | The design: pipeline, model choice, budgets, safety and the OpenClaw bridge. |
 
@@ -285,6 +286,7 @@ Status labels: `bot:queued`, `bot:no-code`, `bot:needs-info`, `bot:planned`, `bo
 - Analysis runs read-only on a fresh clone. The clone's own settings and hooks are not loaded (Claude Code `--setting-sources user`, Codex `--disable hooks`), and the model CLI gets the same scrubbed environment as coding runs, without GitHub tokens or other secrets. The same goes for plan approvals and `iwb scan`. Coding runs only in repositories listed in `coding_repos`, inside orchestrator worktrees of `iwb`'s own clone, never on `main` or a checkout Kenny uses; its changes are checked against the plan's scope and protected paths before anything is pushed.
 - Workers never push to the default branch except via a gated squash merge of a reviewed bot PR (step 5: clean cross-review of the head, acceptance passing on the head, no protected path, no failing check), and never change repository settings, secrets or workflows. In step 4 a policy gate refuses plans that touch `.github/workflows`, secrets, credentials or deploy configuration; no agent can approve them.
 - Tokens come from `prbot`: one hour, one repository, never printed or saved. App private keys live in macOS Keychain.
+- The backup-review workflow skips pull requests from forks and runs Claude Code in a checkout of the default branch, reading the PR only as diff text, so a PR cannot plant `CLAUDE.md` or `.claude/settings.json` hooks where the workflow's secrets are. Its actions are pinned to commit SHAs.
 - The `pr-review-bots` guard hook and `cross-review` skill stop agents from posting or pushing as Kenny.
 - This checkout's own Claude Code hook (`.claude/hooks/check_tool.py`) refuses edits to secret-shaped files (`.env*`, `*.pem`, `*.key`, `secrets/`) and Bash commands that would run the live `iwb`, `install-intake.sh` or a launchctl change, and runs the tests after an edit to `iwb` or `tests/`. It compares names case-insensitively, because the checkout's APFS volume is (`./IWB tick` runs `iwb`), and refuses a program name built by a glob, brace or variable that can name one of those programs, using assignments in the same command (`cmd=launchctl; "$cmd" load x`). Before an `iwb` subcommand a glob in a path (with a slash) that cannot match `iwb` is allowed (`./scripts/*.py code`), but a variable program (`$cmd tick`) is refused. It is a guard against mistakes, not a sandbox.
 
