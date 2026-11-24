@@ -3406,6 +3406,18 @@ class Code(unittest.TestCase):
         self.assertIn("not coded: the approved plan is out of date", out)
         self.assertIn("out of date; not coding", self.run_pass())     # later passes refuse without reading again
 
+    def test_a_trusted_bot_command_after_approval_makes_the_plan_stale(self):
+        # regression (#105 review): ordinary comments from a trusted bot no longer start an analysis, but its
+        # `stop` or `replan` after approval must still keep the old plan from being coded
+        iwb.CONFIG.write_text(json.dumps({**json.loads(iwb.CONFIG.read_text()), "trusted_openers": ["ops-bot[bot]"]}))
+        self.comments = [{"user": "ops-bot[bot]", "body": "Thanks, looks good.", "at": "2026-11-03T14:00:00Z"}]
+        self.assertIsNone(iwb.plan_is_stale(self.KEY, self.state()))
+        self.comments.append({"user": "ops-bot[bot]", "body": "@claude-dev-gh replan", "at": "2026-11-03T14:01:00Z"})
+        self.assertEqual(iwb.plan_is_stale(self.KEY, self.state()), "reply after plan")
+        self.run_pass()
+        self.assertEqual(self.ecc_calls, [])
+        self.assertEqual(self.state()["stale_plan"]["reason"], "reply after plan")
+
     def test_the_hourly_tick_codes_only_a_current_plan(self):
         iwb.CONFIG.write_text(json.dumps({**self.PILOT, "coding_live": True}))
         saved = {k: getattr(iwb, k) for k in ("cmd_intake", "cmd_analyze", "cmd_approve")}

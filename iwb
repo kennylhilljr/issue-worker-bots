@@ -967,14 +967,15 @@ def is_bot_login(login):
     return isinstance(login, str) and login.endswith("[bot]")
 
 
-def needs_analysis(entry, comments, trusted, digest, edited_at=None):
+def needs_analysis(entry, comments, trusted, digest, edited_at=None, worker_slugs=()):
     """Why this picked-up issue should be analyzed now, or None. A trusted comment after any bot answer
     (plan included) or an edit to the title or body brings the bot back. An analysis stored before digests were
     (no "digest") is compared by `edited_at`, the body's last edit, and then gets the current digest. The
     "reason" and "replan" flags are only read here: a hold (per-pass limit) or a failed run must not lose them,
     so they are cleared once an analysis has been posted. A comment from a bot account (a login ending in "[bot]")
-    is never a reply here, even when trusted_openers lists it: a trusted bot that answers the worker's comments
-    would otherwise start an analysis per answer. Its short commands still work through cmd_analyze."""
+    is a reply here only when it is a short command (command_of, with `worker_slugs` as the allowed mentions), even
+    when trusted_openers lists it: a trusted bot that answers the worker's comments would otherwise start an
+    analysis per answer, and a command it posts after approval must still make the plan stale (plan_is_stale)."""
     if "agent" not in entry or entry.get("closed") or entry.get("blocked"):
         return None
     if (entry.get("work") or {}).get("status") in ("in-progress", "pushed") + PR_STATUSES:
@@ -993,8 +994,8 @@ def needs_analysis(entry, comments, trusted, digest, edited_at=None):
     cutoff = max(a["at"], entry.get("handled_at", 0))
     if entry.get("replan"):
         return "replan requested"
-    replies = [c for c in comments if c["user"] in trusted and not is_bot_login(c["user"])
-               and iso_epoch(c["at"]) > cutoff]
+    replies = [c for c in comments if c["user"] in trusted and iso_epoch(c["at"]) > cutoff
+               and (not is_bot_login(c["user"]) or command_of(c["body"], worker_slugs))]
     return f"reply after {a['decision']}" if replies else None
 
 
@@ -1263,7 +1264,7 @@ def cmd_analyze(dry_run=False, limit=None, only=None, repo_filter=None):
             except (SystemExit, ValueError, IndexError, KeyError):
                 mark(key, "deferred", "could not read when the issue was edited; will retry")
                 continue
-        why = needs_analysis(entry, comments, trusted, digest, edited_at)
+        why = needs_analysis(entry, comments, trusted, digest, edited_at, worker_slugs)
         if not why:
             continue
         recent = recent_times(entry.get("analysis_runs") or [], now)
@@ -5211,7 +5212,8 @@ def plan_is_stale(key, entry):
         return CLOSED                     # closed since cmd_code's first read: stop, never code it
     a = entry.get("analysis") or {}
     edited_at = last_edited(repo, number) if a and not a.get("digest") else None   # as cmd_analyze does
-    return needs_analysis(copy.deepcopy(entry), comments, trusted, issue_digest(issue), edited_at)
+    worker_slugs = [cfg[b]["slug"] for b in WORKERS.values() if b in cfg]
+    return needs_analysis(copy.deepcopy(entry), comments, trusted, issue_digest(issue), edited_at, worker_slugs)
 
 
 def cmd_code_drain(queue_dir):
