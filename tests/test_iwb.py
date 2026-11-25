@@ -4126,6 +4126,70 @@ class Code(unittest.TestCase):
         self.assertEqual((code, env["data"]["stop"], err), (3, "no_progress", "drive: FAILED"))
 
 
+class KillGroup(unittest.TestCase):
+    """kill_group with os.killpg faked: macOS returns EPERM from killpg once only zombies are left in the group (#112)."""
+
+    class Proc:
+        pid = 4242
+
+        def __init__(self, exited):
+            self.exited, self.waited = exited, 0
+
+        def poll(self):
+            return 0 if self.exited else None
+
+        def wait(self):
+            self.waited += 1
+            return 0
+
+    def setUp(self):
+        saved = iwb.KILL_GRACE
+        self.addCleanup(setattr, iwb, "KILL_GRACE", saved)
+        iwb.KILL_GRACE = 0.5
+        self.calls = []
+        enter_context(self, mock.patch.object(iwb.time, "sleep", lambda s: None))
+
+    def killpg(self, errors):
+        def fake(pid, sig):
+            self.calls.append(sig)
+            if sig in errors:
+                raise errors[sig]
+        return enter_context(self, mock.patch.object(iwb.os, "killpg", side_effect=fake))
+
+    def test_eperm_from_the_probe_after_the_leader_exits_means_the_group_is_gone(self):
+        self.killpg({0: PermissionError(1, "Operation not permitted")})
+        p = self.Proc(exited=True)
+        iwb.kill_group(p)
+        self.assertEqual(self.calls, [iwb.signal.SIGTERM, 0])
+
+    def test_eperm_from_sigkill_still_reaps_the_leader(self):
+        self.killpg({iwb.signal.SIGKILL: PermissionError(1, "Operation not permitted")})
+        p = self.Proc(exited=False)
+        iwb.kill_group(p)
+        self.assertEqual(self.calls[0], iwb.signal.SIGTERM)
+        self.assertEqual(self.calls[-1], iwb.signal.SIGKILL)
+        self.assertEqual(p.waited, 1)
+
+    def test_a_group_already_gone_at_sigterm_returns(self):
+        self.killpg({iwb.signal.SIGTERM: ProcessLookupError()})
+        p = self.Proc(exited=False)
+        iwb.kill_group(p)
+        self.assertEqual(self.calls, [iwb.signal.SIGTERM])
+        self.assertEqual(p.waited, 0)
+
+
+class Python39Compat(unittest.TestCase):
+    """AGENTS.md requires Python 3.9: TestCase.enterContext is 3.11+, so the tests use enter_context (#112)."""
+
+    def test_no_test_calls_enterContext(self):
+        import ast
+        for path in sorted(Path(ROOT, "tests").glob("*.py")):
+            tree = ast.parse(path.read_text(), str(path))
+            calls = [n.lineno for n in ast.walk(tree)
+                     if isinstance(n, ast.Attribute) and n.attr in ("enterContext", "enterClassContext")]
+            self.assertEqual(calls, [], f"{path.name} calls enterContext (Python 3.11+); use enter_context")
+
+
 class DriveProcess(unittest.TestCase):
     """run_ecc against a real script standing in for the orchestrator, which starts a child like a runner CLI."""
 
