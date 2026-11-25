@@ -81,8 +81,8 @@ class Workflow(unittest.TestCase):
     def test_steps(self):
         steps = children(self.lines, ("jobs", "tests", "steps"))
         self.assertEqual(direct(steps), [
-            "- uses: actions/checkout@v4",
-            "- uses: actions/setup-python@v5",
+            "- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+            "- uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5",
             "- run: python3 scripts/check.py",
         ])
         self.assertIn("python-version: ${{ matrix.python-version }}", [text for _, text in steps])
@@ -91,6 +91,18 @@ class Workflow(unittest.TestCase):
         runs = [text for _, text in self.lines if re.match(r"^(- )?run:", text)]
         self.assertEqual(runs, ["- run: python3 scripts/check.py"])
         self.assertNotRegex(self.block, r"pip |pip3 |install")
+
+    def test_installed_workflow_matches_the_doc(self):
+        workflow = ROOT / ".github" / "workflows" / "tests.yml"
+        self.assertTrue(workflow.is_file(), ".github/workflows/tests.yml must be installed")
+        self.assertEqual(workflow.read_text(encoding="utf-8"), self.block)
+
+    def test_actions_pinned_to_commits(self):
+        uses = [text for _, text in self.lines if re.match(r"^(- )?uses:", text)]
+        self.assertTrue(uses)
+        for text in uses:
+            with self.subTest(uses=text):
+                self.assertRegex(text, r"^(- )?uses: [\w.-]+/[\w.-]+@[0-9a-f]{40} # v\d+$")
 
     def test_no_secrets(self):
         self.assertNotIn("secrets.", self.block)

@@ -87,6 +87,13 @@ class GuardedSubprocess:
         return self._delegate.Popen(*args, **kwargs)
 
 
+def enter_context(case, cm):
+    """TestCase.enterContext for Python 3.9/3.10 (it is 3.11+): enter cm, exit it at cleanup."""
+    result = cm.__enter__()
+    case.addCleanup(cm.__exit__, None, None, None)
+    return result
+
+
 def setUpModule():
     original = iwb.subprocess
     unittest.addModuleCleanup(setattr, iwb, "subprocess", original)
@@ -3537,8 +3544,8 @@ class Code(unittest.TestCase):
             def __getattr__(self, name):
                 return getattr(test.real_subprocess, name)
         self.real_subprocess = iwb.subprocess
-        self.enterContext(mock.patch.object(iwb, "SPAWN_RUNS", True))
-        self.enterContext(mock.patch.object(iwb, "subprocess", FakeSubprocess()))
+        enter_context(self, mock.patch.object(iwb, "SPAWN_RUNS", True))
+        enter_context(self, mock.patch.object(iwb, "subprocess", FakeSubprocess()))
         self.addCleanup(lambda: [os.close(fd) for fds in self.children.values() for fd in fds])
         return started
 
@@ -3635,7 +3642,7 @@ class Code(unittest.TestCase):
         fds = self.children.pop(self.KEY)                                # the fake child's copies of the locks
         job["lock_fds"] = fds
         path.write_text(json.dumps(job))
-        self.enterContext(mock.patch.object(iwb, "run_ecc", self.fake_ecc))
+        enter_context(self, mock.patch.object(iwb, "run_ecc", self.fake_ecc))
         with redirect_stdout(io.StringIO()):
             self.assertEqual(iwb.cmd_job(path), 0)
         self.assertFalse(path.exists())
@@ -3663,7 +3670,7 @@ class Code(unittest.TestCase):
         ((argv, kw, job),) = started
         plan = Path(self.state()["plan_file"])
         plan.write_text(json.dumps({"units": [coding_unit("u2")]}))       # a new analysis wrote another plan
-        self.enterContext(mock.patch.object(iwb, "run_ecc", self.fake_ecc))
+        enter_context(self, mock.patch.object(iwb, "run_ecc", self.fake_ecc))
         with redirect_stdout(io.StringIO()) as out:
             iwb.run_job(job)
         self.assertIn("no longer the approved one", out.getvalue())
@@ -4224,7 +4231,7 @@ class OrchestratorDrift(unittest.TestCase):
         saved = (iwb.ECC, iwb.CONFIG)
         self.addCleanup(lambda: (setattr(iwb, "ECC", saved[0]), setattr(iwb, "CONFIG", saved[1])))
         iwb.ECC, iwb.CONFIG = orch / "bin" / "ecc", Path(tmp.name, "config.json")
-        self.enterContext(mock.patch.object(iwb, "WORK_DIR", Path(tmp.name, "work")))   # its orchestrator.lock
+        enter_context(self, mock.patch.object(iwb, "WORK_DIR", Path(tmp.name, "work")))   # its orchestrator.lock
         self.assertIsNone(iwb.orchestrator_drift())
         git("checkout", "-qb", "feature", cwd=orch)
         Path(orch, "f").write_text("y\n")
@@ -4261,7 +4268,7 @@ class OrchestratorFastForward(unittest.TestCase):
         saved = (iwb.ECC, iwb.CONFIG)
         self.addCleanup(lambda: (setattr(iwb, "ECC", saved[0]), setattr(iwb, "CONFIG", saved[1])))
         iwb.ECC, iwb.CONFIG = self.orch / "bin" / "ecc", Path(self.tmp.name, "config.json")
-        self.enterContext(mock.patch.object(iwb, "WORK_DIR", Path(self.tmp.name, "work")))   # its orchestrator.lock
+        enter_context(self, mock.patch.object(iwb, "WORK_DIR", Path(self.tmp.name, "work")))   # its orchestrator.lock
         self.commit(self.src, "g", "next")                                  # origin moves on after the clone
 
     def commit(self, repo, name, msg):
@@ -5128,7 +5135,7 @@ class Queue(unittest.TestCase):
         self.assertIn(f"held: {self.REPO}#5", out)
 
     def test_a_burst_drains_one_analysis_per_run(self):
-        self.enterContext(mock.patch.object(iwb, "ANALYZE_LIMIT", 1))   # one analysis per run, as before analysis_concurrency
+        enter_context(self, mock.patch.object(iwb, "ANALYZE_LIMIT", 1))   # one analysis per run, as before analysis_concurrency
         def analyze(only=None, limit=None, **kw):
             (key,) = only
             if limit <= 0:
@@ -5202,7 +5209,7 @@ class Queue(unittest.TestCase):
             self.assertNotIn(self.q, d.parents)
 
     def test_the_analysis_limit_is_shared_by_the_issues_in_a_run(self):
-        self.enterContext(mock.patch.object(iwb, "ANALYZE_LIMIT", 1))   # one analysis per run, as before analysis_concurrency
+        enter_context(self, mock.patch.object(iwb, "ANALYZE_LIMIT", 1))   # one analysis per run, as before analysis_concurrency
         seen = []
         iwb.cmd_analyze = lambda only=None, limit=None, **kw: seen.append((limit, sorted(only))) \
             or iwb.SPENT.update(analyze=1)
@@ -5524,7 +5531,7 @@ class Queue(unittest.TestCase):
 
     def test_a_sweep_uses_only_the_budget_the_queued_events_left(self):
         # regression (Codex review of #12, P2): a sweep reset the per-pass limits and could run extra analyses
-        self.enterContext(mock.patch.object(iwb, "ANALYZE_LIMIT", 1))   # one analysis per run, as before analysis_concurrency
+        enter_context(self, mock.patch.object(iwb, "ANALYZE_LIMIT", 1))   # one analysis per run, as before analysis_concurrency
         limits = []
 
         def analyze(only=None, limit=None, **kw):
@@ -5725,7 +5732,7 @@ class QueueRealSteps(Queue):
         # regression (Codex review of #12, P1): the first issue uses the analysis limit; the second has an older
         # approved plan and a new trusted comment that changes the requirements. Its analysis is held, so approval
         # and coding must not run: coding would implement the stale plan.
-        self.enterContext(mock.patch.object(iwb, "ANALYZE_LIMIT", 1))   # one analysis per run, as before analysis_concurrency
+        enter_context(self, mock.patch.object(iwb, "ANALYZE_LIMIT", 1))   # one analysis per run, as before analysis_concurrency
         iwb.cmd_analyze = Queue.real_analyze
         iwb.CONFIG.write_text(json.dumps({"approval_live": True, "coding_live": True}))
         saved = (iwb.post, iwb.prbot.openclaw_attention)
@@ -6652,7 +6659,7 @@ class AutoMerge(unittest.TestCase):
             def __getattr__(self, name):
                 return getattr(real, name)
         self.addCleanup(lambda: [os.close(fd) for fd in kept])
-        self.enterContext(mock.patch.object(iwb, "SPAWN_RUNS", True))
+        enter_context(self, mock.patch.object(iwb, "SPAWN_RUNS", True))
         with mock.patch.object(iwb, "subprocess", FakeSubprocess()):     # undone before tearDown's RealCliGuard
             self.repair_in_a_process(started)
 
@@ -6670,7 +6677,7 @@ class AutoMerge(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             iwb.cmd_code()                                                  # its run is alive: left alone
         self.assertEqual((len(started), self.posts), (1, []))
-        self.enterContext(mock.patch.object(iwb, "run_ecc", self.fake_ecc))
+        enter_context(self, mock.patch.object(iwb, "run_ecc", self.fake_ecc))
         with redirect_stdout(io.StringIO()):
             iwb.run_job(job)                                                # what `iwb code --job` runs
         self.assertEqual(self.pushed, [("claude-dev", REPAIRED, self.BRANCH)])

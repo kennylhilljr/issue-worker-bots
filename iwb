@@ -2966,12 +2966,12 @@ def kill_group(p):
         if p.poll() is not None:
             try:
                 os.killpg(p.pid, 0)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):   # macOS: EPERM when only zombies are left in the group
                 return
         time.sleep(0.2)
     try:
         os.killpg(p.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     p.wait()
 
