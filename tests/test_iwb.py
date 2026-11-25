@@ -1,5 +1,5 @@
 """Tests for iwb intake. No network: GitHub reads and bot posts are faked. Run: python3 -m unittest discover -s tests"""
-import importlib.util, io, json, os, re, shlex, shutil, tempfile, time, unittest
+import importlib.util, io, json, os, re, shlex, shutil, sys, tempfile, time, unittest
 from unittest import mock
 import contextlib
 from contextlib import redirect_stderr, redirect_stdout
@@ -263,7 +263,7 @@ class SubprocessGuard(unittest.TestCase):
 
     def test_real_cli_version_is_guarded(self):
         with self.assertRaisesRegex(AssertionError, "unguarded CLI launch: claude"):
-            iwb.cli_version("claude")
+            iwb.cli_version("claude", {})
 
 
 def nested_sandbox_error():
@@ -4063,9 +4063,46 @@ class Code(unittest.TestCase):
         self.assertEqual(path[0], dirs[1])
         self.assertEqual(sorted(path), sorted(dirs + ["/usr/bin", "/bin"]))      # nothing added or lost
 
+    def test_drive_env_version_probes_receive_scrubbed_environment(self):
+        # regression (#106): newest_first ran each duplicate runner's --version with iwb's whole environment
+        python = sys.executable
+        allowed = {"HOME": "/tmp/fixture-home", "CLAUDE_CONFIG_DIR": "/tmp/fixture-claude",
+                   "CODEX_HOME": "/tmp/fixture-codex", "UV_OFFLINE": "1"}
+        forbidden = {"GH_TOKEN": "ghs_fixture", "GITHUB_TOKEN": "ghp_fixture", "PRBOT_TOKEN": "prbot_fixture",
+                     "UNLISTED_FIXTURE_VAR": "x"}
+        iwb.CONFIG.write_text(json.dumps({**self.PILOT, "drive_env": ["GH_TOKEN", "GITHUB_TOKEN", "PRBOT_TOKEN",
+                                                                      "UV_OFFLINE"]}))
+        for tool, versions in (("claude", ("2.1.112", "2.1.281")), ("codex", ("0.150.0", "0.158.0"))):
+            with self.subTest(tool=tool):
+                root = Path(self.tmp.name, f"probe-{tool}")
+                dirs, records = [], []
+                for i, version in enumerate(versions):
+                    d = root / f"bin{i}"
+                    d.mkdir(parents=True)
+                    record = root / f"env{i}.json"
+                    (d / tool).write_text(f"#!{python}\nimport json, os\n"
+                                          f"open({str(record)!r}, 'w').write(json.dumps(dict(os.environ)))\n"
+                                          f"print({version!r})\n")
+                    (d / tool).chmod(0o755)
+                    dirs.append(str(d))
+                    records.append(record)
+                path = iwb.os.pathsep.join(dirs)
+                with mock.patch.dict(iwb.os.environ, {**allowed, **forbidden, "PATH": path}, clear=True):
+                    env = iwb.drive_env()
+                for record in records:
+                    seen = json.loads(record.read_text())
+                    self.assertFalse(set(forbidden) & set(seen), sorted(seen))
+                    for k, v in allowed.items():
+                        self.assertEqual(seen.get(k), v)
+                    for k in ("USER", "LOGNAME", "LANG", "TMPDIR"):
+                        self.assertIn(k, seen)
+                    self.assertEqual(seen["PATH"], path)
+                self.assertFalse(set(forbidden) & set(env))
+                self.assertEqual(env["PATH"].split(iwb.os.pathsep), [dirs[1], dirs[0]])
+
     def test_cli_version_is_forbidden(self):
         with self.assertRaisesRegex(AssertionError, "unguarded CLI launch: claude"):
-            iwb.cli_version("claude")
+            iwb.cli_version("claude", {})
 
     def test_run_ecc_reads_the_json_envelope(self):
         script = Path(self.tmp.name, "ecc")
