@@ -4067,11 +4067,11 @@ class Code(unittest.TestCase):
         # regression (#106): newest_first ran each duplicate runner's --version with iwb's whole environment
         python = sys.executable
         allowed = {"HOME": "/tmp/fixture-home", "CLAUDE_CONFIG_DIR": "/tmp/fixture-claude",
-                   "CODEX_HOME": "/tmp/fixture-codex", "UV_OFFLINE": "1"}
+                   "CODEX_HOME": "/tmp/fixture-codex", "IWB_FIXTURE_ALLOWED": "1"}
         forbidden = {"GH_TOKEN": "ghs_fixture", "GITHUB_TOKEN": "ghp_fixture", "PRBOT_TOKEN": "prbot_fixture",
                      "UNLISTED_FIXTURE_VAR": "x"}
         iwb.CONFIG.write_text(json.dumps({**self.PILOT, "drive_env": ["GH_TOKEN", "GITHUB_TOKEN", "PRBOT_TOKEN",
-                                                                      "UV_OFFLINE"]}))
+                                                                      "IWB_FIXTURE_ALLOWED"]}))
         for tool, versions in (("claude", ("2.1.112", "2.1.281")), ("codex", ("0.150.0", "0.158.0"))):
             with self.subTest(tool=tool):
                 root = Path(self.tmp.name, f"probe-{tool}")
