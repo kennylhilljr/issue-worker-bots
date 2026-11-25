@@ -3046,29 +3046,30 @@ def drive_env():
     env.setdefault("LANG", "en_US.UTF-8")
     env.setdefault("TMPDIR", tempfile.gettempdir())
     if env.get("PATH"):
-        env["PATH"] = newest_first(env["PATH"], REQUIRED_RUNNERS)
+        env["PATH"] = newest_first(env["PATH"], REQUIRED_RUNNERS, env)   # the probes get this env too (#106)
     return env
 
 
-def cli_version(exe):
-    """The version tuple a runner CLI reports (`2.1.281 (Claude Code)`, `codex-cli 0.158.0`), or () if none."""
+def cli_version(exe, env):
+    """The version tuple a runner CLI reports (`2.1.281 (Claude Code)`, `codex-cli 0.158.0`), or () if none.
+    `env` is drive_env's scrubbed environment: the probe must not see iwb's tokens either."""
     try:
-        out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=30).stdout
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=30, env=env).stdout
     except (OSError, subprocess.SubprocessError):
         return ()
     m = re.search(r"(\d+(?:\.\d+)+)", out)
     return tuple(int(n) for n in m.group(1).split(".")) if m else ()
 
 
-def newest_first(path, tools):
+def newest_first(path, tools, env):
     """PATH with the directory of each tool's newest copy moved to the front. launchd's PATH (install-intake.sh)
     can list an old copy first, for example Claude Code 2.1.112 in ~/.local/bin ahead of 2.1.281, and the
-    orchestrator's runner flags need the version it certified."""
+    orchestrator's runner flags need the version it certified. `env` is passed to each `--version` probe."""
     dirs = path.split(os.pathsep)
     for tool in tools:
         found = [d for d in dirs if d and os.access(os.path.join(d, tool), os.X_OK)]
         if len(found) > 1:
-            best = max(found, key=lambda d: cli_version(os.path.join(d, tool)))   # first one wins a tie
+            best = max(found, key=lambda d: cli_version(os.path.join(d, tool), env))   # first one wins a tie
             dirs = [best] + [d for d in dirs if d != best]
     return os.pathsep.join(dirs)
 
